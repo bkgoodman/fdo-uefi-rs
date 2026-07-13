@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target/
+
+# Cargo.lock - optional for binaries, usually committed for reproducibility
+# Uncomment if you want to ignore it:
+# Cargo.lock
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# EFI disk images (generated)
+/build/*.img
