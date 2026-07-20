@@ -1,10 +1,21 @@
+// Copyright 2026 Dell Technologies, All Rights Reserved
+// Author: Brad Goodman <bradley.goodman@dell.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use log::{info, warn, error, debug};
 use uefi::boot;
 use uefi::Identify;
 use uefi::proto::network::http::{HttpBinding, HttpHelper};
 use uefi::proto::network::ip4config2::Ip4Config2;
+
+/// Track if network has been configured (DHCP completed)
+static NETWORK_CONFIGURED: AtomicBool = AtomicBool::new(false);
+
+/// Track if SNP interface has been initialized
+static SNP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Test URL - points to host machine from QEMU guest
 const TEST_URL: &str = "http://10.0.2.2:8080/test.txt";
@@ -90,7 +101,7 @@ fn find_http_nic() -> Option<uefi::Handle> {
         &SimpleNetwork::GUID
     )) {
         Ok(h) => {
-            info!("Found {} SNP (network driver) handle(s)", h.len());
+            debug!("Found {} SNP (network driver) handle(s)", h.len());
             h
         }
         Err(_) => {
@@ -99,17 +110,25 @@ fn find_http_nic() -> Option<uefi::Handle> {
         }
     };
     
-    // Try to start SNP interface and get handle
-    let snp_handle = match start_snp_interface() {
-        Some(h) => h,
-        None => {
-            warn!("Could not start SNP interface");
-            *snp_handles.first()?
-        }
+    // Only initialize SNP once
+    let snp_handle = if SNP_INITIALIZED.load(Ordering::Relaxed) {
+        debug!("SNP already initialized, reusing handle");
+        *snp_handles.first()?
+    } else {
+        // Try to start SNP interface and get handle
+        let h = match start_snp_interface() {
+            Some(h) => h,
+            None => {
+                warn!("Could not start SNP interface");
+                *snp_handles.first()?
+            }
+        };
+        
+        // Connect the network controller to trigger IP/HTTP driver binding
+        connect_network_controller(h);
+        SNP_INITIALIZED.store(true, Ordering::Relaxed);
+        h
     };
-    
-    // Connect the network controller to trigger IP/HTTP driver binding
-    connect_network_controller(snp_handle);
     
     // Check for IP4Config2 (IP stack)
     if let Ok(ip4_handles) = boot::locate_handle_buffer(boot::SearchType::ByProtocol(
@@ -135,9 +154,15 @@ fn find_http_nic() -> Option<uefi::Handle> {
     }
 }
 
-/// Configure network via DHCP using IP4Config2
+/// Configure network via DHCP using IP4Config2 (only runs once)
 fn configure_network(nic_handle: uefi::Handle) -> bool {
-    info!("Configuring network via DHCP...");
+    // Skip if already configured
+    if NETWORK_CONFIGURED.load(Ordering::Relaxed) {
+        debug!("Network already configured, skipping DHCP");
+        return true;
+    }
+    
+    info!("Configuring network via DHCP (first time)...");
     
     match Ip4Config2::new(nic_handle) {
         Ok(mut ip4cfg) => {
@@ -147,6 +172,7 @@ fn configure_network(nic_handle: uefi::Handle) -> bool {
                     if let Ok(info) = ip4cfg.get_interface_info() {
                         info!("IP Address: {}", info.station_addr);
                     }
+                    NETWORK_CONFIGURED.store(true, Ordering::Relaxed);
                     true
                 }
                 Err(e) => {
@@ -332,7 +358,8 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     let content_length_name = c"Content-Length";
     let content_length_value = alloc::format!("{}\0", body.len());
     let auth_name = c"Authorization";
-    let auth_value_owned = auth_token.map(|t| alloc::format!("{}\0", t));
+    // Server expects "Bearer <token>" format
+    let auth_value_owned = auth_token.map(|t| alloc::format!("Bearer {}\0", t));
     
     let mut headers_vec: alloc::vec::Vec<HttpHeader> = alloc::vec![
         HttpHeader {
@@ -394,11 +421,21 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     debug!("Request sent");
     
     // Receive response
-    let mut rx_body = vec![0u8; 16384];
+    // Must provide HttpResponseData for response to populate status code
+    use uefi_raw::protocol::network::http::HttpResponseData;
+    let mut response_data = HttpResponseData {
+        status_code: uefi_raw::protocol::network::http::HttpStatusCode::STATUS_200_OK,
+    };
+    
+    // Allocate space for response headers (UEFI HTTP returns headers separately)
+    // We need at least space for Authorization header
+    let mut rx_headers: [HttpHeader; 16] = unsafe { core::mem::zeroed() };
+    
+    let mut rx_body = vec![0u8; 32768]; // 32KB to handle 14KB MTU + COSE overhead
     let mut rx_msg = HttpMessage {
-        data: HttpRequestOrResponse { request: core::ptr::null() },
-        header_count: 0,
-        header: core::ptr::null_mut(),
+        data: HttpRequestOrResponse { response: &mut response_data },
+        header_count: rx_headers.len(),
+        header: rx_headers.as_mut_ptr(),
         body_length: rx_body.len(),
         body: rx_body.as_mut_ptr().cast::<c_void>(),
     };
@@ -410,42 +447,102 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     };
     
     debug!("Receiving response...");
+    
     let status = unsafe { ((*proto_ptr).response)(proto_ptr, &mut rx_token) };
-    if status != uefi::Status::SUCCESS {
-        error!("HTTP response failed: {:?}", status);
-        return None;
+    debug!("Response call returned: {:?}, token status: {:?}", status, rx_token.status);
+    
+    // OVMF returns response synchronously - if status is SUCCESS, we have the response
+    if status == uefi::Status::SUCCESS {
+        debug!("Response received synchronously");
+    } else {
+        // Async mode - poll until complete
+        // 3000 iterations × 10ms = 30 seconds max
+        for i in 0..3000 {
+            let poll_status = unsafe { ((*proto_ptr).poll)(proto_ptr) };
+            // Check token status for completion
+            if rx_token.status == uefi::Status::SUCCESS {
+                debug!("Response completed after {} polls", i);
+                break;
+            }
+            // Check for actual error status (not SUCCESS or NOT_READY)
+            if rx_token.status != uefi::Status::SUCCESS && 
+               rx_token.status != uefi::Status::NOT_READY {
+                error!("Response failed with status: {:?}", rx_token.status);
+                return None;
+            }
+            if poll_status != uefi::Status::SUCCESS && poll_status != uefi::Status::NOT_READY {
+                debug!("Poll returned: {:?}", poll_status);
+            }
+            boot::stall(core::time::Duration::from_millis(10));
+        }
     }
     
-    // Poll until complete
-    for _ in 0..300 {
-        let poll_status = unsafe { ((*proto_ptr).poll)(proto_ptr) };
-        if poll_status != uefi::Status::SUCCESS && poll_status != uefi::Status::NOT_READY {
-            break;
-        }
-        boot::stall(core::time::Duration::from_millis(10));
-    }
+    debug!("Final token status: {:?}", rx_token.status);
     
     let body_len = rx_msg.body_length;
-    debug!("Response received: {} bytes", body_len);
+    let header_count = rx_msg.header_count;
+    debug!("Response received: {} bytes, {} headers", body_len, header_count);
     rx_body.truncate(body_len);
     
-    // Parse HTTP response - extract body after headers and Authorization header
-    // Headers end with \r\n\r\n
-    let (body, auth_header) = if let Some(pos) = find_header_end(&rx_body) {
-        debug!("Headers end at byte {}", pos);
-        let headers_section = &rx_body[..pos];
-        let auth = extract_authorization_header(headers_section);
-        if auth.is_some() {
-            debug!("Found Authorization header in response");
+    // Extract Authorization header from UEFI HTTP headers
+    // OVMF may update rx_msg.header to point to its own allocated headers
+    let mut auth_header: Option<String> = None;
+    let header_ptr = rx_msg.header;
+    debug!("Header ptr: {:p}, count: {}", header_ptr, header_count);
+    if !header_ptr.is_null() && header_count > 0 {
+        for i in 0..header_count {
+            let hdr = unsafe { &*header_ptr.add(i) };
+            debug!("  Header[{}] name_ptr: {:p}, value_ptr: {:p}", i, hdr.field_name, hdr.field_value);
+            if !hdr.field_name.is_null() && !hdr.field_value.is_null() {
+                let name = unsafe { 
+                    let mut len = 0;
+                    let mut p = hdr.field_name;
+                    while *p != 0 { len += 1; p = p.add(1); }
+                    core::str::from_utf8_unchecked(core::slice::from_raw_parts(hdr.field_name, len))
+                };
+                let value = unsafe {
+                    let mut len = 0;
+                    let mut p = hdr.field_value;
+                    while *p != 0 { len += 1; p = p.add(1); }
+                    core::str::from_utf8_unchecked(core::slice::from_raw_parts(hdr.field_value, len))
+                };
+                debug!("  Header: {} = {}", name, &value[..value.len().min(60)]);
+                if name.eq_ignore_ascii_case("Authorization") {
+                    // Strip "Bearer " prefix if present
+                    let token = if value.starts_with("Bearer ") {
+                        &value[7..]
+                    } else {
+                        value
+                    };
+                    auth_header = Some(String::from(token));
+                    info!("Found Authorization token: {}...", &token[..token.len().min(20)]);
+                }
+            }
         }
-        (rx_body[pos..].to_vec(), auth)
+    }
+    
+    // Fallback: try parsing headers from body (some UEFI implementations return raw HTTP)
+    let body = if auth_header.is_none() {
+        if let Some(pos) = find_header_end(&rx_body) {
+            debug!("Headers in body, end at byte {}", pos);
+            let headers_section = &rx_body[..pos];
+            auth_header = extract_authorization_header(headers_section);
+            rx_body[pos..].to_vec()
+        } else {
+            rx_body
+        }
     } else {
-        warn!("Could not find header end, returning raw response");
-        (rx_body, None)
+        rx_body
     };
     
     if !body.is_empty() {
         debug!("Body hex: {:02x?}", &body[..body.len().min(80)]);
+    }
+    
+    // Clean up: destroy HTTP child handle to avoid resource leak
+    // This is critical - without it, we run out of handles after ~80 requests
+    if let Err(e) = binding.destroy_child(child_handle) {
+        warn!("Failed to destroy HTTP child handle: {:?}", e);
     }
     
     info!("HTTP POST completed: {} bytes body", body.len());

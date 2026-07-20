@@ -57,8 +57,19 @@ echo "=== Import voucher ==="
     echo "Voucher import failed (may already exist), continuing..."
 }
 
-echo "=== Starting server ==="
-/home/bkg/bkgvm/server -debug server -http 0.0.0.0:8080 -db "$WORKDIR/fdo.db" -rv-bypass > "$WORKDIR/server.log" 2>&1 &
+echo "=== Starting server with BMO ==="
+# BMO payload - use fdo-stub.efi as test chainload target
+BMO_PAYLOAD="/home/bkg/efi-fdo-bmo/build/fdo-stub.efi"
+if [ ! -f "$BMO_PAYLOAD" ]; then
+    echo "WARNING: BMO payload not found, running without BMO"
+    /home/bkg/bkgvm/server -debug server -http 0.0.0.0:8080 -db "$WORKDIR/fdo.db" -rv-bypass > "$WORKDIR/server.log" 2>&1 &
+else
+    echo "BMO payload: $BMO_PAYLOAD ($(stat -c%s "$BMO_PAYLOAD") bytes)"
+    # Use -bmo-file and -bmo-type flags (as per go-fdo test script)
+    # Add -reuse-cred to allow credential reuse for testing
+    /home/bkg/bkgvm/server-debug -debug server -http 0.0.0.0:8080 -db "$WORKDIR/fdo.db" -rv-bypass \
+        -reuse-cred -bmo-file "$BMO_PAYLOAD" -bmo-type "application/x-uefi-image" > "$WORKDIR/server.log" 2>&1 &
+fi
 SERVER_PID=$!
 sleep 2
 
@@ -69,6 +80,21 @@ if ! kill -0 $SERVER_PID 2>/dev/null; then
 fi
 echo "Server started (PID $SERVER_PID)"
 
+echo "=== Building Rust FDO client ==="
+cd /home/bkg/fdo-uefi-rs
+source ~/.cargo/env
+cargo +nightly build --release 2>&1 | tail -3
+
+echo "=== Creating boot disk ==="
+RUST_EFI="/home/bkg/fdo-uefi-rs/target/x86_64-unknown-uefi/release/fdo-uefi.efi"
+DISK_IMG="$WORKDIR/fdo-disk.img"
+dd if=/dev/zero of="$DISK_IMG" bs=1M count=64 2>/dev/null
+mkfs.vfat -F 32 "$DISK_IMG" >/dev/null
+mmd -i "$DISK_IMG" ::/EFI
+mmd -i "$DISK_IMG" ::/EFI/BOOT
+mcopy -i "$DISK_IMG" "$RUST_EFI" ::/EFI/BOOT/BOOTX64.EFI
+echo "Disk image created with Rust FDO client"
+
 echo "=== Copying OVMF vars ==="
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$WORKDIR/OVMF_VARS.fd"
 
@@ -77,7 +103,7 @@ sudo timeout $TIMEOUT_QEMU qemu-system-x86_64 \
     -machine q35 -m 2048 \
     -drive if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,unit=1,file="$WORKDIR/OVMF_VARS.fd" \
-    -drive file=/home/bkg/efi-fdo-bmo/build/stub-disk.img,format=raw,index=0 \
+    -drive file="$DISK_IMG",format=raw,index=0 \
     -chardev socket,id=chrtpm,path="$WORKDIR/swtpm-ctrl" \
     -tpmdev emulator,id=tpm0,chardev=chrtpm \
     -device tpm-tis,tpmdev=tpm0 \

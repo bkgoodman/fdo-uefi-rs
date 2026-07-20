@@ -1,3 +1,7 @@
+// Copyright 2026 Dell Technologies, All Rights Reserved
+// Author: Brad Goodman <bradley.goodman@dell.com>
+// SPDX-License-Identifier: Apache-2.0
+
 #![no_main]
 #![no_std]
 
@@ -10,6 +14,8 @@ use uefi::prelude::*;
 mod tpm;
 mod http;
 mod fdo;
+mod bmo;
+mod chainload;
 
 #[entry]
 fn main() -> Status {
@@ -71,6 +77,11 @@ fn main() -> Status {
     info!("");
     info!("--- TO1 Protocol Test ---");
     fdo::test_to1_protocol(&owner_url, &device_guid);
+    
+    // Test BMO state machine with mock data
+    info!("");
+    info!("--- BMO Mock Test ---");
+    bmo::test_bmo_handling();
     
     // Test TO2 protocol against go-fdo server
     info!("");

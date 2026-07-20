@@ -45,8 +45,27 @@ to the ECDH x-coordinate result before passing to KDF.
 - OwnerSvcInfo20: Handle null response (no service info)
 - Done20: Include 2 fields `[nonce, replacement_hmac]` (hmac=null for credential reuse)
 
+### BMO FSIM (Bare Metal Onboarding)
+- [x] BMO module structure (bmo.rs)
+- [x] BMO message parsing (image-begin, image-data-N, image-end)
+- [x] BMO session state machine
+- [x] BMO response builders (image-result, image-ack)
+- [x] ServiceInfo array parsing
+- [x] BMO integration into TO2 ServiceInfo exchange loop
+- [x] devmod:modules advertisement with ["fdo.bmo"]
+- [x] fdo.bmo:active and fdo.bmo:supported-types advertisement
+- [x] Chainload module (chainload.rs) - LoadImage/StartImage with fallback to temp file
+- [ ] **BLOCKED**: Server-side BMO activation - go-fdo server returns null for OwnerSvcInfo
+  - Client sends complete devmod: nummodules, modules (chunked format), os, arch, version, device, sep, bin
+  - Client sends fdo.bmo:active=true, fdo.bmo:supported-types=["application/x-uefi-image"]
+  - Server receives all fields correctly but responds with null OwnerSvcInfo
+  - Root cause: Unknown - requires investigation into go-fdo ServiceInfo module state machine
+  - Potential issues: devmod completion timing, module iterator initialization, or BMO module registration
+- [ ] URL delivery mode (mode 1)
+- [ ] Meta-URL delivery mode with COSE signature verification (mode 2)
+- [ ] BIOS parameter setting (fdo.bmo:set)
+
 ### Pending
-- [ ] ServiceInfo module handlers (devmod, bmo)
 - [ ] Credential replacement after successful TO2
 - [ ] Error response handling (server returns error instead of expected message)
 

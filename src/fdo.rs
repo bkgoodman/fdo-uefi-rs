@@ -1,3 +1,7 @@
+// Copyright 2026 Dell Technologies, All Rights Reserved
+// Author: Brad Goodman <bradley.goodman@dell.com>
+// SPDX-License-Identifier: Apache-2.0
+//
 // FDO Protocol Implementation for UEFI
 //
 // This module implements FDO TO1/TO2 protocols using manual CBOR encoding/decoding.
@@ -16,6 +20,8 @@ use aes_gcm::aead::generic_array::GenericArray;
 type HmacSha256 = Hmac<Sha256>;
 
 use crate::http::{http_post, http_post_with_session};
+use crate::bmo::{BmoSession, process_bmo_message, BmoState};
+use crate::chainload::chainload_image;
 
 /// Compute SHA-256 hash of data
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -301,21 +307,21 @@ pub enum FdoError {
 }
 
 /// Simple CBOR encoder for FDO messages
-struct CborEncoder {
-    buf: Vec<u8>,
+pub struct CborEncoder {
+    pub buf: Vec<u8>,
 }
 
 impl CborEncoder {
-    fn new() -> Self {
+    pub fn new() -> Self {
         CborEncoder { buf: Vec::new() }
     }
 
-    fn into_bytes(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Vec<u8> {
         self.buf
     }
 
     // Encode array header
-    fn array(&mut self, len: usize) {
+    pub fn array(&mut self, len: usize) {
         if len < 24 {
             self.buf.push(0x80 | len as u8);
         } else if len < 256 {
@@ -329,7 +335,7 @@ impl CborEncoder {
     }
     
     // Encode map header (major type 5)
-    fn encode_map(&mut self, len: usize) {
+    pub fn encode_map(&mut self, len: usize) {
         if len < 24 {
             self.buf.push(0xa0 | len as u8);
         } else if len < 256 {
@@ -343,7 +349,7 @@ impl CborEncoder {
     }
 
     // Encode byte string
-    fn bytes(&mut self, data: &[u8]) {
+    pub fn bytes(&mut self, data: &[u8]) {
         let len = data.len();
         if len < 24 {
             self.buf.push(0x40 | len as u8);
@@ -374,7 +380,7 @@ impl CborEncoder {
     }
 
     // Encode unsigned integer
-    fn uint(&mut self, val: u16) {
+    pub fn uint(&mut self, val: u16) {
         if val < 24 {
             self.buf.push(val as u8);
         } else if val < 256 {
@@ -388,7 +394,7 @@ impl CborEncoder {
     }
     
     // Encode text string
-    fn text(&mut self, s: &str) {
+    pub fn text(&mut self, s: &str) {
         let len = s.len();
         if len < 24 {
             self.buf.push(0x60 | len as u8);
@@ -404,15 +410,45 @@ impl CborEncoder {
     }
     
     // Encode null value
-    fn null(&mut self) {
+    pub fn null(&mut self) {
         self.buf.push(0xf6);
     }
     
     // Encode boolean value
-    fn bool(&mut self, val: bool) {
+    pub fn bool_val(&mut self, val: bool) {
         self.buf.push(if val { 0xf5 } else { 0xf4 });
     }
     
+    
+    // Encode a ServiceInfo key-value pair with bstr-wrapped value
+    // FDO spec: ServiceInfo values must be CBOR bstr containing the CBOR-encoded value
+    pub fn svc_info_kv_bool(&mut self, key: &str, val: bool) {
+        self.array(2);
+        self.text(key);
+        self.bytes(&[if val { 0xf5 } else { 0xf4 }]);
+    }
+    
+    pub fn svc_info_kv_uint(&mut self, key: &str, val: u16) {
+        self.array(2);
+        self.text(key);
+        let mut tmp = CborEncoder::new();
+        tmp.uint(val);
+        self.bytes(&tmp.into_bytes());
+    }
+    
+    pub fn svc_info_kv_text(&mut self, key: &str, val: &str) {
+        self.array(2);
+        self.text(key);
+        let mut tmp = CborEncoder::new();
+        tmp.text(val);
+        self.bytes(&tmp.into_bytes());
+    }
+    
+    pub fn svc_info_kv_bytes(&mut self, key: &str, cbor_bytes: &[u8]) {
+        self.array(2);
+        self.text(key);
+        self.bytes(cbor_bytes);
+    }
     // Append raw pre-encoded bytes (no header)
     fn raw_bytes(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
@@ -420,13 +456,13 @@ impl CborEncoder {
 }
 
 /// Simple CBOR decoder for FDO messages
-struct CborDecoder<'a> {
+pub struct CborDecoder<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
 impl<'a> CborDecoder<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub fn new(data: &'a [u8]) -> Self {
         CborDecoder { data, pos: 0 }
     }
 
@@ -447,7 +483,7 @@ impl<'a> CborDecoder<'a> {
         Ok(b)
     }
 
-    fn read_uint(&mut self) -> Result<u64, FdoError> {
+    pub fn read_uint(&mut self) -> Result<u64, FdoError> {
         let initial = self.read_byte()?;
         let major = initial >> 5;
         let additional = initial & 0x1f;
@@ -459,7 +495,7 @@ impl<'a> CborDecoder<'a> {
         self.decode_additional(additional)
     }
 
-    fn read_int(&mut self) -> Result<i32, FdoError> {
+    pub fn read_int(&mut self) -> Result<i32, FdoError> {
         let initial = self.read_byte()?;
         let major = initial >> 5;
         let additional = initial & 0x1f;
@@ -522,7 +558,7 @@ impl<'a> CborDecoder<'a> {
         Ok(self.decode_additional(additional)? as usize)
     }
 
-    fn read_bytes(&mut self) -> Result<Vec<u8>, FdoError> {
+    pub fn read_bytes(&mut self) -> Result<Vec<u8>, FdoError> {
         let initial = self.read_byte()?;
         let major = initial >> 5;
         let additional = initial & 0x1f;
@@ -541,7 +577,7 @@ impl<'a> CborDecoder<'a> {
         Ok(bytes)
     }
 
-    fn read_text(&mut self) -> Result<String, FdoError> {
+    pub fn read_text(&mut self) -> Result<String, FdoError> {
         let initial = self.read_byte()?;
         let major = initial >> 5;
         let additional = initial & 0x1f;
@@ -561,7 +597,7 @@ impl<'a> CborDecoder<'a> {
         Ok(String::from(s))
     }
 
-    fn skip_value(&mut self) -> Result<(), FdoError> {
+    pub fn skip_value(&mut self) -> Result<(), FdoError> {
         let initial = self.read_byte()?;
         let major = initial >> 5;
         let additional = initial & 0x1f;
@@ -605,8 +641,13 @@ impl<'a> CborDecoder<'a> {
     }
     
     // Alias for read_array_len
-    fn read_array_header(&mut self) -> Result<usize, FdoError> {
+    pub fn read_array_header(&mut self) -> Result<usize, FdoError> {
         self.read_array_len()
+    }
+    
+    // Alias for read_map_len
+    pub fn read_map_header(&mut self) -> Result<usize, FdoError> {
+        self.read_map_len()
     }
     
     // Read map length (major type 5)
@@ -655,7 +696,7 @@ impl<'a> CborDecoder<'a> {
     }
     
     // Read boolean value (0xf4 = false, 0xf5 = true)
-    fn read_bool(&mut self) -> Result<bool, FdoError> {
+    pub fn read_bool(&mut self) -> Result<bool, FdoError> {
         let b = self.read_byte()?;
         match b {
             0xf4 => Ok(false),
@@ -680,12 +721,14 @@ pub struct To1HelloRvAck {
 }
 
 /// Parse TO1.HelloRVAck response (FDO 2.0 format)
+/// FDO 2.0: [nonce4, sig_info, capability_flags, kex_suite_names, cipher_suite_names]
 fn parse_to1_hello_rv_ack(data: &[u8]) -> Result<To1HelloRvAck, FdoError> {
     let mut dec = CborDecoder::new(data);
     
     let arr_len = dec.read_array_len()?;
-    if arr_len < 3 || arr_len > 4 {
-        return Err(FdoError::CborError(format!("HelloRVAck expected 3-4 elements, got {}", arr_len)));
+    // FDO 1.1: 3-4 elements, FDO 2.0: 5 elements
+    if arr_len < 3 || arr_len > 5 {
+        return Err(FdoError::CborError(format!("HelloRVAck expected 3-5 elements, got {}", arr_len)));
     }
     
     // nonce4 - 16 byte nonce
@@ -707,9 +750,12 @@ fn parse_to1_hello_rv_ack(data: &[u8]) -> Result<To1HelloRvAck, FdoError> {
     // capability_flags - bstr
     let capability_flags = dec.read_bytes()?;
     
-    // optional vendor_unique - skip if present
-    if arr_len == 4 {
-        dec.skip_value()?;
+    // FDO 2.0 additional fields - skip if present
+    if arr_len >= 4 {
+        dec.skip_value()?; // kex_suite_names
+    }
+    if arr_len >= 5 {
+        dec.skip_value()?; // cipher_suite_names
     }
     
     Ok(To1HelloRvAck {
@@ -1352,32 +1398,53 @@ pub fn build_devmod_service_info() -> Vec<u8> {
     let mut enc = CborEncoder::new();
     
     // ServiceInfo is array of [module_name:key, value] pairs
-    enc.array(5); // 5 devmod entries
+    // 9 devmod entries + 2 BMO entries = 11 total
+    enc.array(11);
     
-    // devmod:active = true
-    enc.array(2);
-    enc.text("devmod:active");
-    enc.bool(true);
+    // devmod:active = true (bstr-wrapped)
+    enc.svc_info_kv_bool("devmod:active", true);
     
-    // devmod:os = "UEFI"
-    enc.array(2);
-    enc.text("devmod:os");
-    enc.text("UEFI");
+    // devmod:nummodules = 1 (bstr-wrapped)
+    enc.svc_info_kv_uint("devmod:nummodules", 1);
     
-    // devmod:arch = "x86_64"
-    enc.array(2);
-    enc.text("devmod:arch");
-    enc.text("x86_64");
+    // devmod:modules = [0, 1, "fdo.bmo"] (bstr-wrapped array)
+    {
+        let mut tmp = CborEncoder::new();
+        tmp.array(3);
+        tmp.uint(0);         // start = 0
+        tmp.uint(1);         // count = 1
+        tmp.text("fdo.bmo"); // module name
+        enc.svc_info_kv_bytes("devmod:modules", &tmp.into_bytes());
+    }
     
-    // devmod:version = "1.0"
-    enc.array(2);
-    enc.text("devmod:version");
-    enc.text("1.0");
+    // devmod:os (bstr-wrapped)
+    enc.svc_info_kv_text("devmod:os", "UEFI");
     
-    // devmod:device = "FDO-UEFI-Client"
-    enc.array(2);
-    enc.text("devmod:device");
-    enc.text("FDO-UEFI-Client");
+    // devmod:arch (bstr-wrapped)
+    enc.svc_info_kv_text("devmod:arch", "x86_64");
+    
+    // devmod:version (bstr-wrapped)
+    enc.svc_info_kv_text("devmod:version", "1.0");
+    
+    // devmod:device (bstr-wrapped)
+    enc.svc_info_kv_text("devmod:device", "FDO-UEFI-Client");
+    
+    // devmod:sep (bstr-wrapped)
+    enc.svc_info_kv_text("devmod:sep", "\\");
+    
+    // devmod:bin (bstr-wrapped)
+    enc.svc_info_kv_text("devmod:bin", "efi");
+    
+    // fdo.bmo:active (bstr-wrapped)
+    enc.svc_info_kv_bool("fdo.bmo:active", true);
+    
+    // fdo.bmo:supported-types (bstr-wrapped array)
+    {
+        let mut tmp = CborEncoder::new();
+        tmp.array(1);
+        tmp.text("application/x-uefi-image");
+        enc.svc_info_kv_bytes("fdo.bmo:supported-types", &tmp.into_bytes());
+    }
     
     enc.into_bytes()
 }
@@ -1387,7 +1454,7 @@ pub fn build_devmod_service_info() -> Vec<u8> {
 pub fn build_device_svc_info(is_more: bool, service_info: &[u8]) -> Vec<u8> {
     let mut enc = CborEncoder::new();
     enc.array(2);
-    enc.bool(is_more);
+    enc.bool_val(is_more);
     if service_info.is_empty() {
         enc.array(0); // Empty array
     } else {
@@ -1437,6 +1504,37 @@ pub fn parse_owner_svc_info(data: &[u8]) -> Result<OwnerSvcInfo, FdoError> {
         is_more,
         service_info,
     })
+}
+
+/// Parse ServiceInfo array from OwnerSvcInfo
+/// Returns array of (key, value) pairs
+pub fn parse_service_info_array(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, FdoError> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    let mut dec = CborDecoder::new(data);
+    let arr_len = dec.read_array_header()?;
+    info!("ServiceInfo array has {} entries", arr_len);
+    
+    let mut entries = Vec::new();
+    for i in 0..arr_len {
+        // Each entry is [key_string, value_bytes]
+        let entry_len = dec.read_array_header()?;
+        if entry_len != 2 {
+            warn!("ServiceInfo entry {} has {} elements, expected 2", i, entry_len);
+            dec.skip_value()?;
+            continue;
+        }
+        
+        let key = dec.read_text()?;
+        let value = dec.read_bytes()?;
+        
+        info!("  ServiceInfo[{}]: key='{}', value={} bytes", i, key, value.len());
+        entries.push((key, value));
+    }
+    
+    Ok(entries)
 }
 
 /// Build TO2.Done20 message (type 90)
@@ -1722,8 +1820,9 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     info!("TO2 Step 3 complete: All {} OV entries received", prove_ov.num_ov_entries);
     
     // Step 4: DeviceSvcInfoRdy20 (ENCRYPTED - type 86)
+    // UEFI HTTP client has ~1KB response buffer limit, negotiate MTU down
     info!("TO2 Step 4: Sending DeviceSvcInfoRdy20 (encrypted)...");
-    let device_svc_info_rdy = build_device_svc_info_rdy(None); // No max size limit
+    let device_svc_info_rdy = build_device_svc_info_rdy(Some(1040)); // UEFI HTTP limit
     info!("  Plaintext: {} bytes, hex: {:02x?}", device_svc_info_rdy.len(), &device_svc_info_rdy);
     
     // Generate nonce for encryption (12 bytes for AES-GCM)
@@ -1756,6 +1855,10 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     // devmod:active = true, devmod:os = "UEFI", devmod:arch = "x86_64", etc.
     let devmod_info = build_devmod_service_info();
     
+    // Create BMO session for handling bare metal onboarding
+    let mut bmo_session = BmoSession::new();
+    let mut bmo_responses: Vec<(String, Vec<u8>)> = Vec::new();
+    
     let mut is_done = false;
     let mut round = 0u8;
     
@@ -1764,11 +1867,22 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
         info!("  ServiceInfo round {}", round);
         
         // Build DeviceSvcInfo (msg 88): [is_more, service_info_array]
-        // For devmod, we send all info in first round, then empty arrays
+        // Round 1: send devmod info
+        // Subsequent rounds: send BMO responses or empty
         let svc_info = if round == 1 {
             devmod_info.clone()
+        } else if !bmo_responses.is_empty() {
+            // Build ServiceInfo array with BMO responses
+            let mut enc = CborEncoder::new();
+            enc.array(bmo_responses.len());
+            for (key, value) in bmo_responses.drain(..) {
+                enc.array(2);
+                enc.text(&key);
+                enc.bytes(&value);
+            }
+            enc.into_bytes()
         } else {
-            Vec::new() // Empty ServiceInfo for subsequent rounds
+            Vec::new() // Empty ServiceInfo
         };
         
         let device_svc_info = build_device_svc_info(false, &svc_info); // is_more = false
@@ -1791,15 +1905,58 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
         info!("    is_done={}, is_more={}, svc_info_len={}", 
               owner_svc.is_done, owner_svc.is_more, owner_svc.service_info.len());
         
+        // Process ServiceInfo entries from owner
+        if !owner_svc.service_info.is_empty() {
+            match parse_service_info_array(&owner_svc.service_info) {
+                Ok(entries) => {
+                    for (key, value) in entries {
+                        // Check if this is a BMO message
+                        if key.starts_with("fdo.bmo:") {
+                            info!("    Processing BMO message: {}", key);
+                            if let Some((resp_key, resp_value)) = process_bmo_message(&mut bmo_session, &key, &value) {
+                                info!("    BMO response: {} ({} bytes)", resp_key, resp_value.len());
+                                bmo_responses.push((resp_key, resp_value));
+                            }
+                        } else {
+                            info!("    Ignoring non-BMO ServiceInfo: {}", key);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("    Failed to parse ServiceInfo array: {:?}", e);
+                }
+            }
+        }
+        
         is_done = owner_svc.is_done;
         
         // Safety limit to prevent infinite loops
-        if round >= 10 {
-            warn!("ServiceInfo exchange exceeded 10 rounds, forcing done");
+        if round >= 100 {
+            warn!("ServiceInfo exchange exceeded 100 rounds, forcing done");
             break;
         }
     }
+    
+    // Log BMO session state and chainload if image received
     info!("TO2 Step 5 complete: ServiceInfo exchange finished");
+    info!("  BMO state: {:?}", bmo_session.state);
+    
+    if matches!(bmo_session.state, BmoState::Complete) && !bmo_session.image_buffer.is_empty() {
+        info!("  BMO image received: {} bytes", bmo_session.image_buffer.len());
+        info!("  Attempting to chainload received image...");
+        
+        match chainload_image(&bmo_session.image_buffer) {
+            Ok(()) => {
+                info!("  Chainload completed successfully!");
+            }
+            Err(e) => {
+                error!("  Chainload failed: {:?}", e);
+            }
+        }
+    } else if !bmo_session.image_buffer.is_empty() {
+        warn!("  BMO image buffer has {} bytes but state is {:?}", 
+              bmo_session.image_buffer.len(), bmo_session.state);
+    }
     
     // Step 6: Done/DoneAck
     info!("TO2 Step 6: Sending Done...");

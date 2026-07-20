@@ -1,107 +1,158 @@
 # FDO UEFI Client (Rust)
 
-A UEFI application implementing the FDO TO1/TO2 protocols and BMO FSIM, written in Rust.
+A UEFI application implementing FDO 2.0 TO1/TO2 protocols and BMO FSIM, written in Rust.
 
 ## Overview
 
-This project aims to implement a full FDO (FIDO Device Onboard) client as a UEFI application,
-suitable for device onboarding during firmware boot. It is a Rust rewrite of the C-based
-`efi-fdo-bmo` project.
+This is a full FDO (FIDO Device Onboard) client running as a UEFI application for device
+onboarding during firmware boot. It implements:
 
-### Goals
-
-- Full TO1 and TO2 protocol implementation
-- BMO FSIM (Firmware Service Info Module) support
-- TPM-based credential storage
-- HTTP(S) communication
-- Pure Rust, no_std compatible
+- **TO1 protocol** - Rendezvous server communication
+- **TO2 protocol** - Owner server communication with encrypted ServiceInfo exchange
+- **BMO FSIM** - Bare Metal Onboarding for EFI image transfer and chainload
+- **TPM 2.0** - Credential storage and ECDH key exchange
 
 ## Prerequisites
 
-### Rust Toolchain
+### Build Machine
 
 ```bash
-# Install nightly toolchain with rust-src
-make deps
-
-# Or manually:
+# Rust nightly with UEFI target
 rustup install nightly
 rustup +nightly component add rust-src
+
+# Or use: make deps
 ```
 
-### QEMU Testing (optional)
+### Test Machine (pe2)
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get install qemu-system-x86 ovmf mtools dosfstools
+# Ubuntu/Debian packages
+sudo apt-get install qemu-system-x86 ovmf mtools dosfstools swtpm
+
+# go-fdo server binary
+# Build from ../go-fdo with: make build
 ```
 
 ## Building
 
 ```bash
-# Debug build
-make build
+# Release build (recommended)
+cargo +nightly build --release \
+    -Zbuild-std=core,alloc \
+    -Zbuild-std-features=compiler-builtins-mem \
+    --target x86_64-unknown-uefi
 
-# Release build (optimized, smaller)
-make release
-
-# Or directly with cargo:
-cargo +nightly build
+# Output: target/x86_64-unknown-uefi/release/fdo-uefi.efi
 ```
 
-## Testing in QEMU
+## Testing
+
+### Quick Test (on pe2)
 
 ```bash
-# Build and run in QEMU
-make run
-
-# Press Ctrl-A X to exit QEMU
+# Full end-to-end test with DI, TO2, and BMO
+ssh pe2 "cd ~/fdo-uefi-rs && bash start3.sh"
 ```
+
+### Manual Test Steps
+
+1. **Initialize database and export owner key:**
+   ```bash
+   server server -db /tmp/fdo.db -initOnly
+   server server -db /tmp/fdo.db -print-owner-public SECP256R1 > owner.pem
+   ```
+
+2. **Start swtpm (TPM simulator):**
+   ```bash
+   swtpm socket --tpmstate dir=/tmp/tpm \
+       --server type=unixio,path=/tmp/tpm/swtpm-server \
+       --ctrl type=unixio,path=/tmp/tpm/swtpm-ctrl \
+       --tpm2 --flags startup-clear &
+   ```
+
+3. **Create voucher via Device Initialization:**
+   ```bash
+   FDO_TPM_DEVICE=/tmp/tpm/swtpm-server \
+       quick-di-tpm -quick -rv 10.0.2.2:8080:http \
+       -device-info "Test" -output-dir /tmp/vouchers \
+       -signover-key owner.pem
+   ```
+
+4. **Import voucher and start server with BMO:**
+   ```bash
+   server server -db /tmp/fdo.db -import-voucher /tmp/vouchers/*.fdoov -initOnly
+   server -debug server -http 0.0.0.0:8080 -db /tmp/fdo.db -rv-bypass \
+       -reuse-cred -bmo-file payload.efi -bmo-type "application/x-uefi-image"
+   ```
+
+5. **Create boot disk and run QEMU:**
+   ```bash
+   dd if=/dev/zero of=disk.img bs=1M count=64
+   mkfs.vfat -F 32 disk.img
+   mmd -i disk.img ::/EFI ::/EFI/BOOT
+   mcopy -i disk.img fdo-uefi.efi ::/EFI/BOOT/BOOTX64.EFI
+   
+   qemu-system-x86_64 -machine q35 -m 2048 \
+       -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+       -drive if=pflash,format=raw,file=OVMF_VARS.fd \
+       -drive file=disk.img,format=raw \
+       -chardev socket,id=chrtpm,path=/tmp/tpm/swtpm-ctrl \
+       -tpmdev emulator,id=tpm0,chardev=chrtpm \
+       -device tpm-tis,tpmdev=tpm0 \
+       -device virtio-rng-pci \
+       -nic user,model=virtio-net-pci \
+       -nographic
+   ```
+
+### Verifying Success
+
+Check server log for BMO completion:
+```bash
+grep -E "image-end|All chunks sent|Done" /tmp/fdo-test3/server.log
+```
+
+Expected output shows all chunks sent and protocol completion.
 
 ## Project Structure
 
 ```
 fdo-uefi-rs/
 ├── Cargo.toml          # Package manifest
-├── Makefile            # Build automation
 ├── README.md           # This file
+├── TODO.md             # Development status and known issues
+├── start3.sh           # Automated test script
 ├── .cargo/
 │   └── config.toml     # Cargo config (UEFI target)
 └── src/
-    └── main.rs         # Entry point
+    ├── main.rs         # Entry point, protocol orchestration
+    ├── fdo.rs          # FDO TO1/TO2 protocol implementation
+    ├── http.rs         # UEFI HTTP client
+    ├── tpm.rs          # TPM 2.0 operations
+    ├── cbor.rs         # CBOR encoder/decoder
+    ├── bmo.rs          # BMO FSIM handler
+    └── chainload.rs    # EFI image chainloading
 ```
 
-## Roadmap
+## Current Status
 
-### Phase 1: Scaffolding (Current)
-- [x] Basic UEFI application structure
-- [x] Build system with QEMU support
-- [ ] Verify builds and runs
+- **TO1**: ✅ Complete (HelloRV, ProveToRV, RVRedirect)
+- **TO2**: ✅ Complete (all 12 message types, encrypted ServiceInfo)
+- **BMO**: ✅ Working (image transfer, chainload)
+- **TPM**: ✅ Working (NV storage, ECDH, signing)
 
-### Phase 2: Protocol Foundation
-- [ ] TPM support via `uefi::proto::tcg`
-- [ ] HTTP support via `uefi::proto::network`
-- [ ] CBOR parsing (minicbor)
-- [ ] Crypto (RustCrypto: p256, ecdsa, sha2)
-
-### Phase 3: FDO Protocol
-- [ ] Port fdo-data-formats to no_std
-- [ ] TO1 protocol
-- [ ] TO2 protocol
-- [ ] FSIM handlers
-
-### Phase 4: Integration
-- [ ] Chain-loading support
-- [ ] Anti-rollback
-- [ ] E2E testing
+See [TODO.md](TODO.md) for detailed status and known issues.
 
 ## References
 
 - [uefi-rs](https://github.com/rust-osdev/uefi-rs) - Rust UEFI library
-- [fido-device-onboard-rs](../fido-device-onboard-rs) - Reference Rust FDO implementation
-- [efi-fdo-bmo](../efi-fdo-bmo) - Reference C UEFI implementation
-- [UEFI Specification](https://uefi.org/specifications)
+- [go-fdo](../go-fdo) - Go FDO server implementation
+- [FDO Specification](https://fidoalliance.org/specs/FDO/FIDO-Device-Onboard-RD-v1.1-20211214.html)
 
 ## License
 
-Copyright (c) 2026 Dell Technologies. All rights reserved.
+Copyright 2026 Dell Technologies, All Rights Reserved
+
+Author: Brad Goodman <bradley.goodman@dell.com>
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
