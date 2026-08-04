@@ -3,6 +3,23 @@
 ## Current Status
 
 ### Completed
+
+#### Device Initialization (DI) Protocol
+- [x] DI module structure (src/di/)
+- [x] DeviceMfgInfo CBOR encoding (per fdo-appnote-device-mfg-info.bs)
+- [x] DIAppStart message builder with CapabilityFlags
+- [x] DISetCredentials parser (OVHeader extraction)
+- [x] DISetHMAC message builder (Hash structure encoding)
+- [x] DIDone response handling
+- [x] TPM DAK (Device Attestation Key) creation - ECC P-256, handle 0x81020002
+- [x] TPM HMAC key creation - SHA-256, handle 0x81020003
+- [x] CSR generation with TPM signing
+- [x] HMAC computation over OVHeader via TPM
+- [x] TPM NV DefineSpace (index 0x01D10001, spec-defined per securing-fdo-in-tpm.bs)
+- [x] TPM NV Write (DCTPM credential storage)
+- [x] Auto-detection: run DI if no credentials, else TO1/TO2
+
+#### Core Infrastructure
 - [x] Manual CBOR encoder for no_std UEFI environment
 - [x] TO1.HelloRV message builder (CBOR serialization)
 - [x] TO2.HelloDeviceProbe message builder (CBOR serialization)
@@ -102,9 +119,27 @@ to the ECDH x-coordinate result before passing to KDF.
 - pe2 VM with QEMU, OVMF firmware
 - go-fdo server for protocol testing  
 - swtpm for TPM simulation
-- **Use `~/bkgvm/start2.sh`** - handles swtpm dual-socket setup, DI, voucher import, and QEMU launch correctly
+- **Use `~/bkgvm/start3.sh`** - handles swtpm dual-socket setup, DI, voucher import, and QEMU launch correctly
+
+### swtpm/QEMU Setup Note
+
+When starting swtpm for QEMU, you must connect to the `swtpm-server` socket first before QEMU can connect to `swtpm-ctrl`. Example:
+
+```bash
+# Start swtpm
+swtpm socket --tpmstate dir=$WORKDIR \
+    --server type=unixio,path=$WORKDIR/swtpm-server \
+    --ctrl type=unixio,path=$WORKDIR/swtpm-ctrl \
+    --tpm2 --flags startup-clear &
+sleep 2
+
+# Initialize TPM connection (required before QEMU)
+echo -n "" | timeout 1 nc -U "$WORKDIR/swtpm-server" 2>/dev/null || true
+
+# Now QEMU can connect to swtpm-ctrl
+```
 
 ### Known Issues
-- swtpm socket often disappears between commands - use start2.sh which handles this
+- swtpm requires initial connection to server socket before QEMU can use ctrl socket
 - Server must use correct database matching the voucher from DI
 - GUID in client must match what quick-di-tpm created (reads from TPM NV automatically)

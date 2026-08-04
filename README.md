@@ -7,10 +7,11 @@ A UEFI application implementing FDO 2.0 TO1/TO2 protocols and BMO FSIM, written 
 This is a full FDO (FIDO Device Onboard) client running as a UEFI application for device
 onboarding during firmware boot. It implements:
 
+- **DI protocol** - Device Initialization (manufacturing/provisioning)
 - **TO1 protocol** - Rendezvous server communication
 - **TO2 protocol** - Owner server communication with encrypted ServiceInfo exchange
 - **BMO FSIM** - Bare Metal Onboarding for EFI image transfer and chainload
-- **TPM 2.0** - Credential storage and ECDH key exchange
+- **TPM 2.0** - Key creation, credential storage, HMAC, and ECDH key exchange
 
 ## Prerequisites
 
@@ -46,6 +47,18 @@ cargo +nightly build --release \
 # Output: target/x86_64-unknown-uefi/release/fdo-uefi.efi
 ```
 
+## Execution Flow
+
+The UEFI client automatically detects which protocol to run based on TPM state:
+
+1. **No credentials in TPM** → Run **DI protocol** (Device Initialization)
+2. **Credentials exist** → Run **TO1/TO2 protocols** (Onboarding)
+
+```
+Boot → Check TPM NV → No credentials? → DI Protocol → Write DCTPM → Done
+                   → Has credentials? → TO1 → TO2 → BMO → Chainload
+```
+
 ## Testing
 
 ### Quick Test (on pe2)
@@ -55,15 +68,56 @@ cargo +nightly build --release \
 ssh pe2 "cd ~/fdo-uefi-rs && bash start3.sh"
 ```
 
-### Manual Test Steps
+### DI Protocol Test
+
+To test Device Initialization (DI) protocol with UEFI client:
+
+```bash
+# 1. Start fresh swtpm (no existing state)
+rm -rf /tmp/fdo-tpm && mkdir -p /tmp/fdo-tpm
+swtpm socket --tpmstate dir=/tmp/fdo-tpm \
+    --server type=unixio,path=/tmp/fdo-tpm/swtpm-server \
+    --ctrl type=unixio,path=/tmp/fdo-tpm/swtpm-ctrl \
+    --tpm2 --flags startup-clear &
+
+# 2. Start go-fdo manufacturing server
+server server -http 0.0.0.0:8080 -db /tmp/fdo.db
+
+# 3. Run UEFI client in QEMU (will auto-detect no credentials and run DI)
+qemu-system-x86_64 -machine q35 -m 2048 \
+    -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+    -drive if=pflash,format=raw,file=OVMF_VARS.fd \
+    -drive file=disk.img,format=raw \
+    -chardev socket,id=chrtpm,path=/tmp/fdo-tpm/swtpm-ctrl \
+    -tpmdev emulator,id=tpm0,chardev=chrtpm \
+    -device tpm-tis,tpmdev=tpm0 \
+    -device virtio-rng-pci \
+    -nic user,model=virtio-net-pci \
+    -nographic
+```
+
+Expected output:
+```
+Attempting Device Initialization (DI)...
+FDO Device Initialization (DI) Protocol
+Sending DIAppStart...
+Received DISetCredentials
+Sending DISetHMAC...
+Received DIDone
+Device Initialization COMPLETE
+```
+
+### Manual Test Steps (TO1/TO2 with external DI)
 
 1. **Initialize database and export owner key:**
+
    ```bash
    server server -db /tmp/fdo.db -initOnly
    server server -db /tmp/fdo.db -print-owner-public SECP256R1 > owner.pem
    ```
 
 2. **Start swtpm (TPM simulator):**
+
    ```bash
    swtpm socket --tpmstate dir=/tmp/tpm \
        --server type=unixio,path=/tmp/tpm/swtpm-server \
@@ -72,6 +126,7 @@ ssh pe2 "cd ~/fdo-uefi-rs && bash start3.sh"
    ```
 
 3. **Create voucher via Device Initialization:**
+
    ```bash
    FDO_TPM_DEVICE=/tmp/tpm/swtpm-server \
        quick-di-tpm -quick -rv 10.0.2.2:8080:http \
@@ -80,6 +135,7 @@ ssh pe2 "cd ~/fdo-uefi-rs && bash start3.sh"
    ```
 
 4. **Import voucher and start server with BMO:**
+
    ```bash
    server server -db /tmp/fdo.db -import-voucher /tmp/vouchers/*.fdoov -initOnly
    server -debug server -http 0.0.0.0:8080 -db /tmp/fdo.db -rv-bypass \
@@ -87,6 +143,7 @@ ssh pe2 "cd ~/fdo-uefi-rs && bash start3.sh"
    ```
 
 5. **Create boot disk and run QEMU:**
+
    ```bash
    dd if=/dev/zero of=disk.img bs=1M count=64
    mkfs.vfat -F 32 disk.img
@@ -121,14 +178,19 @@ fdo-uefi-rs/
 ├── Cargo.toml          # Package manifest
 ├── README.md           # This file
 ├── TODO.md             # Development status and known issues
+├── spec.md             # Technical specification
 ├── start3.sh           # Automated test script
 ├── .cargo/
 │   └── config.toml     # Cargo config (UEFI target)
 └── src/
-    ├── main.rs         # Entry point, protocol orchestration
+    ├── main.rs         # Entry point, auto-detects DI vs TO1/TO2
+    ├── di/             # DI protocol module
+    │   ├── mod.rs      # Module exports
+    │   ├── protocol.rs # DI message flow and TPM operations
+    │   └── mfginfo.rs  # DeviceMfgInfo structure
     ├── fdo.rs          # FDO TO1/TO2 protocol implementation
     ├── http.rs         # UEFI HTTP client
-    ├── tpm.rs          # TPM 2.0 operations
+    ├── tpm.rs          # TPM 2.0 operations (keys, HMAC, NV, signing)
     ├── cbor.rs         # CBOR encoder/decoder
     ├── bmo.rs          # BMO FSIM handler
     └── chainload.rs    # EFI image chainloading
@@ -136,10 +198,11 @@ fdo-uefi-rs/
 
 ## Current Status
 
+- **DI**: ✅ Complete (DIAppStart, DISetCredentials, DISetHMAC, DIDone)
 - **TO1**: ✅ Complete (HelloRV, ProveToRV, RVRedirect)
 - **TO2**: ✅ Complete (all 12 message types, encrypted ServiceInfo)
 - **BMO**: ✅ Working (image transfer, chainload)
-- **TPM**: ✅ Working (NV storage, ECDH, signing)
+- **TPM**: ✅ Working (key creation, HMAC, NV storage, ECDH, signing)
 
 See [TODO.md](TODO.md) for detailed status and known issues.
 

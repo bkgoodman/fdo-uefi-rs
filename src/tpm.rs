@@ -1181,3 +1181,586 @@ pub fn test_tpm() {
         }
     }
 }
+
+// ============================================================================
+// DI Protocol TPM Functions
+// ============================================================================
+
+/// TPM2 command codes for DI
+const TPM2_CC_CREATE: u32 = 0x00000153;
+const TPM2_CC_LOAD: u32 = 0x00000157;
+const TPM2_CC_EVICT_CONTROL: u32 = 0x00000120;
+const TPM2_CC_NV_DEFINE_SPACE: u32 = 0x0000012A;
+const TPM2_CC_NV_WRITE: u32 = 0x00000137;
+const TPM2_CC_HMAC: u32 = 0x00000155;
+
+/// TPM2 algorithm for HMAC
+const TPM2_ALG_KEYEDHASH: u16 = 0x0008;
+const TPM2_ALG_HMAC_ALG: u16 = 0x0005;
+
+/// Signing key result from TPM
+pub struct TpmSigningKey {
+    pub handle: u32,
+    pub public_x: Vec<u8>,
+    pub public_y: Vec<u8>,
+}
+
+/// Create an ECDSA signing key (P-256) in TPM
+/// Returns transient handle and public key coordinates
+pub fn tpm_create_signing_key() -> Option<TpmSigningKey> {
+    let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
+    let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
+    
+    let cmd = build_create_primary_signing_cmd();
+    let mut response = vec![0u8; 1024];
+    
+    info!("TPM: Creating signing key...");
+    let result = tcg.submit_command(&cmd, &mut response);
+    
+    if result.is_err() {
+        warn!("TPM2_CreatePrimary (signing) failed");
+        return None;
+    }
+    
+    let key_pair = parse_create_primary_response(&response)?;
+    
+    Some(TpmSigningKey {
+        handle: key_pair.handle,
+        public_x: key_pair.public_x,
+        public_y: key_pair.public_y,
+    })
+}
+
+/// Build TPM2_CreatePrimary command for ECDSA signing key (P-256)
+fn build_create_primary_signing_cmd() -> Vec<u8> {
+    let mut cmd = Vec::with_capacity(128);
+    
+    // Header placeholder
+    cmd.extend_from_slice(&[0u8; 10]);
+    pack_u16(&mut cmd[0..2], TPM2_ST_SESSIONS);
+    pack_u32(&mut cmd[6..10], TPM2_CC_CREATE_PRIMARY);
+    
+    // primaryHandle = TPM_RH_OWNER
+    let mut handle_bytes = [0u8; 4];
+    pack_u32(&mut handle_bytes, TPM2_RH_OWNER);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // Authorization area (password session, empty password)
+    let auth_area_start = cmd.len();
+    cmd.extend_from_slice(&[0u8; 4]); // auth size placeholder
+    
+    let mut session_handle = [0u8; 4];
+    pack_u32(&mut session_handle, TPM2_RS_PW);
+    cmd.extend_from_slice(&session_handle);
+    cmd.extend_from_slice(&[0, 0]); // nonce size = 0
+    cmd.push(0); // session attributes
+    cmd.extend_from_slice(&[0, 0]); // password size = 0
+    
+    let auth_size = (cmd.len() - auth_area_start - 4) as u32;
+    pack_u32(&mut cmd[auth_area_start..auth_area_start+4], auth_size);
+    
+    // inSensitive (TPM2B_SENSITIVE_CREATE) - empty
+    cmd.extend_from_slice(&[0, 4]); // size = 4
+    cmd.extend_from_slice(&[0, 0]); // userAuth size = 0
+    cmd.extend_from_slice(&[0, 0]); // data size = 0
+    
+    // inPublic (TPMT_PUBLIC for ECC signing key)
+    let in_public_start = cmd.len();
+    cmd.extend_from_slice(&[0, 0]); // size placeholder
+    
+    // type = TPM_ALG_ECC
+    let mut alg = [0u8; 2];
+    pack_u16(&mut alg, TPM2_ALG_ECC);
+    cmd.extend_from_slice(&alg);
+    
+    // nameAlg = TPM_ALG_SHA256
+    pack_u16(&mut alg, TPM2_ALG_SHA256);
+    cmd.extend_from_slice(&alg);
+    
+    // objectAttributes: fixedTPM | fixedParent | sensitivedataOrigin | userWithAuth | sign
+    // 0x00040472
+    cmd.extend_from_slice(&[0x00, 0x04, 0x04, 0x72]);
+    
+    // authPolicy (empty)
+    cmd.extend_from_slice(&[0, 0]);
+    
+    // parameters.eccDetail
+    // symmetric = TPM_ALG_NULL
+    pack_u16(&mut alg, TPM2_ALG_NULL);
+    cmd.extend_from_slice(&alg);
+    
+    // scheme = TPM_ALG_ECDSA
+    pack_u16(&mut alg, TPM2_ALG_ECDSA);
+    cmd.extend_from_slice(&alg);
+    
+    // scheme.details.ecdsa.hashAlg = TPM_ALG_SHA256
+    pack_u16(&mut alg, TPM2_ALG_SHA256);
+    cmd.extend_from_slice(&alg);
+    
+    // curveID = TPM_ECC_NIST_P256
+    pack_u16(&mut alg, TPM2_ECC_NIST_P256);
+    cmd.extend_from_slice(&alg);
+    
+    // kdf.scheme = TPM_ALG_NULL
+    pack_u16(&mut alg, TPM2_ALG_NULL);
+    cmd.extend_from_slice(&alg);
+    
+    // unique (empty point)
+    cmd.extend_from_slice(&[0, 0]); // x size = 0
+    cmd.extend_from_slice(&[0, 0]); // y size = 0
+    
+    // Update inPublic size
+    let in_public_size = (cmd.len() - in_public_start - 2) as u16;
+    pack_u16(&mut cmd[in_public_start..in_public_start+2], in_public_size);
+    
+    // outsideInfo (empty)
+    cmd.extend_from_slice(&[0, 0]);
+    
+    // creationPCR (empty)
+    cmd.extend_from_slice(&[0, 0, 0, 0]); // count = 0
+    
+    // Update total command size
+    let cmd_len = cmd.len() as u32;
+    pack_u32(&mut cmd[2..6], cmd_len);
+    
+    cmd
+}
+
+/// Create an HMAC key in TPM
+/// Returns transient handle
+pub fn tpm_create_hmac_key() -> Option<u32> {
+    let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
+    let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
+    
+    let cmd = build_create_primary_hmac_cmd();
+    let mut response = vec![0u8; 512];
+    
+    info!("TPM: Creating HMAC key...");
+    let result = tcg.submit_command(&cmd, &mut response);
+    
+    if result.is_err() {
+        warn!("TPM2_CreatePrimary (HMAC) failed");
+        return None;
+    }
+    
+    // Parse response to get handle
+    if response.len() < 14 {
+        return None;
+    }
+    
+    let response_code = unpack_u32(&response[6..10]);
+    if response_code != 0 {
+        warn!("TPM2_CreatePrimary (HMAC) error: 0x{:08x}", response_code);
+        return None;
+    }
+    
+    let handle = unpack_u32(&response[10..14]);
+    Some(handle)
+}
+
+/// Build TPM2_CreatePrimary command for HMAC key
+fn build_create_primary_hmac_cmd() -> Vec<u8> {
+    let mut cmd = Vec::with_capacity(128);
+    
+    // Header placeholder
+    cmd.extend_from_slice(&[0u8; 10]);
+    pack_u16(&mut cmd[0..2], TPM2_ST_SESSIONS);
+    pack_u32(&mut cmd[6..10], TPM2_CC_CREATE_PRIMARY);
+    
+    // primaryHandle = TPM_RH_ENDORSEMENT (per go-fdo GenerateSpecHMACKey)
+    let mut handle_bytes = [0u8; 4];
+    pack_u32(&mut handle_bytes, 0x4000000B); // TPM_RH_ENDORSEMENT
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // Authorization area
+    let auth_area_start = cmd.len();
+    cmd.extend_from_slice(&[0u8; 4]);
+    
+    let mut session_handle = [0u8; 4];
+    pack_u32(&mut session_handle, TPM2_RS_PW);
+    cmd.extend_from_slice(&session_handle);
+    cmd.extend_from_slice(&[0, 0]);
+    cmd.push(0);
+    cmd.extend_from_slice(&[0, 0]);
+    
+    let auth_size = (cmd.len() - auth_area_start - 4) as u32;
+    pack_u32(&mut cmd[auth_area_start..auth_area_start+4], auth_size);
+    
+    // inSensitive - empty
+    cmd.extend_from_slice(&[0, 4]);
+    cmd.extend_from_slice(&[0, 0]);
+    cmd.extend_from_slice(&[0, 0]);
+    
+    // inPublic for KEYEDHASH (HMAC)
+    let in_public_start = cmd.len();
+    cmd.extend_from_slice(&[0, 0]);
+    
+    // type = TPM_ALG_KEYEDHASH
+    let mut alg = [0u8; 2];
+    pack_u16(&mut alg, TPM2_ALG_KEYEDHASH);
+    cmd.extend_from_slice(&alg);
+    
+    // nameAlg = SHA256
+    pack_u16(&mut alg, TPM2_ALG_SHA256);
+    cmd.extend_from_slice(&alg);
+    
+    // objectAttributes: fixedTPM | fixedParent | sensitivedataOrigin | userWithAuth | adminWithPolicy | signEncrypt
+    // 0x000400F2 (matches go-fdo GenerateSpecHMACKey)
+    cmd.extend_from_slice(&[0x00, 0x04, 0x00, 0xF2]);
+    
+    // authPolicy (empty)
+    cmd.extend_from_slice(&[0, 0]);
+    
+    // parameters.keyedHashDetail
+    // scheme = TPM_ALG_HMAC
+    pack_u16(&mut alg, TPM2_ALG_HMAC_ALG);
+    cmd.extend_from_slice(&alg);
+    
+    // hashAlg = SHA256
+    pack_u16(&mut alg, TPM2_ALG_SHA256);
+    cmd.extend_from_slice(&alg);
+    
+    // unique (empty)
+    cmd.extend_from_slice(&[0, 0]);
+    
+    // Update inPublic size
+    let in_public_size = (cmd.len() - in_public_start - 2) as u16;
+    pack_u16(&mut cmd[in_public_start..in_public_start+2], in_public_size);
+    
+    // outsideInfo (empty)
+    cmd.extend_from_slice(&[0, 0]);
+    
+    // creationPCR (empty)
+    cmd.extend_from_slice(&[0, 0, 0, 0]);
+    
+    let cmd_len = cmd.len() as u32;
+    pack_u32(&mut cmd[2..6], cmd_len);
+    
+    cmd
+}
+
+/// Compute HMAC using TPM key
+pub fn tpm_hmac(key_handle: u32, data: &[u8]) -> Option<Vec<u8>> {
+    let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
+    let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
+    
+    let cmd = build_hmac_cmd(key_handle, data);
+    let mut response = vec![0u8; 256];
+    
+    let result = tcg.submit_command(&cmd, &mut response);
+    if result.is_err() {
+        warn!("TPM2_HMAC failed");
+        return None;
+    }
+    
+    parse_hmac_response(&response)
+}
+
+/// Build TPM2_HMAC command
+fn build_hmac_cmd(key_handle: u32, data: &[u8]) -> Vec<u8> {
+    let mut cmd = Vec::with_capacity(data.len() + 64);
+    
+    // Header
+    cmd.extend_from_slice(&[0u8; 10]);
+    pack_u16(&mut cmd[0..2], TPM2_ST_SESSIONS);
+    pack_u32(&mut cmd[6..10], TPM2_CC_HMAC);
+    
+    // handle
+    let mut handle_bytes = [0u8; 4];
+    pack_u32(&mut handle_bytes, key_handle);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // Auth area
+    let auth_start = cmd.len();
+    cmd.extend_from_slice(&[0u8; 4]);
+    pack_u32(&mut handle_bytes, TPM2_RS_PW);
+    cmd.extend_from_slice(&handle_bytes);
+    cmd.extend_from_slice(&[0, 0, 0, 0, 0]);
+    let auth_size = (cmd.len() - auth_start - 4) as u32;
+    pack_u32(&mut cmd[auth_start..auth_start+4], auth_size);
+    
+    // buffer (TPM2B_MAX_BUFFER)
+    let mut size_bytes = [0u8; 2];
+    pack_u16(&mut size_bytes, data.len() as u16);
+    cmd.extend_from_slice(&size_bytes);
+    cmd.extend_from_slice(data);
+    
+    // hashAlg = SHA256
+    let mut alg = [0u8; 2];
+    pack_u16(&mut alg, TPM2_ALG_SHA256);
+    cmd.extend_from_slice(&alg);
+    
+    let cmd_len = cmd.len() as u32;
+    pack_u32(&mut cmd[2..6], cmd_len);
+    
+    cmd
+}
+
+/// Parse TPM2_HMAC response
+fn parse_hmac_response(response: &[u8]) -> Option<Vec<u8>> {
+    if response.len() < 14 {
+        return None;
+    }
+    
+    let response_code = unpack_u32(&response[6..10]);
+    if response_code != 0 {
+        warn!("TPM2_HMAC error: 0x{:08x}", response_code);
+        return None;
+    }
+    
+    // Skip parameterSize
+    let mut pos = 14;
+    
+    // TPM2B_DIGEST
+    if response.len() < pos + 2 {
+        return None;
+    }
+    let size = unpack_u16(&response[pos..pos+2]) as usize;
+    pos += 2;
+    
+    if response.len() < pos + size {
+        return None;
+    }
+    
+    Some(response[pos..pos+size].to_vec())
+}
+
+/// Sign a digest using ECDSA with specified handle
+pub fn tpm_sign_ecdsa(key_handle: u32, digest: &[u8]) -> Option<Vec<u8>> {
+    let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
+    let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
+    
+    let cmd = build_sign_cmd(key_handle, digest);
+    let mut response = vec![0u8; 256];
+    
+    let result = tcg.submit_command(&cmd, &mut response);
+    if result.is_err() {
+        warn!("TPM2_Sign failed");
+        return None;
+    }
+    
+    let (r, s) = parse_sign_response(&response)?;
+    
+    // Concatenate r || s, padding to 32 bytes each for P-256
+    let mut sig = vec![0u8; 64];
+    let r_offset = 32 - r.len().min(32);
+    sig[r_offset..32].copy_from_slice(&r[r.len().saturating_sub(32)..]);
+    let s_offset = 64 - s.len().min(32);
+    sig[s_offset..64].copy_from_slice(&s[s.len().saturating_sub(32)..]);
+    
+    Some(sig)
+}
+
+/// Persist a transient object to a permanent handle
+pub fn tpm_evict_control(transient_handle: u32, persistent_handle: u32) -> bool {
+    let tcg_handle = match boot::get_handle_for_protocol::<Tcg>() {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let mut tcg = match boot::open_protocol_exclusive::<Tcg>(tcg_handle) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    
+    let cmd = build_evict_control_cmd(transient_handle, persistent_handle);
+    let mut response = vec![0u8; 64];
+    
+    if tcg.submit_command(&cmd, &mut response).is_err() {
+        return false;
+    }
+    
+    if response.len() < 10 {
+        return false;
+    }
+    
+    let response_code = unpack_u32(&response[6..10]);
+    if response_code != 0 {
+        warn!("TPM2_EvictControl error: 0x{:08x}", response_code);
+        return false;
+    }
+    
+    true
+}
+
+/// Build TPM2_EvictControl command
+fn build_evict_control_cmd(object_handle: u32, persistent_handle: u32) -> Vec<u8> {
+    let mut cmd = Vec::with_capacity(64);
+    
+    cmd.extend_from_slice(&[0u8; 10]);
+    pack_u16(&mut cmd[0..2], TPM2_ST_SESSIONS);
+    pack_u32(&mut cmd[6..10], TPM2_CC_EVICT_CONTROL);
+    
+    // auth = TPM_RH_OWNER
+    let mut handle_bytes = [0u8; 4];
+    pack_u32(&mut handle_bytes, TPM2_RH_OWNER);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // objectHandle
+    pack_u32(&mut handle_bytes, object_handle);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // Auth area
+    let auth_start = cmd.len();
+    cmd.extend_from_slice(&[0u8; 4]);
+    pack_u32(&mut handle_bytes, TPM2_RS_PW);
+    cmd.extend_from_slice(&handle_bytes);
+    cmd.extend_from_slice(&[0, 0, 0, 0, 0]);
+    let auth_size = (cmd.len() - auth_start - 4) as u32;
+    pack_u32(&mut cmd[auth_start..auth_start+4], auth_size);
+    
+    // persistentHandle
+    pack_u32(&mut handle_bytes, persistent_handle);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    let cmd_len = cmd.len() as u32;
+    pack_u32(&mut cmd[2..6], cmd_len);
+    
+    cmd
+}
+
+/// Write data to TPM NV index (defines space if needed)
+pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
+    let tcg_handle = match boot::get_handle_for_protocol::<Tcg>() {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let mut tcg = match boot::open_protocol_exclusive::<Tcg>(tcg_handle) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    
+    // First try to define the NV space
+    let define_cmd = build_nv_define_space_cmd(nv_index, data.len() as u16);
+    info!("NV DefineSpace cmd ({} bytes): {:02x?}", define_cmd.len(), &define_cmd[..define_cmd.len().min(60)]);
+    let mut response = vec![0u8; 64];
+    
+    if tcg.submit_command(&define_cmd, &mut response).is_ok() {
+        let rc = unpack_u32(&response[6..10]);
+        info!("NV DefineSpace response: {:02x?}", &response[..20]);
+        if rc != 0 && rc != 0x0000014c {  // Ignore "already exists"
+            warn!("TPM2_NV_DefineSpace error: 0x{:08x}", rc);
+        }
+    }
+    
+    // Now write the data
+    let write_cmd = build_nv_write_cmd(nv_index, data);
+    let mut response = vec![0u8; 64];
+    
+    if tcg.submit_command(&write_cmd, &mut response).is_err() {
+        return false;
+    }
+    
+    if response.len() < 10 {
+        return false;
+    }
+    
+    let response_code = unpack_u32(&response[6..10]);
+    if response_code != 0 {
+        warn!("TPM2_NV_Write error: 0x{:08x}", response_code);
+        return false;
+    }
+    
+    true
+}
+
+/// Build TPM2_NV_DefineSpace command
+fn build_nv_define_space_cmd(nv_index: u32, size: u16) -> Vec<u8> {
+    let mut cmd = Vec::with_capacity(64);
+    
+    cmd.extend_from_slice(&[0u8; 10]);
+    pack_u16(&mut cmd[0..2], TPM2_ST_SESSIONS);
+    pack_u32(&mut cmd[6..10], TPM2_CC_NV_DEFINE_SPACE);
+    
+    // authHandle = TPM_RH_OWNER
+    let mut handle_bytes = [0u8; 4];
+    pack_u32(&mut handle_bytes, TPM2_RH_OWNER);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // Auth area
+    let auth_start = cmd.len();
+    cmd.extend_from_slice(&[0u8; 4]);
+    pack_u32(&mut handle_bytes, TPM2_RS_PW);
+    cmd.extend_from_slice(&handle_bytes);
+    cmd.extend_from_slice(&[0, 0, 0, 0, 0]);
+    let auth_size = (cmd.len() - auth_start - 4) as u32;
+    pack_u32(&mut cmd[auth_start..auth_start+4], auth_size);
+    
+    // auth (TPM2B_AUTH) - empty
+    cmd.extend_from_slice(&[0, 0]);
+    
+    // publicInfo (TPM2B_NV_PUBLIC)
+    let public_start = cmd.len();
+    cmd.extend_from_slice(&[0, 0]); // size placeholder
+    
+    // TPMS_NV_PUBLIC
+    pack_u32(&mut handle_bytes, nv_index);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // nameAlg = SHA256
+    let mut alg = [0u8; 2];
+    pack_u16(&mut alg, TPM2_ALG_SHA256);
+    cmd.extend_from_slice(&alg);
+    
+    // attributes: JUST ownerwrite | ownerread (absolute minimum)
+    // OWNERWRITE (bit 1) = 0x02, OWNERREAD (bit 17) = 0x20000
+    // 0x00020002 in big-endian: [0x00, 0x02, 0x00, 0x02]
+    cmd.extend_from_slice(&[0x00, 0x02, 0x00, 0x02]);
+    
+    // authPolicy (empty)
+    cmd.extend_from_slice(&[0, 0]);
+    
+    // dataSize
+    let mut size_bytes = [0u8; 2];
+    pack_u16(&mut size_bytes, size);
+    cmd.extend_from_slice(&size_bytes);
+    
+    // Update publicInfo size
+    let public_size = (cmd.len() - public_start - 2) as u16;
+    pack_u16(&mut cmd[public_start..public_start+2], public_size);
+    
+    let cmd_len = cmd.len() as u32;
+    pack_u32(&mut cmd[2..6], cmd_len);
+    
+    cmd
+}
+
+/// Build TPM2_NV_Write command
+fn build_nv_write_cmd(nv_index: u32, data: &[u8]) -> Vec<u8> {
+    let mut cmd = Vec::with_capacity(data.len() + 64);
+    
+    cmd.extend_from_slice(&[0u8; 10]);
+    pack_u16(&mut cmd[0..2], TPM2_ST_SESSIONS);
+    pack_u32(&mut cmd[6..10], TPM2_CC_NV_WRITE);
+    
+    // authHandle = TPM_RH_OWNER (for OWNERWRITE attribute)
+    let mut handle_bytes = [0u8; 4];
+    pack_u32(&mut handle_bytes, TPM2_RH_OWNER);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // nvIndex
+    pack_u32(&mut handle_bytes, nv_index);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // Auth area
+    let auth_start = cmd.len();
+    cmd.extend_from_slice(&[0u8; 4]);
+    pack_u32(&mut handle_bytes, TPM2_RS_PW);
+    cmd.extend_from_slice(&handle_bytes);
+    cmd.extend_from_slice(&[0, 0, 0, 0, 0]);
+    let auth_size = (cmd.len() - auth_start - 4) as u32;
+    pack_u32(&mut cmd[auth_start..auth_start+4], auth_size);
+    
+    // data (TPM2B_MAX_NV_BUFFER)
+    let mut size_bytes = [0u8; 2];
+    pack_u16(&mut size_bytes, data.len() as u16);
+    cmd.extend_from_slice(&size_bytes);
+    cmd.extend_from_slice(data);
+    
+    // offset = 0
+    cmd.extend_from_slice(&[0, 0]);
+    
+    let cmd_len = cmd.len() as u32;
+    pack_u32(&mut cmd[2..6], cmd_len);
+    
+    cmd
+}

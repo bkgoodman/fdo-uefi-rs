@@ -4,12 +4,29 @@
 
 This document describes the UEFI FDO client implementation for bare metal device onboarding.
 
+## Execution Flow
+
+The client automatically detects which protocol to run:
+
+1. **Check TPM NV** for existing credentials (DCTPM at index 0x01500001)
+2. **No credentials** → Run DI protocol against manufacturing server
+3. **Has credentials** → Run TO1/TO2 protocols for onboarding
+
 ## Protocol Support
 
 ### FDO Version
 
 - **FDO 2.0** - Device-proves-first flow
-- CapabilityFlags negotiation in TO1/TO2
+- CapabilityFlags negotiation in DI/TO1/TO2
+
+### DI Messages (Device Initialization)
+
+| Message | Type | Direction | Status |
+|---------|------|-----------|--------|
+| DIAppStart | 10 | Device→Mfg | ✅ |
+| DISetCredentials | 11 | Mfg→Device | ✅ |
+| DISetHMAC | 12 | Device→Mfg | ✅ |
+| DIDone | 13 | Mfg→Device | ✅ |
 
 ### TO1 Messages
 
@@ -87,15 +104,27 @@ UEFI HTTP client has ~1KB response size limit. BMO chunks are fixed at **1014 by
 
 ## TPM Integration
 
+### DI Key Creation
+
+During Device Initialization, the client creates:
+
+- **DAK (Device Attestation Key)** - ECC P-256 signing key, persisted at handle `0x81020002`
+- **HMAC Key** - SHA-256 HMAC key, persisted at handle `0x81020003`
+
 ### NV Storage
 
-Credential stored in TPM NV index (created by quick-di-tpm during DI).
+Credential (DCTPM) stored in TPM NV index `0x01500001` (Owner range).
+
+Attributes: `OWNERWRITE | OWNERREAD` (0x00020002)
 
 ### Key Operations
 
+- **CreatePrimary** - Create DAK and HMAC keys under Endorsement hierarchy
+- **EvictControl** - Persist keys to permanent handles
+- **HMAC** - Compute HMAC over OVHeader during DI
+- **Sign** - CSR signing during DI, COSE_Sign1 during TO1/TO2
 - **ECDH** - Shared secret computation via TPM
-- **Sign** - COSE_Sign1 signatures via TPM
-- **Random** - Nonce generation
+- **NV DefineSpace/Write** - Store DCTPM after DI
 
 ## HTTP Client
 
