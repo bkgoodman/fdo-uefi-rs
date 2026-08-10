@@ -22,7 +22,7 @@ use alloc::format;
 use log::{info, error, warn};
 use uefi::Status;
 
-use crate::http::http_post;
+use crate::http::{http_post_with_session, HttpPostResponse};
 use crate::tpm;
 use super::mfginfo::{DeviceMfgInfo, KEY_TYPE_SECP256R1};
 
@@ -112,14 +112,17 @@ pub fn run_di_protocol() -> Status {
     // 6. Send DIAppStart
     info!("Sending DIAppStart...");
     let app_start_msg = build_di_app_start(&mfg_info_cbor);
-    let set_credentials_response = match send_di_message(&mfg_server_url, MSG_TYPE_DI_APP_START, &app_start_msg) {
-        Some((msg_type, payload)) => {
+    let (set_credentials_response, session_token) = match send_di_message(&mfg_server_url, MSG_TYPE_DI_APP_START, &app_start_msg, None) {
+        Some((msg_type, payload, token)) => {
             if msg_type != MSG_TYPE_DI_SET_CREDENTIALS {
                 error!("Expected DISetCredentials ({}), got {}", MSG_TYPE_DI_SET_CREDENTIALS, msg_type);
                 return Status::PROTOCOL_ERROR;
             }
             info!("Received DISetCredentials: {} bytes", payload.len());
-            payload
+            if let Some(ref t) = token {
+                info!("Session token: {}...", &t[..t.len().min(20)]);
+            }
+            (payload, token)
         }
         None => {
             error!("Failed to send DIAppStart");
@@ -140,9 +143,9 @@ pub fn run_di_protocol() -> Status {
     };
     
     // 8. Compute HMAC over OVHeader using TPM
-    info!("Computing HMAC over OVHeader...");
-    let ov_header_cbor = ov_header.to_cbor();
-    let hmac_value = match tpm::tpm_hmac(hmac_handle, &ov_header_cbor) {
+    // CRITICAL: Use raw_cbor (exact bytes from server) so HMAC matches
+    info!("Computing HMAC over OVHeader ({} bytes)...", ov_header.raw_cbor.len());
+    let hmac_value = match tpm::tpm_hmac(hmac_handle, &ov_header.raw_cbor) {
         Some(hmac) => {
             info!("HMAC computed: {} bytes", hmac.len());
             hmac
@@ -153,11 +156,11 @@ pub fn run_di_protocol() -> Status {
         }
     };
     
-    // 9. Send DISetHMAC
+    // 9. Send DISetHMAC (with session token from step 6)
     info!("Sending DISetHMAC...");
     let set_hmac_msg = build_di_set_hmac(&hmac_value);
-    match send_di_message(&mfg_server_url, MSG_TYPE_DI_SET_HMAC, &set_hmac_msg) {
-        Some((msg_type, _payload)) => {
+    match send_di_message(&mfg_server_url, MSG_TYPE_DI_SET_HMAC, &set_hmac_msg, session_token.as_deref()) {
+        Some((msg_type, _payload, _token)) => {
             if msg_type != MSG_TYPE_DI_DONE {
                 error!("Expected DIDone ({}), got {}", MSG_TYPE_DI_DONE, msg_type);
                 return Status::PROTOCOL_ERROR;
@@ -216,23 +219,22 @@ fn get_device_model() -> String {
 }
 
 /// Build DIAppStart message (FDO 2.0)
-/// Format: [CapabilityFlags, VendorCapFlags, DeviceMfgInfo]
+/// go-fdo expects: [Info_bstr_or_null, CapabilityFlags]
+/// where CapabilityFlags = [flags_bstr] (1-element array)
 fn build_di_app_start(device_mfg_info: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(device_mfg_info.len() + 16);
     
-    // Array of 3 elements
-    buf.push(0x83);
+    // Array of 2 elements: [Info, CapabilityFlags]
+    buf.push(0x82);
     
-    // CapabilityFlags: uint (FDO 2.0 = 0x0001)
-    buf.push(0x19); // uint16
-    buf.push((CAPABILITY_FLAGS_FDO20 >> 8) as u8);
-    buf.push((CAPABILITY_FLAGS_FDO20 & 0xFF) as u8);
-    
-    // VendorCapFlags: uint (0 = none)
-    buf.push(0x00);
-    
-    // DeviceMfgInfo: bstr (already bstr-wrapped)
+    // Info: bstr .cbor DeviceMfgInfo (already bstr-wrapped)
     buf.extend_from_slice(device_mfg_info);
+    
+    // CapabilityFlags: [flags_bstr] = 1-element array
+    buf.push(0x81); // array(1)
+    // flags_bstr: single byte 0x04 = bit 2 set = FDO 2.0
+    buf.push(0x41); // bstr(1)
+    buf.push(0x04);
     
     buf
 }
@@ -268,18 +270,129 @@ fn build_di_set_hmac(hmac: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Send DI message (simple HTTP POST)
-fn send_di_message(server_url: &str, msg_type: u8, payload: &[u8]) -> Option<(u8, Vec<u8>)> {
-    let url = format!("{}/fdo/101/msg/{}", server_url, msg_type);
+/// FDO error message type
+const MSG_TYPE_ERROR: u8 = 255;
+
+/// Send DI message with session token support
+/// Returns (actual_message_type, body, auth_token)
+fn send_di_message(server_url: &str, msg_type: u8, payload: &[u8], auth_token: Option<&str>) -> Option<(u8, Vec<u8>, Option<String>)> {
+    let url = format!("{}/fdo/200/msg/{}", server_url, msg_type);
     
-    match http_post(&url, payload, msg_type) {
-        Some(response) => {
-            // Response message type is always request + 1 in DI protocol
-            let response_type = msg_type + 1;
-            Some((response_type, response))
+    match http_post_with_session(&url, payload, msg_type, auth_token) {
+        Some(resp) => {
+            // Use actual Message-Type header if available, otherwise assume msg_type + 1
+            let response_type = resp.message_type.unwrap_or(msg_type + 1);
+            
+            // Check for error response
+            if response_type == MSG_TYPE_ERROR {
+                error!("Server returned error (Message-Type 255)");
+                decode_fdo_error(&resp.body);
+                return None;
+            }
+            
+            Some((response_type, resp.body, resp.auth_token))
         }
         None => None,
     }
+}
+
+/// Decode and log FDO error response body
+/// Error format: CBOR array [error_code, prev_msg_type, error_string, timestamp, correlation_id]
+fn decode_fdo_error(body: &[u8]) {
+    if body.is_empty() {
+        error!("  (empty error body)");
+        return;
+    }
+    
+    let mut pos = 0;
+    
+    // Expect array of 5 elements
+    if pos >= body.len() { return; }
+    let first = body[pos];
+    if (first >> 5) != 4 {
+        error!("  Error body not a CBOR array (first byte: 0x{:02x})", first);
+        return;
+    }
+    pos += 1;
+    
+    // [0] error_code (uint)
+    let error_code = if pos < body.len() {
+        let (val, consumed) = cbor_decode_uint(&body[pos..]);
+        pos += consumed;
+        val
+    } else { 0 };
+    
+    // [1] prev_msg_type (uint)
+    let prev_msg = if pos < body.len() {
+        let (val, consumed) = cbor_decode_uint(&body[pos..]);
+        pos += consumed;
+        val
+    } else { 0 };
+    
+    // [2] error_string (tstr)
+    let error_str = if pos < body.len() {
+        let major = body[pos] >> 5;
+        if major == 3 {
+            // text string
+            let (s, consumed) = cbor_decode_tstr(&body[pos..]);
+            pos += consumed;
+            s
+        } else {
+            pos += 1;
+            String::from("(not a text string)")
+        }
+    } else {
+        String::from("(missing)")
+    };
+    
+    error!("  FDO Error {}: msg_type={}, \"{}\"", error_code, prev_msg, error_str);
+}
+
+/// Decode a CBOR unsigned integer, returning (value, bytes_consumed)
+fn cbor_decode_uint(data: &[u8]) -> (u32, usize) {
+    if data.is_empty() { return (0, 0); }
+    let additional = data[0] & 0x1f;
+    match additional {
+        0..=23 => (additional as u32, 1),
+        24 => {
+            if data.len() < 2 { return (0, 1); }
+            (data[1] as u32, 2)
+        }
+        25 => {
+            if data.len() < 3 { return (0, 1); }
+            (((data[1] as u32) << 8) | data[2] as u32, 3)
+        }
+        26 => {
+            if data.len() < 5 { return (0, 1); }
+            (((data[1] as u32) << 24) | ((data[2] as u32) << 16) | ((data[3] as u32) << 8) | data[4] as u32, 5)
+        }
+        _ => (0, 1),
+    }
+}
+
+/// Decode a CBOR text string, returning (string, bytes_consumed)
+fn cbor_decode_tstr(data: &[u8]) -> (String, usize) {
+    if data.is_empty() { return (String::new(), 0); }
+    let additional = data[0] & 0x1f;
+    let (str_len, header_len) = match additional {
+        0..=23 => (additional as usize, 1usize),
+        24 => {
+            if data.len() < 2 { return (String::new(), 1); }
+            (data[1] as usize, 2)
+        }
+        25 => {
+            if data.len() < 3 { return (String::new(), 1); }
+            (((data[1] as usize) << 8) | data[2] as usize, 3)
+        }
+        _ => return (String::new(), 1),
+    };
+    let end = header_len + str_len;
+    if data.len() < end {
+        return (String::new(), data.len());
+    }
+    let s = core::str::from_utf8(&data[header_len..end])
+        .unwrap_or("(invalid utf8)");
+    (String::from(s), end)
 }
 
 /// Parsed OVHeader from DISetCredentials
@@ -289,6 +402,8 @@ pub struct OVHeader {
     pub device_info: String,
     pub pub_key: Vec<u8>,
     pub cert_chain_hash: Vec<u8>,
+    /// Raw CBOR bytes as received from server (for HMAC computation)
+    pub raw_cbor: Vec<u8>,
 }
 
 impl OVHeader {
@@ -368,24 +483,261 @@ impl OVHeader {
 }
 
 /// Parse DISetCredentials response to extract OVHeader
+/// Wire format: CBOR array [bstr .cbor OVHeader]
+/// OVHeader = [OVHProtVer, OVGuid, OVRVInfo, OVDeviceInfo, OVPubKey, OVDevCertChainHash]
 fn parse_di_set_credentials(data: &[u8]) -> Option<OVHeader> {
-    // DISetCredentials = [OVHeader, ServerCapabilityFlags]
-    // OVHeader = [OVProtVer, OVGuid, OVRVInfo, OVDeviceInfo, OVPublicKey, OVCertChainHash]
-    
     if data.is_empty() {
+        error!("DISetCredentials: empty response");
         return None;
     }
     
-    // TODO: Proper CBOR parsing
-    // For now, return a placeholder
-    warn!("DISetCredentials parsing not fully implemented - using placeholder");
+    info!("DISetCredentials: parsing {} bytes", data.len());
+    info!("DISetCredentials: first bytes: {:02x?}", &data[..data.len().min(32)]);
+    
+    let mut pos: usize = 0;
+    
+    // Outer wrapper: 1-element CBOR array [bstr]
+    let outer_initial = data[pos];
+    pos += 1;
+    let outer_major = outer_initial >> 5;
+    let outer_additional = outer_initial & 0x1f;
+    
+    if outer_major == 4 {
+        // Array wrapper - read count (should be 1)
+        let _count = if outer_additional < 24 {
+            outer_additional as usize
+        } else if outer_additional == 24 {
+            let n = data[pos] as usize;
+            pos += 1;
+            n
+        } else {
+            error!("DISetCredentials: unsupported array size encoding");
+            return None;
+        };
+        info!("DISetCredentials: outer array with {} element(s)", _count);
+    } else {
+        // No array wrapper, reset - the data might be just the bstr directly
+        pos = 0;
+    }
+    
+    // Read bstr containing OVHeader CBOR
+    let ov_header_raw = cbor_read_bstr(data, &mut pos)?;
+    info!("DISetCredentials: OVHeader bstr = {} bytes", ov_header_raw.len());
+    
+    // Parse the OVHeader array from inside the bstr
+    parse_ov_header_cbor(&ov_header_raw)
+}
+
+/// Read a CBOR bstr value at the given position, advancing pos
+fn cbor_read_bstr(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    if *pos >= data.len() {
+        return None;
+    }
+    let initial = data[*pos];
+    *pos += 1;
+    let major = initial >> 5;
+    let additional = initial & 0x1f;
+    
+    if major != 2 {
+        error!("cbor_read_bstr: expected bstr (major 2), got major {}", major);
+        return None;
+    }
+    
+    let len = cbor_decode_additional(data, pos, additional)?;
+    if *pos + len > data.len() {
+        error!("cbor_read_bstr: length {} exceeds data ({})", len, data.len() - *pos);
+        return None;
+    }
+    let result = data[*pos..*pos + len].to_vec();
+    *pos += len;
+    Some(result)
+}
+
+/// Read a CBOR tstr value at the given position, advancing pos
+fn cbor_read_tstr(data: &[u8], pos: &mut usize) -> Option<String> {
+    if *pos >= data.len() {
+        return None;
+    }
+    let initial = data[*pos];
+    *pos += 1;
+    let major = initial >> 5;
+    let additional = initial & 0x1f;
+    
+    if major != 3 {
+        error!("cbor_read_tstr: expected tstr (major 3), got major {}", major);
+        return None;
+    }
+    
+    let len = cbor_decode_additional(data, pos, additional)?;
+    if *pos + len > data.len() {
+        return None;
+    }
+    let s = core::str::from_utf8(&data[*pos..*pos + len]).ok()?;
+    *pos += len;
+    Some(String::from(s))
+}
+
+/// Read a CBOR uint value at the given position, advancing pos
+fn cbor_read_uint(data: &[u8], pos: &mut usize) -> Option<u64> {
+    if *pos >= data.len() {
+        return None;
+    }
+    let initial = data[*pos];
+    *pos += 1;
+    let major = initial >> 5;
+    let additional = initial & 0x1f;
+    
+    if major != 0 {
+        error!("cbor_read_uint: expected uint (major 0), got major {}", major);
+        return None;
+    }
+    
+    let val = cbor_decode_additional(data, pos, additional)?;
+    Some(val as u64)
+}
+
+/// Decode CBOR additional info to get length/value
+fn cbor_decode_additional(data: &[u8], pos: &mut usize, additional: u8) -> Option<usize> {
+    match additional {
+        n if n < 24 => Some(n as usize),
+        24 => {
+            if *pos >= data.len() { return None; }
+            let v = data[*pos] as usize;
+            *pos += 1;
+            Some(v)
+        }
+        25 => {
+            if *pos + 1 >= data.len() { return None; }
+            let v = ((data[*pos] as usize) << 8) | (data[*pos + 1] as usize);
+            *pos += 2;
+            Some(v)
+        }
+        26 => {
+            if *pos + 3 >= data.len() { return None; }
+            let v = ((data[*pos] as usize) << 24) | ((data[*pos+1] as usize) << 16)
+                  | ((data[*pos+2] as usize) << 8) | (data[*pos+3] as usize);
+            *pos += 4;
+            Some(v)
+        }
+        _ => {
+            error!("cbor_decode_additional: unsupported additional {}", additional);
+            None
+        }
+    }
+}
+
+/// Skip one CBOR value, advancing pos
+fn cbor_skip_value(data: &[u8], pos: &mut usize) -> Option<()> {
+    if *pos >= data.len() {
+        return None;
+    }
+    let initial = data[*pos];
+    *pos += 1;
+    let major = initial >> 5;
+    let additional = initial & 0x1f;
+    
+    let arg = cbor_decode_additional(data, pos, additional)?;
+    
+    match major {
+        0 | 1 => { /* uint/negint - already consumed */ }
+        2 | 3 => { *pos += arg; } // bstr/tstr
+        4 => { // array
+            for _ in 0..arg {
+                cbor_skip_value(data, pos)?;
+            }
+        }
+        5 => { // map
+            for _ in 0..arg {
+                cbor_skip_value(data, pos)?; // key
+                cbor_skip_value(data, pos)?; // value
+            }
+        }
+        6 => { cbor_skip_value(data, pos)?; } // tag
+        7 => { /* simple/float */ }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Capture raw bytes of a CBOR value without consuming
+fn cbor_capture_value(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    let start = *pos;
+    cbor_skip_value(data, pos)?;
+    Some(data[start..*pos].to_vec())
+}
+
+/// Parse OVHeader from CBOR bytes
+/// OVHeader = [OVHProtVer, OVGuid, OVRVInfo, OVDeviceInfo, OVPubKey, OVDevCertChainHash]
+fn parse_ov_header_cbor(data: &[u8]) -> Option<OVHeader> {
+    let mut pos: usize = 0;
+    
+    // Read array header
+    if pos >= data.len() { return None; }
+    let initial = data[pos];
+    pos += 1;
+    let major = initial >> 5;
+    let additional = initial & 0x1f;
+    
+    if major != 4 {
+        error!("parse_ov_header: expected array (major 4), got {}", major);
+        return None;
+    }
+    let count = cbor_decode_additional(data, &mut pos, additional)?;
+    if count < 5 {
+        error!("parse_ov_header: expected >= 5 elements, got {}", count);
+        return None;
+    }
+    info!("parse_ov_header: {} elements", count);
+    
+    // [0] OVHProtVer (uint)
+    let prot_ver = cbor_read_uint(data, &mut pos)?;
+    info!("  OVHProtVer: {}", prot_ver);
+    
+    // [1] OVGuid (bstr, 16 bytes)
+    let guid_bytes = cbor_read_bstr(data, &mut pos)?;
+    if guid_bytes.len() != 16 {
+        error!("parse_ov_header: GUID expected 16 bytes, got {}", guid_bytes.len());
+        return None;
+    }
+    let mut guid = [0u8; 16];
+    guid.copy_from_slice(&guid_bytes);
+    info!("  OVGuid: {:02x?}", guid);
+    
+    // [2] OVRVInfo (RendezvousInfo - complex CBOR, capture raw)
+    let rv_info = cbor_capture_value(data, &mut pos)?;
+    info!("  OVRVInfo: {} bytes", rv_info.len());
+    
+    // [3] OVDeviceInfo (tstr)
+    let device_info = cbor_read_tstr(data, &mut pos)?;
+    info!("  OVDeviceInfo: {}", device_info);
+    
+    // [4] OVPubKey (PublicKey - complex CBOR, capture raw)
+    let pub_key = cbor_capture_value(data, &mut pos)?;
+    info!("  OVPubKey: {} bytes", pub_key.len());
+    
+    // [5] OVDevCertChainHash (Hash or null, capture raw)
+    let cert_chain_hash = if count >= 6 {
+        // Check for null
+        if pos < data.len() && data[pos] == 0xf6 {
+            pos += 1;
+            info!("  OVDevCertChainHash: null");
+            vec![0xf6] // preserve null encoding
+        } else {
+            let h = cbor_capture_value(data, &mut pos)?;
+            info!("  OVDevCertChainHash: {} bytes", h.len());
+            h
+        }
+    } else {
+        vec![]
+    };
     
     Some(OVHeader {
-        guid: [0u8; 16],
-        rv_info: vec![],
-        device_info: String::from("placeholder"),
-        pub_key: vec![],
-        cert_chain_hash: vec![],
+        guid,
+        rv_info,
+        device_info,
+        pub_key,
+        cert_chain_hash,
+        raw_cbor: data.to_vec(),
     })
 }
 
@@ -504,9 +856,19 @@ fn build_csr_tbs(subject_cn: &str, public_x: &[u8], public_y: &[u8]) -> Vec<u8> 
     // attributes [0] (empty)
     buf.extend_from_slice(&[0xa0, 0x00]);
     
-    // Update sequence length
+    // Update sequence length (may need long-form encoding)
     let seq_len = buf.len() - seq_start - 2;
-    buf[seq_start + 1] = seq_len as u8;
+    if seq_len < 128 {
+        buf[seq_start + 1] = seq_len as u8;
+    } else {
+        // Need long-form: rebuild with correct length prefix
+        let content = buf[seq_start + 2..].to_vec();
+        buf.truncate(seq_start);
+        buf.push(0x30);
+        buf.push(0x81); // long-form, 1 length byte
+        buf.push(seq_len as u8);
+        buf.extend_from_slice(&content);
+    }
     
     buf
 }
@@ -525,6 +887,7 @@ fn build_x509_name_cn(cn: &str) -> Vec<u8> {
     // AttributeTypeAndValue ::= SEQUENCE { type OID, value ANY }
     let mut atv = Vec::new();
     atv.push(0x30); // SEQUENCE
+    atv.push(0x00); // length placeholder
     
     // type = id-at-commonName (2.5.4.3)
     atv.extend_from_slice(&[0x06, 0x03, 0x55, 0x04, 0x03]);
@@ -619,8 +982,16 @@ fn assemble_csr_der(tbs: &[u8], signature: &[u8]) -> Vec<u8> {
     let total_len = buf.len() - len_pos - 1;
     if total_len < 128 {
         buf[len_pos] = total_len as u8;
+    } else if total_len < 256 {
+        // Long-form: 0x81 <len>
+        let mut new_buf = Vec::with_capacity(buf.len() + 1);
+        new_buf.push(0x30);
+        new_buf.push(0x81);
+        new_buf.push(total_len as u8);
+        new_buf.extend_from_slice(&buf[len_pos + 1..]);
+        return new_buf;
     } else {
-        // Need to expand length field - shift everything
+        // Long-form: 0x82 <hi> <lo>
         let mut new_buf = Vec::with_capacity(buf.len() + 2);
         new_buf.push(0x30);
         new_buf.push(0x82);

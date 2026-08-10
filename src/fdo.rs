@@ -19,7 +19,7 @@ use aes_gcm::aead::generic_array::GenericArray;
 
 type HmacSha256 = Hmac<Sha256>;
 
-use crate::http::{http_post, http_post_with_session};
+use crate::http::{http_post, http_post_with_session, HttpPostResponse};
 use crate::bmo::{BmoSession, process_bmo_message, BmoState};
 use crate::chainload::chainload_image;
 
@@ -1592,8 +1592,10 @@ pub fn perform_to2_hello(owner_url: &str, guid: &[u8; 16]) -> Result<(To2HelloDe
     let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_HELLO_DEVICE_PROBE);
     
     // Send HTTP POST and capture session token
-    let (response, auth_token) = http_post_with_session(&url, &hello_probe, MSG_TO2_HELLO_DEVICE_PROBE, None)
+    let resp = http_post_with_session(&url, &hello_probe, MSG_TO2_HELLO_DEVICE_PROBE, None)
         .ok_or_else(|| FdoError::HttpError(String::from("HTTP POST failed")))?;
+    let response = resp.body;
+    let auth_token = resp.auth_token;
     
     info!("  Response: {} bytes", response.len());
     if auth_token.is_some() {
@@ -1728,8 +1730,9 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     info!("  ProveDevice20 CBOR: {:02x?}", &prove_device[..prove_device.len().min(32)]);
     
     let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_PROVE_DEVICE);
-    let (response, _) = http_post_with_session(&url, &prove_device, MSG_TO2_PROVE_DEVICE, session_token.as_deref())
+    let resp = http_post_with_session(&url, &prove_device, MSG_TO2_PROVE_DEVICE, session_token.as_deref())
         .ok_or_else(|| FdoError::HttpError(String::from("HTTP POST failed")))?;
+    let response = resp.body;
     
     info!("  Response: {} bytes", response.len());
     if !response.is_empty() {
@@ -1804,8 +1807,9 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
         let get_entry = build_to2_get_ov_next_entry(entry_num);
         let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_GET_OV_NEXT_ENTRY);
         
-        let (response, _) = http_post_with_session(&url, &get_entry, MSG_TO2_GET_OV_NEXT_ENTRY, session_token.as_deref())
+        let resp = http_post_with_session(&url, &get_entry, MSG_TO2_GET_OV_NEXT_ENTRY, session_token.as_deref())
             .ok_or_else(|| FdoError::HttpError(String::from("GetOVNextEntry failed")))?;
+        let response = resp.body;
         
         // Parse OVNextEntry20 response: [entry_num, entry_bytes]
         let mut dec = CborDecoder::new(&response);
@@ -1833,8 +1837,9 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     info!("  Encrypted message: {} bytes", encrypted_msg.len());
     
     let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_DEVICE_SVC_INFO_RDY);
-    let (response, _) = http_post_with_session(&url, &encrypted_msg, MSG_TO2_DEVICE_SVC_INFO_RDY, session_token.as_deref())
+    let resp = http_post_with_session(&url, &encrypted_msg, MSG_TO2_DEVICE_SVC_INFO_RDY, session_token.as_deref())
         .ok_or_else(|| FdoError::HttpError(String::from("DeviceSvcInfoRdy failed")))?;
+    let response = resp.body;
     
     info!("  SetupDevice20 response: {} bytes (encrypted)", response.len());
     
@@ -1893,8 +1898,9 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
         let encrypted_msg = cose_encrypt0_a256gcm(&session_keys.sek, &nonce, &device_svc_info)?;
         
         let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_DEVICE_SVC_INFO);
-        let (response, _) = http_post_with_session(&url, &encrypted_msg, MSG_TO2_DEVICE_SVC_INFO, session_token.as_deref())
+        let resp = http_post_with_session(&url, &encrypted_msg, MSG_TO2_DEVICE_SVC_INFO, session_token.as_deref())
             .ok_or_else(|| FdoError::HttpError(String::from("DeviceSvcInfo failed")))?;
+        let response = resp.body;
         
         // Decrypt OwnerSvcInfo (msg 89)
         let owner_svc_info_plain = cose_decrypt0_a256gcm(&session_keys.sek, &response)?;
@@ -1970,8 +1976,9 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     let done_encrypted = cose_encrypt0_a256gcm(&session_keys.sek, &done_nonce, &done_msg)?;
     
     let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_DONE);
-    let (response, _) = http_post_with_session(&url, &done_encrypted, MSG_TO2_DONE, session_token.as_deref())
+    let resp = http_post_with_session(&url, &done_encrypted, MSG_TO2_DONE, session_token.as_deref())
         .ok_or_else(|| FdoError::HttpError(String::from("Done failed")))?;
+    let response = resp.body;
     
     // Decrypt DoneAck (msg 91)
     let done_ack_plain = cose_decrypt0_a256gcm(&session_keys.sek, &response)?;

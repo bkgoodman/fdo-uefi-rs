@@ -14,20 +14,16 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// DeviceMfgInfo map keys (per spec)
-const DMI_KEY_TYPE: u8 = 0;
-const DMI_KEY_ENCODING: u8 = 1;
-const DMI_CSR: u8 = 2;
-const DMI_SPEC_VERSION: u8 = 3;
-const DMI_OVE_EXTRA_REQUEST: u8 = 4;
+// go-fdo custom.DeviceMfgInfo struct field order (CBOR array encoding):
+//   [0] KeyType:      protocol.KeyType
+//   [1] KeyEncoding:  protocol.KeyEncoding
+//   [2] SerialNumber: string (tstr)
+//   [3] DeviceInfo:   string (tstr)
+//   [4] CertInfo:     cbor.X509CertificateRequest (bstr)
 
-/// Payload type keys for OVE_EXTRA_REQUEST (per spec)
-const PT_DEVICE_SERIAL: u8 = 0;
-const PT_MODEL: u8 = 2;
-
-/// PublicKeyType values (from FDO spec Table 4)
-pub const KEY_TYPE_SECP256R1: u8 = 13;
-pub const KEY_TYPE_SECP384R1: u8 = 14;
+/// PublicKeyType values (must match go-fdo protocol.KeyType constants)
+pub const KEY_TYPE_SECP256R1: u8 = 10;
+pub const KEY_TYPE_SECP384R1: u8 = 11;
 
 /// PublicKeyEncoding values (from FDO spec)
 pub const KEY_ENCODING_X509: u8 = 1;
@@ -54,69 +50,53 @@ impl DeviceMfgInfo {
         }
     }
 
-    /// Encode as CBOR map per fdo-appnote-device-mfg-info.bs
-    /// Returns bstr-wrapped CBOR (as required by DI.AppStart)
+    /// Encode as CBOR array matching go-fdo custom.DeviceMfgInfo struct order:
+    ///   [KeyType, KeyEncoding, SerialNumber, DeviceInfo, CertInfo]
+    /// Returns bstr-wrapped CBOR (as required by DI.AppStart cbor.Bstr wrapper)
     pub fn to_cbor(&self) -> Vec<u8> {
-        let inner = self.encode_map();
-        // Wrap in bstr (DeviceMfgInfo = bstr .cbor DeviceMfgInfoMap)
+        let inner = self.encode_array();
+        // Wrap in bstr (Info = bstr .cbor DeviceMfgInfo)
         encode_bstr(&inner)
     }
 
-    /// Encode the inner DeviceMfgInfoMap
-    fn encode_map(&self) -> Vec<u8> {
+    /// Encode as 5-element CBOR array matching go-fdo struct field order
+    fn encode_array(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
         
-        // Map with 5 entries: keys 0,1,2,3,4
-        buf.push(0xa5); // map(5)
+        // 5-element array
+        buf.push(0x85); // array(5)
         
-        // DMI_KEY_TYPE (key 0): uint
-        buf.push(DMI_KEY_TYPE);
+        // [0] KeyType: uint (e.g. 13 = SECP256R1)
         buf.push(self.key_type);
         
-        // DMI_KEY_ENCODING (key 1): uint
-        buf.push(DMI_KEY_ENCODING);
+        // [1] KeyEncoding: uint (e.g. 2 = X5CHAIN)
         buf.push(self.key_encoding);
         
-        // DMI_CSR (key 2): bstr (DER-encoded PKCS#10)
-        buf.push(DMI_CSR);
-        buf.extend_from_slice(&encode_bstr(&self.csr_der));
+        // [2] SerialNumber: tstr
+        let sn = self.serial_number.as_bytes();
+        encode_tstr_into(&mut buf, sn);
         
-        // DMI_SPEC_VERSION (key 3): uint = 1
-        buf.push(DMI_SPEC_VERSION);
-        buf.push(1u8);
+        // [3] DeviceInfo: tstr (model name used as device info string)
+        let model = self.model.as_bytes();
+        encode_tstr_into(&mut buf, model);
         
-        // DMI_OVE_EXTRA_REQUEST (key 4): PayloadMap
-        buf.push(DMI_OVE_EXTRA_REQUEST);
-        buf.extend_from_slice(&self.encode_ove_extra_request());
-        
-        buf
-    }
-
-    /// Encode DMI_OVE_EXTRA_REQUEST PayloadMap
-    /// Contains PT_DEVICE_SERIAL and PT_MODEL as bstr values
-    fn encode_ove_extra_request(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(128);
-        
-        // Map with 2 entries
-        buf.push(0xa2); // map(2)
-        
-        // PT_DEVICE_SERIAL (key 0): bstr containing UTF-8
-        buf.push(PT_DEVICE_SERIAL);
-        buf.extend_from_slice(&encode_bstr(self.serial_number.as_bytes()));
-        
-        // PT_MODEL (key 2): bstr containing UTF-8
-        buf.push(PT_MODEL);
-        buf.extend_from_slice(&encode_bstr(self.model.as_bytes()));
+        // [4] CertInfo: bstr (DER-encoded PKCS#10 CSR)
+        encode_bstr_into(&mut buf, &self.csr_der);
         
         buf
     }
 }
 
-/// Encode byte string with CBOR bstr header
+/// Encode byte string with CBOR bstr header (returns new Vec)
 fn encode_bstr(data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(data.len() + 3);
+    encode_bstr_into(&mut buf, data);
+    buf
+}
+
+/// Encode byte string with CBOR bstr header into existing buffer
+fn encode_bstr_into(buf: &mut Vec<u8>, data: &[u8]) {
     let len = data.len();
-    let mut buf = Vec::with_capacity(len + 3);
-    
     if len < 24 {
         buf.push(0x40 | len as u8);
     } else if len < 256 {
@@ -134,7 +114,22 @@ fn encode_bstr(data: &[u8]) -> Vec<u8> {
         buf.push(len as u8);
     }
     buf.extend_from_slice(data);
-    buf
+}
+
+/// Encode text string with CBOR tstr header into existing buffer
+fn encode_tstr_into(buf: &mut Vec<u8>, data: &[u8]) {
+    let len = data.len();
+    if len < 24 {
+        buf.push(0x60 | len as u8);
+    } else if len < 256 {
+        buf.push(0x78);
+        buf.push(len as u8);
+    } else if len < 65536 {
+        buf.push(0x79);
+        buf.push((len >> 8) as u8);
+        buf.push(len as u8);
+    }
+    buf.extend_from_slice(data);
 }
 
 #[cfg(test)]

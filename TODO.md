@@ -4,20 +4,22 @@
 
 ### Completed
 
-#### Device Initialization (DI) Protocol
+#### Device Initialization (DI) Protocol - FULLY TESTED 2026-08-10
 - [x] DI module structure (src/di/)
-- [x] DeviceMfgInfo CBOR encoding (per fdo-appnote-device-mfg-info.bs)
-- [x] DIAppStart message builder with CapabilityFlags
-- [x] DISetCredentials parser (OVHeader extraction)
+- [x] DeviceMfgInfo CBOR encoding as array matching go-fdo custom.DeviceMfgInfo struct order
+- [x] DIAppStart message builder with CapabilityFlags (FDO 2.0 URL /fdo/200/msg/)
+- [x] DISetCredentials parser (OVHeader extraction, preserves raw CBOR for HMAC)
 - [x] DISetHMAC message builder (Hash structure encoding)
 - [x] DIDone response handling
 - [x] TPM DAK (Device Attestation Key) creation - ECC P-256, handle 0x81020002
 - [x] TPM HMAC key creation - SHA-256, handle 0x81020003
-- [x] CSR generation with TPM signing
+- [x] CSR generation with TPM signing (proper DER encoding with long-form lengths)
 - [x] HMAC computation over OVHeader via TPM
 - [x] TPM NV DefineSpace (index 0x01D10001, spec-defined per securing-fdo-in-tpm.bs)
 - [x] TPM NV Write (DCTPM credential storage)
 - [x] Auto-detection: run DI if no credentials, else TO1/TO2
+- [x] HTTP session token (Authorization: Bearer) threading across DI messages
+- [x] **End-to-end DI verified** against go-fdo server on pe2 QEMU+swtpm
 
 #### Core Infrastructure
 - [x] Manual CBOR encoder for no_std UEFI environment
@@ -84,7 +86,13 @@ to the ECDH x-coordinate result before passing to KDF.
 
 ### Pending
 - [ ] Credential replacement after successful TO2
-- [ ] Error response handling (server returns error instead of expected message)
+
+### Recently Completed (2026-08-10)
+- [x] Error response handling: Message-Type header parsing, FDO error body decoder (error_code, msg_type, error_string)
+- [x] Negative test verified: intentionally wrong KeyType produces clean error log with server message
+- [x] KeyType constants fixed to match go-fdo values (P-256=10, P-384=11)
+- [x] Session token (Authorization: Bearer) threading across DI messages
+- [x] HttpPostResponse struct with body, auth_token, and message_type fields
 
 ## Resolved Blockers
 

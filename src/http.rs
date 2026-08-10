@@ -252,20 +252,24 @@ pub fn http_get(url: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// HTTP POST response containing body, auth token, and message type
+pub struct HttpPostResponse {
+    pub body: Vec<u8>,
+    pub auth_token: Option<String>,
+    pub message_type: Option<u8>,
+}
+
 /// Perform HTTP POST request using raw UEFI HTTP protocol
-/// This bypasses uefi-rs HttpHelper to access HttpMethod::POST
-/// HTTP POST with session token support
-/// Returns (body, authorization_header) where authorization_header can be used for subsequent requests
-pub fn http_post_with_session(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<&str>) -> Option<(Vec<u8>, Option<String>)> {
-    let (response_body, auth_header) = http_post_internal(url, body, _msg_type, auth_token)?;
-    Some((response_body, auth_header))
+/// Returns HttpPostResponse with body, authorization token, and Message-Type header
+pub fn http_post_with_session(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<&str>) -> Option<HttpPostResponse> {
+    http_post_internal(url, body, _msg_type, auth_token)
 }
 
 pub fn http_post(url: &str, body: &[u8], _msg_type: u8) -> Option<Vec<u8>> {
-    http_post_internal(url, body, _msg_type, None).map(|(body, _)| body)
+    http_post_internal(url, body, _msg_type, None).map(|r| r.body)
 }
 
-fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<&str>) -> Option<(Vec<u8>, Option<String>)> {
+fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<&str>) -> Option<HttpPostResponse> {
     use alloc::string::String;
     use alloc::vec;
     use core::ffi::c_void;
@@ -484,9 +488,9 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     debug!("Response received: {} bytes, {} headers", body_len, header_count);
     rx_body.truncate(body_len);
     
-    // Extract Authorization header from UEFI HTTP headers
-    // OVMF may update rx_msg.header to point to its own allocated headers
+    // Extract Authorization and Message-Type headers from UEFI HTTP headers
     let mut auth_header: Option<String> = None;
+    let mut msg_type_header: Option<u8> = None;
     let header_ptr = rx_msg.header;
     debug!("Header ptr: {:p}, count: {}", header_ptr, header_count);
     if !header_ptr.is_null() && header_count > 0 {
@@ -516,6 +520,10 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
                     };
                     auth_header = Some(String::from(token));
                     info!("Found Authorization token: {}...", &token[..token.len().min(20)]);
+                } else if name.eq_ignore_ascii_case("Message-Type") {
+                    if let Ok(mt) = value.trim().parse::<u8>() {
+                        msg_type_header = Some(mt);
+                    }
                 }
             }
         }
@@ -545,8 +553,12 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
         warn!("Failed to destroy HTTP child handle: {:?}", e);
     }
     
-    info!("HTTP POST completed: {} bytes body", body.len());
-    Some((body, auth_header))
+    info!("HTTP POST completed: {} bytes body, msg_type={:?}", body.len(), msg_type_header);
+    Some(HttpPostResponse {
+        body,
+        auth_token: auth_header,
+        message_type: msg_type_header,
+    })
 }
 
 /// Extract Authorization header from raw HTTP headers
