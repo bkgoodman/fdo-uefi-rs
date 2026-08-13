@@ -139,6 +139,13 @@ fn find_http_nic() -> Option<uefi::Handle> {
         warn!("No IP4Config2 handles after connect");
     }
     
+    // Check for TCP4 Service Binding Protocol
+    let tcp4_sb_guid = uefi::guid!("00720665-67eb-4a99-baf7-d3c33a1c7cc9");
+    match boot::locate_handle_buffer(boot::SearchType::ByProtocol(&tcp4_sb_guid)) {
+        Ok(handles) => info!("Found {} TCP4 ServiceBinding handle(s)", handles.len()),
+        Err(_) => warn!("No TCP4 ServiceBinding handles found"),
+    }
+    
     // Look for HTTP Service Binding Protocol handles
     match boot::locate_handle_buffer(boot::SearchType::ByProtocol(
         &HttpBinding::GUID
@@ -155,7 +162,7 @@ fn find_http_nic() -> Option<uefi::Handle> {
 }
 
 /// Configure network via DHCP using IP4Config2 (only runs once)
-fn configure_network(nic_handle: uefi::Handle) -> bool {
+pub fn configure_network(nic_handle: uefi::Handle) -> bool {
     // Skip if already configured
     if NETWORK_CONFIGURED.load(Ordering::Relaxed) {
         debug!("Network already configured, skipping DHCP");
@@ -252,12 +259,7 @@ pub fn http_get(url: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// HTTP POST response containing body, auth token, and message type
-pub struct HttpPostResponse {
-    pub body: Vec<u8>,
-    pub auth_token: Option<String>,
-    pub message_type: Option<u8>,
-}
+use crate::http_api::HttpPostResponse;
 
 /// Perform HTTP POST request using raw UEFI HTTP protocol
 /// Returns HttpPostResponse with body, authorization token, and Message-Type header
@@ -280,7 +282,13 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     };
     use uefi_raw::{Boolean, Ipv4Address};
     
-    let nic_handle = find_http_nic()?;
+    let nic_handle = match find_http_nic() {
+        Some(h) => h,
+        None => {
+            warn!("No HTTP protocol available");
+            return None;
+        }
+    };
     
     // Configure network first
     if !configure_network(nic_handle) {

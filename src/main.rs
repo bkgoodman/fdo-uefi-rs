@@ -8,12 +8,16 @@
 extern crate alloc;
 
 use core::time::Duration;
-use log::info;
+use log::{info, error};
 use uefi::prelude::*;
 use uefi::boot;
 
 mod tpm;
+mod http_api;
+#[cfg(feature = "uefi-http")]
 mod http;
+#[cfg(feature = "tcp4-http")]
+mod tcp4_http;
 mod fdo;
 mod bmo;
 mod chainload;
@@ -26,6 +30,17 @@ fn main() -> Status {
     info!("===========================================");
     info!("  FDO UEFI Client");
     info!("===========================================");
+    
+    // Check for TPM presence first
+    if !tpm::tpm_is_present() {
+        error!("No TPM found! TCG2 protocol not available in this UEFI environment.");
+        error!("Please enable TPM in BIOS (e.g. Intel PTT under System Security).");
+        info!("");
+        info!("FDO UEFI Client exiting.");
+        boot::stall(Duration::from_secs(5));
+        return Status::DEVICE_ERROR;
+    }
+    info!("TPM detected (TCG2 protocol available).");
     
     // Check if device credentials exist in TPM
     info!("Checking for FDO credentials in TPM...");
@@ -66,7 +81,7 @@ fn main() -> Status {
 /// Run TO1/TO2 onboarding protocols
 fn run_onboarding(device_guid: &[u8; 16]) {
     let owner_url = tpm::read_fdo_rv_info()
-        .unwrap_or_else(|| alloc::string::String::from("http://10.0.2.2:8080"));
+        .unwrap_or_else(|| alloc::string::String::from("http://192.168.200.30:8080"));
     info!("Owner/RV URL: {}", owner_url);
     
     // Run TO1 protocol

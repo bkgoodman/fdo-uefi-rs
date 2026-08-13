@@ -93,8 +93,8 @@ fn build_nv_read_cmd(nv_index: u32, size: u16, offset: u16) -> Vec<u8> {
     pack_u32(&mut cmd[pos..pos+4], TPM2_CC_NV_READ);
     pos += 4;
     
-    // authHandle (use NV index itself for owner read)
-    pack_u32(&mut cmd[pos..pos+4], nv_index);
+    // authHandle = TPM_RH_OWNER (required for OWNERREAD attribute)
+    pack_u32(&mut cmd[pos..pos+4], TPM2_RH_OWNER);
     pos += 4;
     
     // nvIndex
@@ -864,6 +864,7 @@ pub fn tpm_sign_with_dak(digest: &[u8; 32]) -> Option<Vec<u8>> {
 
 /// Read data from TPM NV index
 pub fn tpm_nv_read(nv_index: u32) -> Option<Vec<u8>> {
+    info!("tpm_nv_read: reading index 0x{:08x}", nv_index);
     // Get TCG2 protocol
     let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
@@ -875,7 +876,14 @@ pub fn tpm_nv_read(nv_index: u32) -> Option<Vec<u8>> {
     let result = tcg.submit_command(&read_public_cmd, &mut response);
     
     if result.is_err() {
-        warn!("submit_command (NV_ReadPublic) failed");
+        warn!("submit_command (NV_ReadPublic) failed for 0x{:08x}", nv_index);
+        return None;
+    }
+    
+    let rc = unpack_u32(&response[6..10]);
+    info!("NV_ReadPublic response: rc=0x{:08x} for index 0x{:08x}", rc, nv_index);
+    if rc != 0 {
+        info!("NV index 0x{:08x} does not exist (rc=0x{:08x})", nv_index, rc);
         return None;
     }
     
@@ -982,8 +990,15 @@ fn skip_cbor_value(data: &[u8], pos: &mut usize) -> bool {
 /// DCTPM is a CBOR array or map with GUID at index/key 4
 pub fn read_fdo_guid() -> Option<[u8; 16]> {
     // Try the consolidated DCTPM index (0x01D10001)
-    let data = tpm_nv_read(FDO_NV_INDEX_ALT)?;
-    info!("DCTPM NV data: {} bytes", data.len());
+    info!("Checking TPM NV for DCTPM at index 0x{:08x}...", FDO_NV_INDEX_ALT);
+    let data = match tpm_nv_read(FDO_NV_INDEX_ALT) {
+        Some(d) => d,
+        None => {
+            info!("No DCTPM found in NV (index 0x{:08x} not defined or empty)", FDO_NV_INDEX_ALT);
+            return None;
+        }
+    };
+    info!("DCTPM NV data: {} bytes, first 16: {:02x?}", data.len(), &data[..data.len().min(16)]);
     
     // Parse CBOR map to extract GUID at key 4
     // CBOR map format: 0xA0-0xBF for small maps, or 0xB9/0xBA/0xBB for larger
@@ -1131,7 +1146,15 @@ pub fn read_fdo_guid() -> Option<[u8; 16]> {
 pub fn read_fdo_rv_info() -> Option<alloc::string::String> {
     // For now, return hardcoded - will implement full parsing later
     // The RV info is at key 5 in the DCTPM CBOR map
-    Some(alloc::string::String::from("http://10.0.2.2:8080"))
+    Some(alloc::string::String::from("http://192.168.200.30:8080"))
+}
+
+/// Check if TPM (TCG2 protocol) is available in this UEFI environment
+pub fn tpm_is_present() -> bool {
+    match boot::get_handle_for_protocol::<Tcg>() {
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
 /// Test TPM functionality
@@ -1205,27 +1228,96 @@ pub struct TpmSigningKey {
     pub public_y: Vec<u8>,
 }
 
-/// Create an ECDSA signing key (P-256) in TPM
-/// Returns transient handle and public key coordinates
-pub fn tpm_create_signing_key() -> Option<TpmSigningKey> {
-    let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
-    let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
+/// Create an ECDSA signing key (P-256) in TPM and persist it.
+/// Creates the key and runs EvictControl in the SAME TCG2 session so the
+/// transient handle isn't flushed by the UEFI resource manager.
+/// If a stale key exists at persistent_handle, it is evicted first.
+pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmSigningKey> {
+    info!("TPM: tpm_create_and_persist_signing_key(0x{:08x})", persistent_handle);
+    let tcg_handle = match boot::get_handle_for_protocol::<Tcg>() {
+        Ok(h) => { info!("TPM: got TCG handle"); h }
+        Err(e) => { error!("TPM: get_handle_for_protocol failed: {:?}", e); return None; }
+    };
+    let mut tcg = match boot::open_protocol_exclusive::<Tcg>(tcg_handle) {
+        Ok(t) => { info!("TPM: opened TCG protocol"); t }
+        Err(e) => { error!("TPM: open_protocol_exclusive failed: {:?}", e); return None; }
+    };
     
+    // Step 0: Evict any stale key at the persistent handle
+    let evict_cmd = build_evict_control_cmd(persistent_handle, persistent_handle);
+    let mut evict_resp = vec![0u8; 64];
+    if tcg.submit_command(&evict_cmd, &mut evict_resp).is_ok() {
+        let rc = unpack_u32(&evict_resp[6..10]);
+        if rc == 0 {
+            info!("TPM: Evicted stale key at 0x{:08x}", persistent_handle);
+        } else {
+            info!("TPM: No stale key at 0x{:08x} (rc=0x{:08x})", persistent_handle, rc);
+        }
+    }
+    
+    // Step 1: CreatePrimary signing key
     let cmd = build_create_primary_signing_cmd();
     let mut response = vec![0u8; 1024];
     
-    info!("TPM: Creating signing key...");
+    info!("TPM: Creating signing key ({} byte cmd)...", cmd.len());
     let result = tcg.submit_command(&cmd, &mut response);
     
     if result.is_err() {
-        warn!("TPM2_CreatePrimary (signing) failed");
+        warn!("TPM2_CreatePrimary (signing) UEFI submit failed: {:?}", result.err());
+        return None;
+    }
+    
+    if response.len() < 10 {
+        warn!("TPM2_CreatePrimary response too short: {} bytes", response.len());
+        return None;
+    }
+    
+    let rc = unpack_u32(&response[6..10]);
+    info!("TPM2_CreatePrimary response: rc=0x{:08x}, resp_len={}", rc, unpack_u32(&response[2..6]));
+    if rc != 0 {
+        warn!("TPM2_CreatePrimary error code: 0x{:08x}", rc);
         return None;
     }
     
     let key_pair = parse_create_primary_response(&response)?;
+    let transient_handle = key_pair.handle;
+    info!("TPM: Signing key created: transient=0x{:08x}", transient_handle);
     
+    // Step 2: EvictControl to persist the transient handle (same session!)
+    let persist_cmd = build_evict_control_cmd(transient_handle, persistent_handle);
+    let mut persist_resp = vec![0u8; 64];
+    
+    let mut persisted = false;
+    for attempt in 0..5 {
+        let mut resp = vec![0u8; 64];
+        if tcg.submit_command(&persist_cmd, &mut resp).is_err() {
+            warn!("TPM: EvictControl submit failed (attempt {})", attempt);
+            boot::stall(core::time::Duration::from_millis(200));
+            continue;
+        }
+        let rc = unpack_u32(&resp[6..10]);
+        info!("TPM: EvictControl(0x{:08x}->0x{:08x}) rc=0x{:08x} (attempt {})", 
+              transient_handle, persistent_handle, rc, attempt);
+        if rc == 0x922 {
+            boot::stall(core::time::Duration::from_millis(200));
+            continue;
+        }
+        if rc == 0 {
+            persisted = true;
+            break;
+        }
+        warn!("TPM: EvictControl error: 0x{:08x}", rc);
+        break;
+    }
+    
+    if !persisted {
+        warn!("TPM: Failed to persist signing key at 0x{:08x}", persistent_handle);
+        return None;
+    }
+    
+    info!("TPM: Signing key persisted at 0x{:08x}", persistent_handle);
     Some(TpmSigningKey {
-        handle: key_pair.handle,
+        handle: persistent_handle,
         public_x: key_pair.public_x,
         public_y: key_pair.public_y,
     })
@@ -1326,12 +1418,28 @@ fn build_create_primary_signing_cmd() -> Vec<u8> {
     cmd
 }
 
-/// Create an HMAC key in TPM
-/// Returns transient handle
-pub fn tpm_create_hmac_key() -> Option<u32> {
+/// Create an HMAC key in TPM, compute HMAC over data, and persist the key.
+/// All done in a single TCG2 session because the UEFI firmware's
+/// resource manager flushes transient handles when the protocol is closed.
+/// If a stale key exists at persistent_handle, it is evicted first.
+pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Option<(u32, Vec<u8>)> {
+    info!("TPM: tpm_create_hmac_and_persist() data_len={}, persist=0x{:08x}", data.len(), persistent_handle);
     let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
     
+    // Step 0: Evict any stale key at the persistent handle
+    let evict_cmd = build_evict_control_cmd(persistent_handle, persistent_handle);
+    let mut evict_resp = vec![0u8; 64];
+    if tcg.submit_command(&evict_cmd, &mut evict_resp).is_ok() {
+        let rc = unpack_u32(&evict_resp[6..10]);
+        if rc == 0 {
+            info!("TPM: Evicted stale HMAC key at 0x{:08x}", persistent_handle);
+        } else {
+            info!("TPM: No stale HMAC key at 0x{:08x} (rc=0x{:08x})", persistent_handle, rc);
+        }
+    }
+    
+    // Step 1: CreatePrimary HMAC key
     let cmd = build_create_primary_hmac_cmd();
     let mut response = vec![0u8; 512];
     
@@ -1343,7 +1451,6 @@ pub fn tpm_create_hmac_key() -> Option<u32> {
         return None;
     }
     
-    // Parse response to get handle
     if response.len() < 14 {
         return None;
     }
@@ -1354,8 +1461,78 @@ pub fn tpm_create_hmac_key() -> Option<u32> {
         return None;
     }
     
-    let handle = unpack_u32(&response[10..14]);
-    Some(handle)
+    let hmac_handle = unpack_u32(&response[10..14]);
+    info!("TPM: HMAC key created: transient=0x{:08x}", hmac_handle);
+    
+    // Step 2: Compute HMAC using the key (same TCG2 session — handle is still valid)
+    let hmac_cmd = build_hmac_cmd(hmac_handle, data);
+    info!("TPM: HMAC command: {} bytes, header+auth: {:02x?}", hmac_cmd.len(), &hmac_cmd[..hmac_cmd.len().min(30)]);
+    
+    let mut hmac_value = None;
+    for attempt in 0..5 {
+        let mut hmac_response = vec![0u8; 256];
+        
+        let result = tcg.submit_command(&hmac_cmd, &mut hmac_response);
+        if result.is_err() {
+            warn!("TPM2_HMAC submit_command failed (attempt {})", attempt);
+            boot::stall(core::time::Duration::from_millis(100));
+            continue;
+        }
+        
+        let rc = unpack_u32(&hmac_response[6..10]);
+        if rc == 0x922 {
+            info!("TPM: HMAC got TPM_RC_RETRY (0x922), attempt {}, retrying after delay...", attempt);
+            boot::stall(core::time::Duration::from_millis(200));
+            continue;
+        }
+        
+        info!("TPM: HMAC response first 14: {:02x?}", &hmac_response[..14]);
+        hmac_value = parse_hmac_response(&hmac_response);
+        break;
+    }
+    
+    let hmac_value = match hmac_value {
+        Some(v) => v,
+        None => {
+            warn!("TPM2_HMAC failed after all retries");
+            return None;
+        }
+    };
+    
+    // Step 3: EvictControl to persist the HMAC key (same session!)
+    let persist_cmd = build_evict_control_cmd(hmac_handle, persistent_handle);
+    
+    let mut persisted = false;
+    for attempt in 0..5 {
+        let mut resp = vec![0u8; 64];
+        if tcg.submit_command(&persist_cmd, &mut resp).is_err() {
+            warn!("TPM: EvictControl (HMAC) submit failed (attempt {})", attempt);
+            boot::stall(core::time::Duration::from_millis(200));
+            continue;
+        }
+        let rc = unpack_u32(&resp[6..10]);
+        info!("TPM: EvictControl HMAC(0x{:08x}->0x{:08x}) rc=0x{:08x} (attempt {})",
+              hmac_handle, persistent_handle, rc, attempt);
+        if rc == 0x922 {
+            boot::stall(core::time::Duration::from_millis(200));
+            continue;
+        }
+        if rc == 0 {
+            persisted = true;
+            break;
+        }
+        warn!("TPM: EvictControl (HMAC) error: 0x{:08x}", rc);
+        break;
+    }
+    
+    if !persisted {
+        warn!("TPM: Failed to persist HMAC key at 0x{:08x}", persistent_handle);
+        // Still return the HMAC value - DI can continue, just key won't be persistent
+    } else {
+        info!("TPM: HMAC key persisted at 0x{:08x}", persistent_handle);
+    }
+    
+    Some((persistent_handle, hmac_value))
 }
 
 /// Build TPM2_CreatePrimary command for HMAC key
@@ -1367,9 +1544,10 @@ fn build_create_primary_hmac_cmd() -> Vec<u8> {
     pack_u16(&mut cmd[0..2], TPM2_ST_SESSIONS);
     pack_u32(&mut cmd[6..10], TPM2_CC_CREATE_PRIMARY);
     
-    // primaryHandle = TPM_RH_ENDORSEMENT (per go-fdo GenerateSpecHMACKey)
+    // primaryHandle = TPM_RH_OWNER (Owner Hierarchy has empty auth on real hardware)
+    // go-fdo uses TPM_RH_ENDORSEMENT but that requires policy auth on real TPMs
     let mut handle_bytes = [0u8; 4];
-    pack_u32(&mut handle_bytes, 0x4000000B); // TPM_RH_ENDORSEMENT
+    pack_u32(&mut handle_bytes, 0x40000001); // TPM_RH_OWNER
     cmd.extend_from_slice(&handle_bytes);
     
     // Authorization area
@@ -1404,8 +1582,8 @@ fn build_create_primary_hmac_cmd() -> Vec<u8> {
     pack_u16(&mut alg, TPM2_ALG_SHA256);
     cmd.extend_from_slice(&alg);
     
-    // objectAttributes: fixedTPM | fixedParent | sensitivedataOrigin | userWithAuth | adminWithPolicy | signEncrypt
-    // 0x000400F2 (matches go-fdo GenerateSpecHMACKey)
+    // objectAttributes: fixedTPM | fixedParent | sensitivedataOrigin | userWithAuth | adminWithPolicy | sign
+    // 0x000400F2 (per FDO TPM spec Table 11: adminWithPolicy only affects admin ops, not user ops like HMAC)
     cmd.extend_from_slice(&[0x00, 0x04, 0x00, 0xF2]);
     
     // authPolicy (empty)
@@ -1441,18 +1619,33 @@ fn build_create_primary_hmac_cmd() -> Vec<u8> {
 
 /// Compute HMAC using TPM key
 pub fn tpm_hmac(key_handle: u32, data: &[u8]) -> Option<Vec<u8>> {
-    let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
-    let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
+    info!("TPM: tpm_hmac() handle=0x{:08x}, data_len={}", key_handle, data.len());
+    let tcg_handle = match boot::get_handle_for_protocol::<Tcg>() {
+        Ok(h) => h,
+        Err(e) => {
+            error!("TPM: HMAC: get_handle_for_protocol failed: {:?}", e);
+            return None;
+        }
+    };
+    let mut tcg = match boot::open_protocol_exclusive::<Tcg>(tcg_handle) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("TPM: HMAC: open_protocol_exclusive failed: {:?}", e);
+            return None;
+        }
+    };
     
     let cmd = build_hmac_cmd(key_handle, data);
+    info!("TPM: HMAC command: {} bytes, first 20: {:02x?}", cmd.len(), &cmd[..cmd.len().min(20)]);
     let mut response = vec![0u8; 256];
     
     let result = tcg.submit_command(&cmd, &mut response);
     if result.is_err() {
-        warn!("TPM2_HMAC failed");
+        warn!("TPM2_HMAC submit_command failed");
         return None;
     }
     
+    info!("TPM: HMAC response first 14: {:02x?}", &response[..14]);
     parse_hmac_response(&response)
 }
 
@@ -1629,38 +1822,74 @@ pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
         Err(_) => return false,
     };
     
-    // First try to define the NV space
+    // First try to define the NV space (with retry for TPM_RC_RETRY)
     let define_cmd = build_nv_define_space_cmd(nv_index, data.len() as u16);
-    info!("NV DefineSpace cmd ({} bytes): {:02x?}", define_cmd.len(), &define_cmd[..define_cmd.len().min(60)]);
-    let mut response = vec![0u8; 64];
+    info!("NV DefineSpace cmd ({} bytes) for index 0x{:08x}, size={}", define_cmd.len(), nv_index, data.len());
     
-    if tcg.submit_command(&define_cmd, &mut response).is_ok() {
-        let rc = unpack_u32(&response[6..10]);
-        info!("NV DefineSpace response: {:02x?}", &response[..20]);
-        if rc != 0 && rc != 0x0000014c {  // Ignore "already exists"
+    let mut define_ok = false;
+    for attempt in 0..5 {
+        let mut response = vec![0u8; 64];
+        if tcg.submit_command(&define_cmd, &mut response).is_ok() {
+            let rc = unpack_u32(&response[6..10]);
+            info!("NV DefineSpace response: rc=0x{:08x} (attempt {})", rc, attempt);
+            if rc == 0x922 {
+                info!("NV DefineSpace got TPM_RC_RETRY, retrying...");
+                boot::stall(core::time::Duration::from_millis(200));
+                continue;
+            }
+            if rc == 0 || rc == 0x0000014c {  // Success or "already exists"
+                define_ok = true;
+                break;
+            }
             warn!("TPM2_NV_DefineSpace error: 0x{:08x}", rc);
+            break;
+        } else {
+            warn!("NV DefineSpace submit_command failed (attempt {})", attempt);
+            boot::stall(core::time::Duration::from_millis(200));
         }
     }
+    if !define_ok {
+        warn!("NV DefineSpace failed for 0x{:08x}", nv_index);
+        return false;
+    }
     
-    // Now write the data
+    // Now write the data (with retry for TPM_RC_RETRY)
     let write_cmd = build_nv_write_cmd(nv_index, data);
-    let mut response = vec![0u8; 64];
+    info!("NV Write cmd: {} bytes of data to 0x{:08x}", data.len(), nv_index);
     
-    if tcg.submit_command(&write_cmd, &mut response).is_err() {
-        return false;
+    for attempt in 0..5 {
+        let mut response = vec![0u8; 64];
+        
+        if tcg.submit_command(&write_cmd, &mut response).is_err() {
+            warn!("NV_Write submit_command failed (attempt {})", attempt);
+            boot::stall(core::time::Duration::from_millis(200));
+            continue;
+        }
+        
+        if response.len() < 10 {
+            warn!("NV_Write response too short");
+            return false;
+        }
+        
+        let response_code = unpack_u32(&response[6..10]);
+        info!("NV_Write response: rc=0x{:08x} (attempt {})", response_code, attempt);
+        
+        if response_code == 0x922 {
+            info!("NV_Write got TPM_RC_RETRY, retrying...");
+            boot::stall(core::time::Duration::from_millis(200));
+            continue;
+        }
+        
+        if response_code != 0 {
+            warn!("TPM2_NV_Write error: 0x{:08x}", response_code);
+            return false;
+        }
+        
+        return true;
     }
     
-    if response.len() < 10 {
-        return false;
-    }
-    
-    let response_code = unpack_u32(&response[6..10]);
-    if response_code != 0 {
-        warn!("TPM2_NV_Write error: 0x{:08x}", response_code);
-        return false;
-    }
-    
-    true
+    warn!("NV_Write failed after all retries");
+    false
 }
 
 /// Build TPM2_NV_DefineSpace command

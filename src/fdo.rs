@@ -19,7 +19,7 @@ use aes_gcm::aead::generic_array::GenericArray;
 
 type HmacSha256 = Hmac<Sha256>;
 
-use crate::http::{http_post, http_post_with_session, HttpPostResponse};
+use crate::http_api::{http_post, http_post_with_session, HttpPostResponse};
 use crate::bmo::{BmoSession, process_bmo_message, BmoState};
 use crate::chainload::chainload_image;
 

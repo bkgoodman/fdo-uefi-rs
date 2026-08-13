@@ -22,7 +22,7 @@ use alloc::format;
 use log::{info, error, warn};
 use uefi::Status;
 
-use crate::http::{http_post_with_session, HttpPostResponse};
+use crate::http_api::{http_post_with_session, HttpPostResponse};
 use crate::tpm;
 use super::mfginfo::{DeviceMfgInfo, KEY_TYPE_SECP256R1};
 
@@ -60,11 +60,11 @@ pub fn run_di_protocol() -> Status {
         }
     };
     
-    // 2. Create or retrieve device key (DAK) in TPM
-    info!("Creating device key in TPM...");
-    let (dak_handle, public_x, public_y) = match tpm::tpm_create_signing_key() {
+    // 2. Create device key (DAK) in TPM and persist it in the same session
+    info!("Creating and persisting device key in TPM...");
+    let (dak_handle, public_x, public_y) = match tpm::tpm_create_and_persist_signing_key(FDO_DAK_HANDLE) {
         Some(key) => {
-            info!("DAK created: handle=0x{:08x}", key.handle);
+            info!("DAK created and persisted: handle=0x{:08x}", key.handle);
             (key.handle, key.public_x, key.public_y)
         }
         None => {
@@ -73,19 +73,8 @@ pub fn run_di_protocol() -> Status {
         }
     };
     
-    // 3. Create HMAC key in TPM
-    info!("Creating HMAC key in TPM...");
-    let hmac_handle = match tpm::tpm_create_hmac_key() {
-        Some(handle) => {
-            info!("HMAC key created: handle=0x{:08x}", handle);
-            handle
-        }
-        None => {
-            error!("Failed to create HMAC key in TPM");
-            tpm::tpm_flush_context(dak_handle);
-            return Status::DEVICE_ERROR;
-        }
-    };
+    // 3. HMAC key will be created later (must stay in same TCG2 session as HMAC computation)
+    // The UEFI firmware resource manager flushes transient handles when the protocol is closed.
     
     // 4. Generate CSR using TPM-based signing
     info!("Generating CSR...");
@@ -99,7 +88,6 @@ pub fn run_di_protocol() -> Status {
         None => {
             error!("Failed to generate CSR");
             tpm::tpm_flush_context(dak_handle);
-            tpm::tpm_flush_context(hmac_handle);
             return Status::DEVICE_ERROR;
         }
     };
@@ -142,13 +130,15 @@ pub fn run_di_protocol() -> Status {
         }
     };
     
-    // 8. Compute HMAC over OVHeader using TPM
+    // 8. Create HMAC key, compute HMAC, and persist — all in a SINGLE TCG2 session.
+    // The UEFI firmware resource manager flushes transient handles when the
+    // TCG2 protocol is closed, so CreatePrimary + HMAC + EvictControl must share one session.
     // CRITICAL: Use raw_cbor (exact bytes from server) so HMAC matches
     info!("Computing HMAC over OVHeader ({} bytes)...", ov_header.raw_cbor.len());
-    let hmac_value = match tpm::tpm_hmac(hmac_handle, &ov_header.raw_cbor) {
-        Some(hmac) => {
-            info!("HMAC computed: {} bytes", hmac.len());
-            hmac
+    let (hmac_handle, hmac_value) = match tpm::tpm_create_hmac_and_persist(&ov_header.raw_cbor, FDO_HMAC_HANDLE) {
+        Some((handle, hmac)) => {
+            info!("HMAC key created, HMAC computed, and key persisted: handle=0x{:08x}, {} bytes", handle, hmac.len());
+            (handle, hmac)
         }
         None => {
             error!("Failed to compute HMAC");
@@ -173,14 +163,7 @@ pub fn run_di_protocol() -> Status {
         }
     };
     
-    // 10. Persist keys to TPM (EvictControl)
-    info!("Persisting keys to TPM...");
-    if !tpm::tpm_evict_control(dak_handle, FDO_DAK_HANDLE) {
-        warn!("Failed to persist DAK (may already exist)");
-    }
-    if !tpm::tpm_evict_control(hmac_handle, FDO_HMAC_HANDLE) {
-        warn!("Failed to persist HMAC key (may already exist)");
-    }
+    // 10. Keys already persisted in steps 2 and 8 (same TCG2 sessions)
     
     // 11. Write DCTPM to NV index
     info!("Writing DCTPM to TPM NV...");
@@ -202,8 +185,8 @@ pub fn run_di_protocol() -> Status {
 /// Per fdo-appnote-device-mfg-info.bs §mfg-server-discovery
 fn get_manufacturing_server_url() -> Option<String> {
     // TODO: Read from UEFI variable "FdoMfgServerUrl"
-    // For minimal testing, use hardcoded URL (QEMU user-mode networking)
-    Some(String::from("http://10.0.2.2:8080"))
+    // pe2 (192.168.200.30) runs the go-fdo DI server on port 8080
+    Some(String::from("http://192.168.200.30:8080"))
 }
 
 /// Get device serial number (placeholder)

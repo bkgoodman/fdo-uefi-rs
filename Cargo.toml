@@ -5,6 +5,13 @@ edition = "2021"
 authors = ["Brad Goodman"]
 description = "FDO TO1/TO2 client as a UEFI application"
 
+[features]
+default = ["uefi-http", "tcp4-http"]
+# Use EFI_HTTP_PROTOCOL (available in OVMF/QEMU, some server firmware)
+uefi-http = []
+# Use TCP4-based HTTP (works on most real hardware without HTTP DXE driver)
+tcp4-http = []
+
 [dependencies]
 log = "0.4"
 uefi = { version = "0.38", features = ["logger", "panic_handler", "alloc", "global_allocator"] }
