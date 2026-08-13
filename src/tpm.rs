@@ -687,94 +687,44 @@ pub fn tpm_flush_context(handle: u32) {
 /// TPM2_CC_ReadPublic command code
 const TPM2_CC_READ_PUBLIC: u32 = 0x00000173;
 
-/// Read the public key from a persistent handle
+/// Read the DAK public key by recreating it via CreatePrimary.
+/// Since UEFI TCG2 cannot access persistent handles, we recreate
+/// the key (deterministic — same template = same key) to get the public key.
 /// Returns (x, y) coordinates for ECC keys
-pub fn tpm_read_public(handle: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+pub fn tpm_read_public(_handle: u32) -> Option<(Vec<u8>, Vec<u8>)> {
     let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
     
-    // Build TPM2_ReadPublic command
-    let mut cmd = vec![0u8; 14];
-    pack_u16(&mut cmd[0..2], TPM2_ST_NO_SESSIONS);
-    pack_u32(&mut cmd[2..6], 14);
-    pack_u32(&mut cmd[6..10], TPM2_CC_READ_PUBLIC);
-    pack_u32(&mut cmd[10..14], handle);
+    // Recreate DAK via CreatePrimary (deterministic)
+    let cmd = build_create_primary_signing_cmd();
+    let mut response = vec![0u8; 1024];
     
-    let mut response = vec![0u8; 512];
-    
-    info!("TPM: Reading public key from handle 0x{:08x}...", handle);
+    info!("TPM: Recreating DAK to read public key...");
     let result = tcg.submit_command(&cmd, &mut response);
     
     if result.is_err() {
-        warn!("TPM2_ReadPublic command failed");
+        warn!("TPM: CreatePrimary (DAK) for ReadPublic failed");
         return None;
     }
     
     // Parse response
     if response.len() < 14 {
-        warn!("TPM2_ReadPublic response too short: {} bytes", response.len());
+        warn!("TPM: CreatePrimary response too short: {} bytes", response.len());
         return None;
     }
     
     let response_code = unpack_u32(&response[6..10]);
     if response_code != 0 {
-        warn!("TPM2_ReadPublic failed: 0x{:08x}", response_code);
+        warn!("TPM: CreatePrimary (DAK) error: 0x{:08x}", response_code);
         return None;
     }
     
-    info!("TPM: ReadPublic response OK, {} bytes", response.len());
+    // Use parse_create_primary_response which handles the CreatePrimary response format
+    let key_pair = parse_create_primary_response(&response)?;
+    info!("TPM: Public key read via CreatePrimary: x={} bytes, y={} bytes", 
+          key_pair.public_x.len(), key_pair.public_y.len());
     
-    // Skip header(10)
-    let mut pos = 10;
-    
-    // TPM2B_PUBLIC
-    if response.len() < pos + 2 {
-        return None;
-    }
-    let public_size = unpack_u16(&response[pos..pos+2]) as usize;
-    pos += 2;
-    
-    if response.len() < pos + public_size {
-        return None;
-    }
-    
-    // Skip type(2) + nameAlg(2) + attributes(4) + authPolicy.size(2)
-    pos += 2 + 2 + 4;
-    if response.len() < pos + 2 {
-        return None;
-    }
-    let auth_policy_size = unpack_u16(&response[pos..pos+2]) as usize;
-    pos += 2 + auth_policy_size;
-    
-    // Skip parameters: symmetric(2) + scheme(2) + scheme.hashAlg(2) + curveID(2) + kdf(2)
-    pos += 2 + 2 + 2 + 2 + 2;
-    
-    // unique.x
-    if response.len() < pos + 2 {
-        return None;
-    }
-    let x_size = unpack_u16(&response[pos..pos+2]) as usize;
-    pos += 2;
-    if response.len() < pos + x_size {
-        return None;
-    }
-    let public_x = response[pos..pos+x_size].to_vec();
-    pos += x_size;
-    
-    // unique.y
-    if response.len() < pos + 2 {
-        return None;
-    }
-    let y_size = unpack_u16(&response[pos..pos+2]) as usize;
-    pos += 2;
-    if response.len() < pos + y_size {
-        return None;
-    }
-    let public_y = response[pos..pos+y_size].to_vec();
-    
-    info!("TPM: Public key read: x={} bytes, y={} bytes", public_x.len(), public_y.len());
-    
-    Some((public_x, public_y))
+    Some((key_pair.public_x, key_pair.public_y))
 }
 
 // P-256 curve order N (for low-S normalization)
@@ -819,14 +769,35 @@ fn subtract_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// Sign a SHA-256 digest using the FDO Device Attestation Key (DAK)
 /// Returns the signature as concatenated r || s (64 bytes for P-256)
 /// Applies low-S normalization per BIP-0062 / RFC 6979
+///
+/// Since the UEFI TCG2 protocol cannot access persistent handles across
+/// sessions, we recreate the DAK via CreatePrimary (deterministic — same
+/// hierarchy + same template = same key) and sign in the same session.
 pub fn tpm_sign_with_dak(digest: &[u8; 32]) -> Option<Vec<u8>> {
     let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
     
-    let cmd = build_sign_cmd(FDO_DAK_HANDLE, digest);
+    // Recreate DAK via CreatePrimary (deterministic — same key every time)
+    let create_cmd = build_create_primary_signing_cmd();
+    let mut create_resp = vec![0u8; 1024];
+    info!("TPM: Recreating DAK via CreatePrimary for signing...");
+    if tcg.submit_command(&create_cmd, &mut create_resp).is_err() {
+        warn!("TPM: CreatePrimary (DAK) failed");
+        return None;
+    }
+    let create_rc = unpack_u32(&create_resp[6..10]);
+    if create_rc != 0 {
+        warn!("TPM: CreatePrimary (DAK) error: 0x{:08x}", create_rc);
+        return None;
+    }
+    let dak_handle = unpack_u32(&create_resp[10..14]);
+    info!("TPM: DAK recreated: transient handle=0x{:08x}", dak_handle);
+    
+    // Sign with the transient handle (same session — handle is valid)
+    let cmd = build_sign_cmd(dak_handle, digest);
     let mut response = vec![0u8; 512];
     
-    info!("TPM: Signing with DAK (handle 0x{:08x})...", FDO_DAK_HANDLE);
+    info!("TPM: Signing with DAK (handle 0x{:08x})...", dak_handle);
     let result = tcg.submit_command(&cmd, &mut response);
     
     if result.is_err() {

@@ -122,6 +122,25 @@ to the ECDH x-coordinate result before passing to KDF.
 - TLS not implemented (HTTP only for now) - acceptable for initial development
 - **Key exchange suite configuration** - Currently hardcoded to ECDH256 (P-256). Need config option to select/limit between key types/sizes (ECDH256 vs ECDH384). Would require TPM P-384 key creation support.
 
+### Hacks / Hardcoded Values to Remove
+
+- [ ] **Hardcoded DI server address** - `192.168.200.30:8080` is hardcoded in the DI module. Replace with spec-defined discovery mechanism (e.g. mDNS, DHCP vendor option, UEFI variable, or compile-time config). See DI spec for proper server discovery.
+- [ ] **Static IP fallback** - TCP4 module falls back to static IP `192.168.200.26/24` when DHCP fails (or times out). This should be removed; rely on DHCP only, or make configurable via UEFI variable.
+- [ ] **Hardcoded RV/owner URL fallback** - `run_onboarding()` in main.rs falls back to `http://192.168.200.30:8080` if RV info isn't in NV. Should only use RV info from DCTPM.
+
+### Network / NIC Improvements
+
+- [ ] **Skip NICs with zeroed MAC addresses** - During NIC scanning, skip handles where MAC is `00:00:00:00:00:00` (virtual/unconfigured NICs). Will significantly speed up connection on hardware with many ServiceBinding handles.
+- [ ] **Cache working NIC handle** - After TO1 finds a working NIC, remember that handle and reuse it for TO2 directly (avoid rescanning all NICs each protocol phase).
+- [ ] **DHCP investigation** - Unclear if DHCP is actually working or if we're timing out too fast and silently falling back to static IP. Need to add logging to confirm whether DHCP succeeds and what address is obtained, or if we always hit the static fallback.
+- [ ] **TCP4 reconnect stuck** - On second run (after DI), TCP4 connection attempts get stuck. May be related to ServiceBinding handles not being properly cleaned up from the first connection.
+
+### TPM Persistent Handle Limitation (Documented)
+
+- UEFI TCG2 on OnLogic k800 cannot access persistent handles (ReadPublic returns 0x902). EvictControl succeeds (keys visible from Linux), but UEFI can't read them on next boot.
+- **Workaround**: Recreate DAK/HMAC keys via `CreatePrimary` each boot (deterministic — same hierarchy + template = same key). No persistent handles needed.
+- This may be OnLogic-specific or a general UEFI TCG2 limitation. Need to test on other hardware (Dell T360).
+
 ## Test Environment
 
 - pe2 VM with QEMU, OVMF firmware
