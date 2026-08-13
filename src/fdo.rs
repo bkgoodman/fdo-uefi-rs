@@ -1589,7 +1589,7 @@ pub fn perform_to2_hello(owner_url: &str, guid: &[u8; 16]) -> Result<(To2HelloDe
     info!("  HelloDeviceProbe: {} bytes", hello_probe.len());
     
     // Build URL for message type 80
-    let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_HELLO_DEVICE_PROBE);
+    let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_HELLO_DEVICE_PROBE);
     
     // Send HTTP POST and capture session token
     let resp = http_post_with_session(&url, &hello_probe, MSG_TO2_HELLO_DEVICE_PROBE, None)
@@ -1676,13 +1676,16 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     
     info!("TO2: Building COSE signature for ProveDevice20...");
     
-    // Read and log FULL DAK public key for debugging key mismatch
-    if let Some((dak_x, dak_y)) = tpm::tpm_read_public(0x81020002) {
-        info!("  DAK public X (full): {:02x?}", &dak_x);
-        info!("  DAK public Y (full): {:02x?}", &dak_y);
-    } else {
-        warn!("  Failed to read DAK public key from TPM!");
-    }
+    // Flush the ECDH transient handle before DAK CreatePrimary+Sign.
+    // UEFI TCG2 doesn't auto-flush transients between sessions, so the ECDH
+    // key blocks CreatePrimary for the DAK.
+    // After signing, we'll recreate the ECDH key for ECDH_ZGen.
+    info!("TO2: Flushing ECDH transient handle 0x{:08x} before DAK sign...", ecdh_key.handle);
+    tpm::tpm_flush_context(ecdh_key.handle);
+    
+    // NOTE: tpm_read_public skipped here — it would leave a DAK transient
+    // that conflicts with tpm_sign_with_dak. The DAK public key was already
+    // embedded in the device certificate during DI.
     
     // Build the payload bytes
     let payload = build_to2_prove_device_payload(
@@ -1729,7 +1732,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     info!("  ProveDevice20: {} bytes", prove_device.len());
     info!("  ProveDevice20 CBOR: {:02x?}", &prove_device[..prove_device.len().min(32)]);
     
-    let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_PROVE_DEVICE);
+    let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_PROVE_DEVICE);
     let resp = http_post_with_session(&url, &prove_device, MSG_TO2_PROVE_DEVICE, session_token.as_deref())
         .ok_or_else(|| FdoError::HttpError(String::from("HTTP POST failed")))?;
     let response = resp.body;
@@ -1768,10 +1771,20 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     info!("  xB preview: {:02x?}", &prove_ov.xb_key_exchange[..prove_ov.xb_key_exchange.len().min(32)]);
     info!("  nonce_to2_prove_ov: {:02x?}", prove_ov.nonce_to2_prove_ov);
     
+    // Recreate the ECDH key for ECDH_ZGen.
+    // We flushed the original ECDH transient handle before DAK signing.
+    // CreatePrimary with the same template is deterministic (same hierarchy seed +
+    // same template = same key), so the recreated key has the same private key
+    // as the one whose public key we sent in ProveDevice20.
+    info!("TO2: Recreating ECDH key for shared secret computation...");
+    let ecdh_key2 = tpm::tpm_create_ecdh_key()
+        .ok_or_else(|| FdoError::CryptoError(String::from("Failed to recreate ECDH key")))?;
+    info!("TO2: ECDH key recreated, handle=0x{:08x}", ecdh_key2.handle);
+    
     // Perform ECDH with server's xB to get shared secret
     // xB is in FDO format: [2-byte xLen][x][2-byte yLen][y][2-byte randLen][rand]
     info!("TO2: Computing ECDH shared secret...");
-    let ecdh_result = tpm::tpm_ecdh_derive(ecdh_key.handle, &prove_ov.xb_key_exchange)
+    let ecdh_result = tpm::tpm_ecdh_derive(ecdh_key2.handle, &prove_ov.xb_key_exchange)
         .ok_or_else(|| FdoError::CryptoError(String::from("ECDH key derivation failed")))?;
     info!("  ECDH result (x-coordinate): {} bytes", ecdh_result.len());
     
@@ -1793,7 +1806,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     info!("  Shared secret preview: {:02x?}", &shared_secret[..shared_secret.len().min(16)]);
     
     // Clean up TPM key handle
-    tpm::tpm_flush_context(ecdh_key.handle);
+    tpm::tpm_flush_context(ecdh_key2.handle);
     
     // Derive session keys from shared secret using FDO KDF
     info!("TO2: Deriving session keys...");
@@ -1805,7 +1818,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     info!("TO2 Step 3: Fetching {} OV entries...", prove_ov.num_ov_entries);
     for entry_num in 0..prove_ov.num_ov_entries {
         let get_entry = build_to2_get_ov_next_entry(entry_num);
-        let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_GET_OV_NEXT_ENTRY);
+        let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_GET_OV_NEXT_ENTRY);
         
         let resp = http_post_with_session(&url, &get_entry, MSG_TO2_GET_OV_NEXT_ENTRY, session_token.as_deref())
             .ok_or_else(|| FdoError::HttpError(String::from("GetOVNextEntry failed")))?;
@@ -1836,7 +1849,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     let encrypted_msg = cose_encrypt0_a256gcm(&session_keys.sek, &nonce, &device_svc_info_rdy)?;
     info!("  Encrypted message: {} bytes", encrypted_msg.len());
     
-    let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_DEVICE_SVC_INFO_RDY);
+    let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_DEVICE_SVC_INFO_RDY);
     let resp = http_post_with_session(&url, &encrypted_msg, MSG_TO2_DEVICE_SVC_INFO_RDY, session_token.as_deref())
         .ok_or_else(|| FdoError::HttpError(String::from("DeviceSvcInfoRdy failed")))?;
     let response = resp.body;
@@ -1897,7 +1910,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
         let nonce: [u8; 12] = [round, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
         let encrypted_msg = cose_encrypt0_a256gcm(&session_keys.sek, &nonce, &device_svc_info)?;
         
-        let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_DEVICE_SVC_INFO);
+        let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_DEVICE_SVC_INFO);
         let resp = http_post_with_session(&url, &encrypted_msg, MSG_TO2_DEVICE_SVC_INFO, session_token.as_deref())
             .ok_or_else(|| FdoError::HttpError(String::from("DeviceSvcInfo failed")))?;
         let response = resp.body;
@@ -1975,7 +1988,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     let done_nonce: [u8; 12] = [0xD0, 0x0E, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
     let done_encrypted = cose_encrypt0_a256gcm(&session_keys.sek, &done_nonce, &done_msg)?;
     
-    let url = format!("{}/fdo/101/msg/{}", owner_url, MSG_TO2_DONE);
+    let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_DONE);
     let resp = http_post_with_session(&url, &done_encrypted, MSG_TO2_DONE, session_token.as_deref())
         .ok_or_else(|| FdoError::HttpError(String::from("Done failed")))?;
     let response = resp.body;
@@ -2013,7 +2026,7 @@ pub fn perform_to1_hello(rv_url: &str, guid: &[u8; 16]) -> Result<To1HelloRvAck,
     info!("  HelloRV: {} bytes", hello_rv.len());
     
     // Build URL for message type 30
-    let url = format!("{}/fdo/101/msg/{}", rv_url, MSG_TO1_HELLO_RV);
+    let url = format!("{}/fdo/200/msg/{}", rv_url, MSG_TO1_HELLO_RV);
     
     // Send HTTP POST
     let response = http_post(&url, &hello_rv, MSG_TO1_HELLO_RV)
@@ -2039,7 +2052,7 @@ fn perform_to1_prove(rv_url: &str, guid: &[u8; 16], nonce4: &[u8; 16]) -> Result
     info!("  ProveToRV: {} bytes", prove_to_rv.len());
     
     // Build URL for message type 32
-    let url = format!("{}/fdo/101/msg/{}", rv_url, MSG_TO1_PROVE_TO_RV);
+    let url = format!("{}/fdo/200/msg/{}", rv_url, MSG_TO1_PROVE_TO_RV);
     
     // Send HTTP POST
     let response = http_post(&url, &prove_to_rv, MSG_TO1_PROVE_TO_RV)

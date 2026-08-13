@@ -26,10 +26,15 @@ use uefi_raw::{Boolean, Ipv4Address, Status as RawStatus, Event};
 
 use crate::http_api::HttpPostResponse;
 
+use core::sync::atomic::{AtomicI8, Ordering};
+
 /// Static IP configuration for real hardware (no DHCP)
 /// OnLogic k800: 192.168.200.26/24
 const STATIC_IP: [u8; 4] = [192, 168, 200, 26];
 const STATIC_SUBNET: [u8; 4] = [255, 255, 255, 0];
+
+/// Cache of last working ServiceBinding handle index (-1 = none cached)
+static LAST_WORKING_NIC: AtomicI8 = AtomicI8::new(-1);
 
 /// EFI_SERVICE_BINDING_PROTOCOL function signatures
 #[repr(C)]
@@ -202,6 +207,48 @@ unsafe fn check_event(event: Event) -> bool {
     status == uefi::Status::SUCCESS
 }
 
+/// Check if a ServiceBinding handle has a non-zero MAC address.
+/// Returns true if the NIC has a real MAC, false if zeroed or unreadable.
+/// Uses GET_PROTOCOL (non-exclusive) to avoid locking out the ServiceBinding.
+fn has_nonzero_mac(handle: uefi::Handle) -> bool {
+    use uefi::proto::network::snp::SimpleNetwork;
+    use uefi::Identify;
+    
+    unsafe {
+        let st = uefi::table::system_table_raw().expect("no system table");
+        let bs = (*st.as_ptr()).boot_services;
+        let mut snp_ptr: *mut c_void = core::ptr::null_mut();
+        
+        let status = ((*bs).open_protocol)(
+            handle.as_ptr(),
+            &SimpleNetwork::GUID,
+            &mut snp_ptr,
+            boot::image_handle().as_ptr(),
+            core::ptr::null_mut(),
+            0x02, // EFI_OPEN_PROTOCOL_GET_PROTOCOL (non-exclusive)
+        );
+        if status != uefi::Status::SUCCESS {
+            // Can't read SNP on this handle — don't skip, might still work
+            return true;
+        }
+        
+        let snp = snp_ptr.cast::<uefi_raw::protocol::network::snp::SimpleNetworkProtocol>();
+        let mode = (*snp).mode;
+        if mode.is_null() {
+            return true;
+        }
+        let mac = (*mode).current_address.0;
+        let all_zero = mac.iter().all(|&b| b == 0);
+        if all_zero {
+            debug!("TCP4: Handle({:?}) has zeroed MAC, skipping", handle);
+            return false;
+        }
+        debug!("TCP4: Handle({:?}) MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            handle, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        true
+    }
+}
+
 /// Try to connect a TCP4 child on a specific ServiceBinding handle.
 /// Returns (tcp4_protocol, child_handle, sb_handle) on success.
 unsafe fn try_connect_on_handle(
@@ -335,12 +382,37 @@ pub fn tcp4_http_post(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     
     let (tcp4, child_handle, sb_handle) = unsafe {
         let mut result = None;
-        for (idx, &handle) in sb_handles.iter().enumerate() {
-            if let Some(conn) = try_connect_on_handle(handle, idx, ip, port) {
+        let cached = LAST_WORKING_NIC.load(Ordering::Relaxed);
+        
+        // If we have a cached working handle, try it first
+        if cached >= 0 && (cached as usize) < sb_handles.len() {
+            let idx = cached as usize;
+            info!("TCP4: Trying cached NIC handle #{} first", idx);
+            if let Some(conn) = try_connect_on_handle(sb_handles[idx], idx, ip, port) {
                 result = Some(conn);
-                break;
             }
         }
+        
+        // If cached handle didn't work, scan all handles
+        if result.is_none() {
+            for (idx, &handle) in sb_handles.iter().enumerate() {
+                // Skip the cached handle (already tried)
+                if cached >= 0 && idx == cached as usize {
+                    continue;
+                }
+                // Skip NICs with zeroed MAC addresses
+                if !has_nonzero_mac(handle) {
+                    continue;
+                }
+                if let Some(conn) = try_connect_on_handle(handle, idx, ip, port) {
+                    LAST_WORKING_NIC.store(idx as i8, Ordering::Relaxed);
+                    info!("TCP4: Caching NIC handle #{} for future use", idx);
+                    result = Some(conn);
+                    break;
+                }
+            }
+        }
+        
         match result {
             Some(r) => r,
             None => {

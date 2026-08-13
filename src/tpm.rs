@@ -830,6 +830,14 @@ pub fn tpm_sign_with_dak(digest: &[u8; 32]) -> Option<Vec<u8>> {
     signature.extend_from_slice(&r_padded);
     signature.extend_from_slice(&s_padded);
     
+    // Flush the DAK transient handle within this same session to free the slot.
+    // UEFI TCG2 doesn't auto-flush transients, so leaving it loaded would
+    // block the next CreatePrimary (e.g. ECDH key recreation).
+    let flush_cmd = build_flush_context_cmd(dak_handle);
+    let mut flush_resp = vec![0u8; 32];
+    let _ = tcg.submit_command(&flush_cmd, &mut flush_resp);
+    info!("TPM: Flushed DAK transient handle 0x{:08x}", dak_handle);
+    
     Some(signature)
 }
 
