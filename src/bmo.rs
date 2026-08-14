@@ -332,17 +332,36 @@ pub fn process_bmo_message(
         
         k if k.starts_with(BMO_KEY_IMAGE_DATA) => {
             // image-data-N message - append to buffer
+            // The chunk value is CBOR bstr-encoded by the server's chunking layer,
+            // so we need to decode it to get the raw image bytes.
             if session.state != BmoState::AwaitingData {
                 warn!("BMO: Unexpected image-data in state {:?}", session.state);
                 return None;
             }
             
-            session.image_buffer.extend_from_slice(value);
+            // Try CBOR bstr decode; fall back to raw if it fails
+            let chunk_data = if !value.is_empty() && (value[0] & 0xe0) == 0x40 {
+                // CBOR major type 2 (byte string) — decode inner bytes
+                match CborDecoder::new(value).read_bytes() {
+                    Ok(inner) => {
+                        info!("BMO: Decoded CBOR bstr chunk: {} -> {} bytes", value.len(), inner.len());
+                        inner
+                    }
+                    Err(_) => {
+                        warn!("BMO: CBOR bstr decode failed, using raw value");
+                        value.to_vec()
+                    }
+                }
+            } else {
+                value.to_vec()
+            };
+            
+            session.image_buffer.extend_from_slice(&chunk_data);
             session.chunks_received += 1;
-            session.bytes_received += value.len() as u64;
+            session.bytes_received += chunk_data.len() as u64;
             
             info!("BMO: Received chunk {}, {} bytes (total: {} bytes)", 
-                  session.chunks_received, value.len(), session.bytes_received);
+                  session.chunks_received, chunk_data.len(), session.bytes_received);
             
             None
         }

@@ -36,7 +36,7 @@
 - [x] TPM 2.0 protocol detection
 - [x] SNP network driver initialization
 
-### TO2 Protocol (In Progress)
+### TO2 Protocol - FULLY TESTED 2026-08-14
 - [x] TO2.HelloDeviceProbe (msg 80) - sends device GUID, nonce, capabilities
 - [x] TO2.HelloDeviceAck20 (msg 81) - parses server nonce, kex/cipher suites (supports both FDO 1.1 and 2.0 formats)
 - [x] TO2.ProveDevice20 (msg 82) - COSE_Sign1 with TPM signature, ECDH xA public key
@@ -50,6 +50,9 @@
 - [x] TO2.SetupDevice20 (msg 87) - decrypts and parses server response
 - [x] TO2.DeviceSvcInfo/OwnerSvcInfo loop (msg 88/89) - FSIM exchange (basic)
 - [x] TO2.Done/DoneAck (msg 90/91) - protocol completion
+- [x] TPM transient handle management - flush ECDH before DAK, flush DAK after sign, recreate ECDH for ZGen
+- [x] FDO 2.0 URL paths (/fdo/200/msg/) for all TO1/TO2 messages
+- [x] **End-to-end DI+TO2 verified** on OnLogic k800 real hardware (2026-08-14)
 
 ### RESOLVED: COSE Encryption Auth Failure
 
@@ -64,7 +67,7 @@ to the ECDH x-coordinate result before passing to KDF.
 - OwnerSvcInfo20: Handle null response (no service info)
 - Done20: Include 2 fields `[nonce, replacement_hmac]` (hmac=null for credential reuse)
 
-### BMO FSIM (Bare Metal Onboarding)
+### BMO FSIM (Bare Metal Onboarding) - IN PROGRESS
 - [x] BMO module structure (bmo.rs)
 - [x] BMO message parsing (image-begin, image-data-N, image-end)
 - [x] BMO session state machine
@@ -74,15 +77,13 @@ to the ECDH x-coordinate result before passing to KDF.
 - [x] devmod:modules advertisement with ["fdo.bmo"]
 - [x] fdo.bmo:active and fdo.bmo:supported-types advertisement
 - [x] Chainload module (chainload.rs) - LoadImage/StartImage with fallback to temp file
-- [ ] **BLOCKED**: Server-side BMO activation - go-fdo server returns null for OwnerSvcInfo
-  - Client sends complete devmod: nummodules, modules (chunked format), os, arch, version, device, sep, bin
-  - Client sends fdo.bmo:active=true, fdo.bmo:supported-types=["application/x-uefi-image"]
-  - Server receives all fields correctly but responds with null OwnerSvcInfo
-  - Root cause: Unknown - requires investigation into go-fdo ServiceInfo module state machine
-  - Potential issues: devmod completion timing, module iterator initialization, or BMO module registration
-- [ ] URL delivery mode (mode 1)
+- [ ] Fix image-data chunk CBOR decoding (chunks are CBOR bstr-wrapped, need inner decode)
+- [ ] **End-to-end inline BMO test** - send actual EFI binary via BMO and chainload it
+- [ ] URL delivery mode (mode 1) - device fetches image from URL
 - [ ] Meta-URL delivery mode with COSE signature verification (mode 2)
-- [ ] BIOS parameter setting (fdo.bmo:set)
+- [ ] dd image mode - write raw disk image to storage device instead of executing EFI app
+- [ ] BIOS parameter setting (fdo.bmo:set) - enroll/change BIOS config (e.g. enable Secure Boot, EFI DB keys)
+- [ ] **Secure Boot + BMO** - allow unsigned BMO payloads to execute when Secure Boot is on (owner-signed via FDO = sufficient trust)
 
 ### Pending
 - [ ] Credential replacement after successful TO2
@@ -130,8 +131,8 @@ to the ECDH x-coordinate result before passing to KDF.
 
 ### Network / NIC Improvements
 
-- [ ] **Skip NICs with zeroed MAC addresses** - During NIC scanning, skip handles where MAC is `00:00:00:00:00:00` (virtual/unconfigured NICs). Will significantly speed up connection on hardware with many ServiceBinding handles.
-- [ ] **Cache working NIC handle** - After TO1 finds a working NIC, remember that handle and reuse it for TO2 directly (avoid rescanning all NICs each protocol phase).
+- [x] **Skip NICs with zeroed MAC addresses** - Non-exclusive GET_PROTOCOL MAC check, skip zeroed MACs (2026-08-14)
+- [x] **Cache working NIC handle** - AtomicI8 cache reuses last working ServiceBinding handle (2026-08-14)
 - [ ] **DHCP investigation** - Unclear if DHCP is actually working or if we're timing out too fast and silently falling back to static IP. Need to add logging to confirm whether DHCP succeeds and what address is obtained, or if we always hit the static fallback.
 - [ ] **TCP4 reconnect stuck** - On second run (after DI), TCP4 connection attempts get stuck. May be related to ServiceBinding handles not being properly cleaned up from the first connection.
 

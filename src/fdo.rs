@@ -1839,7 +1839,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     // Step 4: DeviceSvcInfoRdy20 (ENCRYPTED - type 86)
     // UEFI HTTP client has ~1KB response buffer limit, negotiate MTU down
     info!("TO2 Step 4: Sending DeviceSvcInfoRdy20 (encrypted)...");
-    let device_svc_info_rdy = build_device_svc_info_rdy(Some(1040)); // UEFI HTTP limit
+    let device_svc_info_rdy = build_device_svc_info_rdy(Some(1300)); // Must exceed BMO chunk+overhead (~1064)
     info!("  Plaintext: {} bytes, hex: {:02x?}", device_svc_info_rdy.len(), &device_svc_info_rdy);
     
     // Generate nonce for encryption (12 bytes for AES-GCM)
