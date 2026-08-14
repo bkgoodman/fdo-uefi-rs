@@ -28,7 +28,7 @@ use crate::http_api::HttpPostResponse;
 
 use core::sync::atomic::{AtomicI8, Ordering};
 
-/// Static IP configuration for real hardware (no DHCP)
+/// Static IP fallback for when DHCP fails
 /// OnLogic k800: 192.168.200.26/24
 const STATIC_IP: [u8; 4] = [192, 168, 200, 26];
 const STATIC_SUBNET: [u8; 4] = [255, 255, 255, 0];
@@ -286,13 +286,15 @@ unsafe fn try_connect_on_handle(
         enable_path_mtu_discovery: Boolean::FALSE,
     };
     
+    // Use DHCP-assigned address if available, otherwise fall back to static IP
+    let use_dhcp = crate::http_api::dhcp_succeeded();
     let config = Tcp4ConfigData {
         type_of_service: 0,
         time_to_live: 64,
         access_point: Tcp4AccessPoint {
-            use_default_address: Boolean::FALSE,
-            station_address: Ipv4Address(STATIC_IP),
-            subnet_mask: Ipv4Address(STATIC_SUBNET),
+            use_default_address: if use_dhcp { Boolean::TRUE } else { Boolean::FALSE },
+            station_address: if use_dhcp { Ipv4Address([0, 0, 0, 0]) } else { Ipv4Address(STATIC_IP) },
+            subnet_mask: if use_dhcp { Ipv4Address([0, 0, 0, 0]) } else { Ipv4Address(STATIC_SUBNET) },
             station_port: 0,
             remote_address: Ipv4Address(ip),
             remote_port: port,
@@ -300,6 +302,12 @@ unsafe fn try_connect_on_handle(
         },
         control_option: &mut tcp_option,
     };
+    if use_dhcp {
+        info!("TCP4: Handle #{}: Using DHCP address (use_default_address=TRUE)", handle_idx);
+    } else {
+        info!("TCP4: Handle #{}: Using static IP {}.{}.{}.{} (DHCP not available)",
+            handle_idx, STATIC_IP[0], STATIC_IP[1], STATIC_IP[2], STATIC_IP[3]);
+    }
     
     let status = ((*tcp4).configure)(tcp4, &config);
     if status != RawStatus::SUCCESS {
@@ -369,9 +377,6 @@ pub fn tcp4_http_post(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     let hostname = url.split('/').nth(2).unwrap_or("localhost");
     
     info!("TCP4 HTTP POST to {}.{}.{}.{}:{}{} ({} bytes)", ip[0], ip[1], ip[2], ip[3], port, path, body.len());
-    info!("TCP4: Using static IP {}.{}.{}.{}/{}.{}.{}.{}",
-        STATIC_IP[0], STATIC_IP[1], STATIC_IP[2], STATIC_IP[3],
-        STATIC_SUBNET[0], STATIC_SUBNET[1], STATIC_SUBNET[2], STATIC_SUBNET[3]);
     
     // Find all TCP4 Service Binding handles and try each one
     let sb_handles = find_tcp4_service_bindings();

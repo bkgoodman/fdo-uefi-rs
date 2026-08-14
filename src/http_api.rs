@@ -12,6 +12,19 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[cfg(feature = "tcp4-http")]
+use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+/// Whether DHCP succeeded — used by tcp4_http to decide address mode
+#[cfg(feature = "tcp4-http")]
+static DHCP_SUCCEEDED: AtomicBool = AtomicBool::new(false);
+
+/// Returns true if DHCP completed successfully (IP4 stack has a valid address)
+#[cfg(feature = "tcp4-http")]
+pub fn dhcp_succeeded() -> bool {
+    DHCP_SUCCEEDED.load(AtomicOrdering::Relaxed)
+}
+
 /// HTTP POST response containing body, auth token, and message type
 pub struct HttpPostResponse {
     pub body: Vec<u8>,
@@ -87,22 +100,85 @@ fn ensure_network_configured() {
         }
     }
 
-    // Run DHCP via IP4Config2
+    // Try DHCP via IP4Config2, but only on NICs with link (media_present).
+    // The OnLogic k800 has 6 NICs but only one has a cable. Running DHCP on
+    // a NIC with no link wastes 30 seconds per NIC.
     if let Ok(ip4_handles) = boot::locate_handle_buffer(boot::SearchType::ByProtocol(
         &Ip4Config2::GUID
     )) {
-        if let Some(&h) = ip4_handles.first() {
-            if let Ok(mut ip4cfg) = Ip4Config2::new(h) {
-                match ip4cfg.ifup() {
-                    Ok(()) => {
-                        log::info!("TCP4: Network configured via DHCP");
-                        if let Ok(info) = ip4cfg.get_interface_info() {
-                            log::info!("TCP4: IP Address: {}", info.station_addr);
+        log::info!("TCP4: Found {} IP4Config2 handle(s), checking link state...", ip4_handles.len());
+
+        // Build list of SNP handles with media_present for link detection
+        use uefi::proto::network::snp::SimpleNetwork;
+        let snp_link_macs = {
+            let mut macs_with_link: alloc::vec::Vec<[u8; 6]> = alloc::vec::Vec::new();
+            if let Ok(snp_handles) = boot::locate_handle_buffer(boot::SearchType::ByProtocol(
+                &SimpleNetwork::GUID
+            )) {
+                for &sh in snp_handles.iter() {
+                    let snp_result = unsafe {
+                        boot::open_protocol::<SimpleNetwork>(
+                            boot::OpenProtocolParams {
+                                handle: sh,
+                                agent: boot::image_handle(),
+                                controller: None,
+                            },
+                            boot::OpenProtocolAttributes::GetProtocol,
+                        )
+                    };
+                    if let Ok(snp) = snp_result {
+                        let mode = snp.mode();
+                        let mac = &mode.current_address.0[..6];
+                        let has_link = mode.media_present_supported.into()
+                            && bool::from(mode.media_present);
+                        let mac6: [u8; 6] = [mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]];
+                        log::info!("TCP4: SNP {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} media_present={}",
+                            mac6[0], mac6[1], mac6[2], mac6[3], mac6[4], mac6[5], has_link);
+                        if has_link {
+                            macs_with_link.push(mac6);
                         }
                     }
-                    Err(e) => log::warn!("TCP4: DHCP failed: {:?}", e),
                 }
             }
+            macs_with_link
+        };
+
+        for (idx, &h) in ip4_handles.iter().enumerate() {
+            if let Ok(mut ip4cfg) = Ip4Config2::new(h) {
+                if let Ok(info) = ip4cfg.get_interface_info() {
+                    let hw = info.hw_addr.0;
+                    let mac6: [u8; 6] = [hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]];
+
+                    // Check if this NIC has link by matching MAC to SNP results
+                    let has_link = snp_link_macs.iter().any(|m| *m == mac6);
+                    log::info!("TCP4: IP4Config2 #{}: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
+                        idx, mac6[0], mac6[1], mac6[2], mac6[3], mac6[4], mac6[5], has_link);
+
+                    if !has_link {
+                        log::info!("TCP4: IP4Config2 #{}: skipping DHCP (no link)", idx);
+                        continue;
+                    }
+
+                    // This NIC has link — try DHCP
+                    log::info!("TCP4: IP4Config2 #{}: attempting DHCP (link detected)...", idx);
+                    match ip4cfg.ifup() {
+                        Ok(()) => {
+                            log::info!("TCP4: DHCP succeeded on handle #{}", idx);
+                            if let Ok(info2) = ip4cfg.get_interface_info() {
+                                log::info!("TCP4: DHCP IP={}, Mask={}", info2.station_addr, info2.subnet_mask);
+                            }
+                            DHCP_SUCCEEDED.store(true, AtomicOrdering::Relaxed);
+                            break;
+                        }
+                        Err(e) => {
+                            log::warn!("TCP4: DHCP failed on handle #{}: {:?}", idx, e);
+                        }
+                    }
+                }
+            }
+        }
+        if !DHCP_SUCCEEDED.load(AtomicOrdering::Relaxed) {
+            log::warn!("TCP4: DHCP not available, will use static IP fallback");
         }
     }
 

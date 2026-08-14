@@ -67,7 +67,7 @@ to the ECDH x-coordinate result before passing to KDF.
 - OwnerSvcInfo20: Handle null response (no service info)
 - Done20: Include 2 fields `[nonce, replacement_hmac]` (hmac=null for credential reuse)
 
-### BMO FSIM (Bare Metal Onboarding) - IN PROGRESS
+### BMO FSIM (Bare Metal Onboarding) - INLINE TRANSFER VERIFIED 2026-08-14
 - [x] BMO module structure (bmo.rs)
 - [x] BMO message parsing (image-begin, image-data-N, image-end)
 - [x] BMO session state machine
@@ -77,8 +77,10 @@ to the ECDH x-coordinate result before passing to KDF.
 - [x] devmod:modules advertisement with ["fdo.bmo"]
 - [x] fdo.bmo:active and fdo.bmo:supported-types advertisement
 - [x] Chainload module (chainload.rs) - LoadImage/StartImage with fallback to temp file
-- [ ] Fix image-data chunk CBOR decoding (chunks are CBOR bstr-wrapped, need inner decode)
-- [ ] **End-to-end inline BMO test** - send actual EFI binary via BMO and chainload it
+- [x] Fix image-data chunk CBOR decoding (chunks are CBOR bstr-wrapped, inner bstr decode)
+- [x] Fix server BMO chunk size check (estimatedSize +5 not +50, was double-counting overhead)
+- [x] Fix client MTU (1300, was 1040 which was too small for BMO chunks)
+- [x] **End-to-end inline BMO verified on OnLogic k800** - payload.efi (51KB) delivered in 51 chunks, chainloaded via LoadImage/StartImage, banner displayed, image-result=success
 - [ ] URL delivery mode (mode 1) - device fetches image from URL
 - [ ] Meta-URL delivery mode with COSE signature verification (mode 2)
 - [ ] dd image mode - write raw disk image to storage device instead of executing EFI app
