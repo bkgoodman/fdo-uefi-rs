@@ -127,15 +127,15 @@ to the ECDH x-coordinate result before passing to KDF.
 
 ### Hacks / Hardcoded Values to Remove
 
-- [ ] **Hardcoded DI server address** - `192.168.200.30:8080` is hardcoded in the DI module. Replace with spec-defined discovery mechanism (e.g. mDNS, DHCP vendor option, UEFI variable, or compile-time config). See DI spec for proper server discovery.
+- [x] **Hardcoded DI server address** - Removed. DI server URL now via `-di` CLI flag or well-known DNS names (`_fdo._tcp`, `fdo-mfg`). See README Command-Line Options. (2026-08-15)
 - [ ] **Static IP fallback** - TCP4 module falls back to static IP `192.168.200.26/24` when DHCP fails (or times out). This should be removed; rely on DHCP only, or make configurable via UEFI variable.
-- [ ] **Hardcoded RV/owner URL fallback** - `run_onboarding()` in main.rs falls back to `http://192.168.200.30:8080` if RV info isn't in NV. Should only use RV info from DCTPM.
+- [x] **Hardcoded RV/owner URL fallback** - Removed. RV URL now parsed from DCTPM credential (key 5, RvInfo). CLI override via `-rv` flag. (2026-08-15)
 
 ### Network / NIC Improvements
 
 - [x] **Skip NICs with zeroed MAC addresses** - Non-exclusive GET_PROTOCOL MAC check, skip zeroed MACs (2026-08-14)
 - [x] **Cache working NIC handle** - AtomicI8 cache reuses last working ServiceBinding handle (2026-08-14)
-- [ ] **DHCP investigation** - Unclear if DHCP is actually working or if we're timing out too fast and silently falling back to static IP. Need to add logging to confirm whether DHCP succeeds and what address is obtained, or if we always hit the static fallback.
+- [x] **DHCP investigation** - Resolved. DHCP works on OnLogic k800 when using the correct NIC (Handle #3, MAC f9:bd). Added link detection via SNP `media_present` to skip NICs without cable. (2026-08-14)
 - [ ] **TCP4 reconnect stuck** - On second run (after DI), TCP4 connection attempts get stuck. May be related to ServiceBinding handles not being properly cleaned up from the first connection.
 
 ### TPM Persistent Handle Limitation (Documented)

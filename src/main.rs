@@ -7,10 +7,13 @@
 
 extern crate alloc;
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::time::Duration;
-use log::{info, error};
+use log::{info, error, warn};
 use uefi::prelude::*;
 use uefi::boot;
+use uefi::proto::loaded_image::LoadedImage;
 
 mod tpm;
 mod http_api;
@@ -23,6 +26,112 @@ mod bmo;
 mod chainload;
 mod di;
 
+/// Parsed command-line options
+struct FdoOptions {
+    /// Override DI (manufacturing) server URL
+    di_url: Option<String>,
+    /// Override RV/Owner server URL (for TO1/TO2)
+    rv_url: Option<String>,
+}
+
+/// Well-known FDO manufacturing server DNS names (per fdo-appnote-device-mfg-info.bs)
+/// Devices try these in order when no explicit DI server URL is provided.
+const WELL_KNOWN_DI_NAMES: &[&str] = &[
+    "_fdo._tcp",        // DNS-SD service discovery
+    "fdo-mfg",          // Simple well-known hostname
+];
+
+/// Default DI server port
+const DEFAULT_DI_PORT: u16 = 8080;
+
+/// Parse command-line arguments from EFI shell load options.
+/// Supports:  -di <url>   Override DI server URL
+///            -rv <url>   Override RV/Owner server URL
+///            -h          Show usage help
+fn parse_args() -> FdoOptions {
+    let mut opts = FdoOptions { di_url: None, rv_url: None };
+
+    let loaded_image = match boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()) {
+        Ok(li) => li,
+        Err(_) => return opts,
+    };
+
+    let args_str = match loaded_image.load_options_as_cstr16() {
+        Ok(s) => {
+            // Convert UCS-2 to ASCII string
+            let mut buf = Vec::new();
+            for c in s.iter() {
+                let ch = u16::from(*c) as u8;
+                if ch == 0 { break; }
+                buf.push(ch);
+            }
+            match core::str::from_utf8(&buf) {
+                Ok(s) => String::from(s),
+                Err(_) => return opts,
+            }
+        }
+        Err(_) => return opts,
+    };
+
+    if args_str.is_empty() {
+        return opts;
+    }
+    info!("Command line: {}", args_str);
+
+    // Split on whitespace and parse flags
+    // Note: first token is typically the EFI app path itself, skip it
+    let tokens: Vec<&str> = args_str.split_ascii_whitespace().collect();
+    let mut i = 1; // skip argv[0] (the EFI binary path)
+    while i < tokens.len() {
+        match tokens[i] {
+            "-di" => {
+                if i + 1 < tokens.len() {
+                    opts.di_url = Some(String::from(tokens[i + 1]));
+                    info!("CLI: DI server URL = {}", tokens[i + 1]);
+                    i += 2;
+                } else {
+                    warn!("CLI: -di requires a URL argument");
+                    i += 1;
+                }
+            }
+            "-rv" => {
+                if i + 1 < tokens.len() {
+                    opts.rv_url = Some(String::from(tokens[i + 1]));
+                    info!("CLI: RV/Owner URL = {}", tokens[i + 1]);
+                    i += 2;
+                } else {
+                    warn!("CLI: -rv requires a URL argument");
+                    i += 1;
+                }
+            }
+            "-h" | "--help" | "-help" | "/?" => {
+                info!("");
+                info!("Usage: fdo-uefi.efi [options]");
+                info!("  -di <url>   DI (manufacturing) server URL");
+                info!("              e.g. -di http://192.168.1.100:8080");
+                info!("  -rv <url>   RV/Owner server URL (TO1/TO2 override)");
+                info!("              e.g. -rv http://fdo-server.local:8080");
+                info!("  -h          Show this help");
+                info!("");
+                info!("If no -di URL is given, the client tries well-known DNS names:");
+                for name in WELL_KNOWN_DI_NAMES {
+                    info!("  http://{}:{}", name, DEFAULT_DI_PORT);
+                }
+                info!("");
+                info!("If no -rv URL is given, the RV URL is read from the FDO");
+                info!("device credential stored in the TPM (written during DI).");
+                i += 1;
+            }
+            _ => {
+                info!("CLI: ignoring unknown argument: {}", tokens[i]);
+                i += 1;
+            }
+        }
+    }
+
+    opts
+}
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
@@ -30,6 +139,9 @@ fn main() -> Status {
     info!("===========================================");
     info!("  FDO UEFI Client");
     info!("===========================================");
+    
+    // Parse command-line arguments
+    let opts = parse_args();
     
     // Check for TPM presence first
     if !tpm::tpm_is_present() {
@@ -49,14 +161,14 @@ fn main() -> Status {
         Some(guid) => {
             // Credentials exist - run TO1/TO2 onboarding
             info!("Device GUID found: {:02x?}", guid);
-            run_onboarding(&guid);
+            run_onboarding(&guid, &opts);
         }
         None => {
             // No credentials - attempt Device Initialization
             info!("No credentials found in TPM.");
             info!("Attempting Device Initialization (DI)...");
             
-            match di::run_di_protocol() {
+            match di::run_di_protocol(opts.di_url.as_deref()) {
                 Status::SUCCESS => {
                     info!("Device Initialization completed successfully.");
                     info!("Reboot required to proceed with onboarding.");
@@ -79,9 +191,25 @@ fn main() -> Status {
 }
 
 /// Run TO1/TO2 onboarding protocols
-fn run_onboarding(device_guid: &[u8; 16]) {
-    let owner_url = tpm::read_fdo_rv_info()
-        .unwrap_or_else(|| alloc::string::String::from("http://192.168.200.30:8080"));
+fn run_onboarding(device_guid: &[u8; 16], opts: &FdoOptions) {
+    // RV URL priority: 1) CLI -rv flag, 2) parsed from TPM credential, 3) error
+    let owner_url = if let Some(ref url) = opts.rv_url {
+        info!("Using CLI-provided RV/Owner URL");
+        url.clone()
+    } else {
+        match tpm::read_fdo_rv_info() {
+            Some(url) => {
+                info!("Using RV URL from device credential");
+                url
+            }
+            None => {
+                error!("No RV/Owner URL available!");
+                error!("  Provide one with: fdo-uefi.efi -rv http://server:port");
+                error!("  Or ensure DI stored valid rendezvous info in TPM.");
+                return;
+            }
+        }
+    };
     info!("Owner/RV URL: {}", owner_url);
     
     // Run TO1 protocol

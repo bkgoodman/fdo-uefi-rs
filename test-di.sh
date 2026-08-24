@@ -169,6 +169,9 @@ setup() {
     echo "Server PID: $SERVER_PID"
 
     # Create boot disk
+    # The UEFI client needs -di flag to know the server address.
+    # In QEMU user-mode networking, the host is at 10.0.2.2.
+    # We use a startup.nsh script to pass the -di argument.
     echo ""
     echo "--- Creating boot disk ---"
     DISK_IMG="$WORKDIR/fdo-disk.img"
@@ -177,8 +180,15 @@ setup() {
     mmd -i "$DISK_IMG" ::/EFI
     mmd -i "$DISK_IMG" ::/EFI/BOOT
     mcopy -i "$DISK_IMG" "$RUST_EFI" ::/EFI/BOOT/BOOTX64.EFI
+
+    # Create startup.nsh that passes the DI server URL
+    STARTUP_NSH="$WORKDIR/startup.nsh"
+    printf 'fs0:\\EFI\\BOOT\\BOOTX64.EFI -di http://10.0.2.2:8080\r\n' > "$STARTUP_NSH"
+    mcopy -i "$DISK_IMG" "$STARTUP_NSH" ::/startup.nsh
+
     cp "$OVMF_VARS_SRC" "$WORKDIR/OVMF_VARS.fd"
     echo "Boot disk: $DISK_IMG"
+    echo "DI server: http://10.0.2.2:8080 (QEMU host)"
 }
 
 # ─── Run QEMU ──────────────────────────────────────────────────────

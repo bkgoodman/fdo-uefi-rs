@@ -1120,12 +1120,372 @@ pub fn read_fdo_guid() -> Option<[u8; 16]> {
     None
 }
 
+/// RV variable IDs (per FDO spec RendezvousVariable)
+const RV_IP_ADDRESS: u8 = 2;
+const RV_DEV_PORT: u8 = 3;
+const RV_DNS: u8 = 5;
+const RV_PROTOCOL: u8 = 12;
+
+/// RV protocol values
+const RV_PROT_HTTP: u8 = 1;
+const RV_PROT_HTTPS: u8 = 2;
+
 /// Read FDO RV info from TPM NV (DCTPM index)
-/// Returns the RV URL string (owner server address)
+/// Parses the DCTPM credential stored by DI and extracts the rendezvous URL.
+///
+/// DCTPM layout (CBOR map with integer keys):
+///   0: Magic, 1: Active, 2: Version, 3: DeviceInfo, 4: GUID,
+///   5: RvInfo (array of arrays of [variable, value] pairs),
+///   6: PubKeyHash, 7: KeyType, 8: DeviceKeyHandle, 9: HMACKeyHandle
+///
+/// Each RvInstruction is a 2-element CBOR array: [variable_id, value_bytes].
+/// We extract DNS/IP, DevPort, and Protocol to build a URL.
 pub fn read_fdo_rv_info() -> Option<alloc::string::String> {
-    // For now, return hardcoded - will implement full parsing later
-    // The RV info is at key 5 in the DCTPM CBOR map
-    Some(alloc::string::String::from("http://192.168.200.30:8080"))
+    use alloc::string::String;
+    use alloc::format;
+
+    // Read DCTPM NV data
+    let data = match tpm_nv_read(FDO_NV_INDEX_ALT) {
+        Some(d) => d,
+        None => {
+            info!("RV: No DCTPM found in NV");
+            return None;
+        }
+    };
+    info!("RV: DCTPM data: {} bytes", data.len());
+
+    if data.is_empty() {
+        return None;
+    }
+
+    let mut pos = 0;
+    let initial = data[pos];
+    pos += 1;
+
+    let major = initial >> 5;
+    let additional = initial & 0x1f;
+
+    let num_items = if additional < 24 {
+        additional as usize
+    } else if additional == 24 && pos < data.len() {
+        let n = data[pos] as usize;
+        pos += 1;
+        n
+    } else {
+        warn!("RV: unsupported CBOR size encoding");
+        return None;
+    };
+
+    if major == 4 {
+        // CBOR array — RvInfo is at index 5
+        info!("RV: CBOR array with {} items", num_items);
+        if num_items < 6 {
+            warn!("RV: array too short for RvInfo at index 5");
+            return None;
+        }
+        // Skip items 0–4 to get to index 5
+        for idx in 0..5 {
+            if !skip_cbor_value(&data, &mut pos) {
+                warn!("RV: failed to skip item {}", idx);
+                return None;
+            }
+        }
+        // pos now points to RvInfo
+        return parse_rv_info_at(&data, &mut pos);
+    } else if major == 5 {
+        // CBOR map — find key 5
+        info!("RV: CBOR map with {} pairs", num_items);
+        for _ in 0..num_items {
+            if pos >= data.len() {
+                break;
+            }
+            // Read key
+            let key_byte = data[pos];
+            pos += 1;
+            let key = if (key_byte >> 5) == 0 {
+                let add = key_byte & 0x1f;
+                if add < 24 {
+                    add as u32
+                } else if add == 24 && pos < data.len() {
+                    let k = data[pos] as u32;
+                    pos += 1;
+                    k
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            };
+
+            if key == 5 {
+                return parse_rv_info_at(&data, &mut pos);
+            } else {
+                if !skip_cbor_value(&data, &mut pos) {
+                    return None;
+                }
+            }
+        }
+        warn!("RV: key 5 (RvInfo) not found in map");
+    }
+
+    None
+}
+
+/// Parse RvInfo at the current position in `data`.
+/// RvInfo is an array of directives, each directive is an array of RvInstructions.
+/// Each RvInstruction is [variable_id, value_bytes].
+/// Returns the first successfully parsed URL.
+fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::String> {
+    use alloc::string::String;
+    use alloc::format;
+
+    if *pos >= data.len() {
+        return None;
+    }
+
+    // Read outer array header (array of directives)
+    let outer_initial = data[*pos];
+    *pos += 1;
+    let outer_major = outer_initial >> 5;
+    if outer_major != 4 {
+        warn!("RV: RvInfo should be array, got major {}", outer_major);
+        return None;
+    }
+    let outer_len = read_cbor_uint_arg(data, pos, outer_initial & 0x1f)?;
+    info!("RV: RvInfo has {} directive(s)", outer_len);
+
+    for dir_idx in 0..outer_len {
+        // Each directive is an array of RvInstructions
+        if *pos >= data.len() {
+            break;
+        }
+        let dir_initial = data[*pos];
+        *pos += 1;
+        let dir_major = dir_initial >> 5;
+        if dir_major != 4 {
+            warn!("RV: directive {} should be array", dir_idx);
+            skip_cbor_value(data, pos);
+            continue;
+        }
+        let dir_len = match read_cbor_uint_arg(data, pos, dir_initial & 0x1f) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let mut dns_name: Option<String> = None;
+        let mut ip_addr: Option<[u8; 4]> = None;
+        let mut port: u16 = 8080;
+        let mut scheme = "http";
+
+        for _ in 0..dir_len {
+            // Each RvInstruction is [variable, value]
+            if *pos >= data.len() {
+                break;
+            }
+            let instr_initial = data[*pos];
+            *pos += 1;
+            let instr_major = instr_initial >> 5;
+            if instr_major != 4 {
+                // Not an array — skip
+                skip_cbor_value(data, pos);
+                continue;
+            }
+            let instr_len = match read_cbor_uint_arg(data, pos, instr_initial & 0x1f) {
+                Some(n) => n,
+                None => continue,
+            };
+            if instr_len < 2 {
+                // Skip malformed instruction
+                for _ in 0..instr_len {
+                    skip_cbor_value(data, pos);
+                }
+                continue;
+            }
+
+            // Read variable ID (unsigned int)
+            let var_id = read_cbor_small_uint(data, pos).unwrap_or(255) as u8;
+
+            // Read value (byte string — CBOR-encoded content)
+            let value_bytes = read_cbor_bstr(data, pos);
+
+            // Skip any extra fields beyond the first 2
+            for _ in 2..instr_len {
+                skip_cbor_value(data, pos);
+            }
+
+            let value_bytes = match value_bytes {
+                Some(v) => v,
+                None => continue,
+            };
+
+            match var_id {
+                RV_DNS => {
+                    // Value is CBOR text string
+                    if let Some(s) = decode_cbor_text(&value_bytes) {
+                        info!("RV: DNS = {}", s);
+                        dns_name = Some(s);
+                    }
+                }
+                RV_IP_ADDRESS => {
+                    // Value is CBOR byte string (4 bytes for IPv4)
+                    if let Some(ip_bytes) = decode_cbor_bstr(&value_bytes) {
+                        if ip_bytes.len() == 4 {
+                            let mut ip = [0u8; 4];
+                            ip.copy_from_slice(&ip_bytes);
+                            info!("RV: IP = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                            ip_addr = Some(ip);
+                        }
+                    }
+                }
+                RV_DEV_PORT => {
+                    // Value is CBOR uint16
+                    if let Some(p) = decode_cbor_uint(&value_bytes) {
+                        info!("RV: DevPort = {}", p);
+                        port = p as u16;
+                    }
+                }
+                RV_PROTOCOL => {
+                    // Value is CBOR uint8
+                    if let Some(p) = decode_cbor_uint(&value_bytes) {
+                        match p as u8 {
+                            RV_PROT_HTTP => scheme = "http",
+                            RV_PROT_HTTPS => scheme = "https",
+                            other => info!("RV: unsupported protocol {}", other),
+                        }
+                    }
+                }
+                _ => {
+                    // Ignore other RV variables (RVOwnerOnly, RVBypass, etc.)
+                }
+            }
+        }
+
+        // Build URL from parsed directive
+        if let Some(ref dns) = dns_name {
+            let url = format!("{}://{}:{}", scheme, dns, port);
+            info!("RV: Resolved URL: {}", url);
+            return Some(url);
+        }
+        if let Some(ip) = ip_addr {
+            let url = format!("{}://{}.{}.{}.{}:{}", scheme, ip[0], ip[1], ip[2], ip[3], port);
+            info!("RV: Resolved URL: {}", url);
+            return Some(url);
+        }
+    }
+
+    warn!("RV: No usable RV directive found");
+    None
+}
+
+/// Read a CBOR uint argument given the additional info byte.
+fn read_cbor_uint_arg(data: &[u8], pos: &mut usize, additional: u8) -> Option<usize> {
+    if additional < 24 {
+        Some(additional as usize)
+    } else if additional == 24 && *pos < data.len() {
+        let n = data[*pos] as usize;
+        *pos += 1;
+        Some(n)
+    } else if additional == 25 && *pos + 1 < data.len() {
+        let n = ((data[*pos] as usize) << 8) | (data[*pos + 1] as usize);
+        *pos += 2;
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Read a small unsigned integer from CBOR at pos.
+fn read_cbor_small_uint(data: &[u8], pos: &mut usize) -> Option<usize> {
+    if *pos >= data.len() {
+        return None;
+    }
+    let b = data[*pos];
+    *pos += 1;
+    let major = b >> 5;
+    if major != 0 {
+        return None; // Not an unsigned int
+    }
+    read_cbor_uint_arg(data, pos, b & 0x1f)
+}
+
+/// Read a CBOR byte string at pos, returning the raw bytes.
+fn read_cbor_bstr(data: &[u8], pos: &mut usize) -> Option<alloc::vec::Vec<u8>> {
+    if *pos >= data.len() {
+        return None;
+    }
+    let b = data[*pos];
+    *pos += 1;
+    let major = b >> 5;
+    if major != 2 {
+        // Not a byte string — try to skip and return None
+        // But we already consumed the byte, so we need to handle this
+        let additional = b & 0x1f;
+        // Re-parse as a skip from after the initial byte
+        let arg = read_cbor_uint_arg(data, pos, additional)?;
+        match major {
+            0 | 1 => {} // int, already consumed
+            3 => { *pos += arg; } // text string
+            4 => { for _ in 0..arg { skip_cbor_value(data, pos); } }
+            5 => { for _ in 0..arg*2 { skip_cbor_value(data, pos); } }
+            7 => {} // simple
+            _ => {}
+        }
+        return None;
+    }
+    let len = read_cbor_uint_arg(data, pos, b & 0x1f)?;
+    if *pos + len > data.len() {
+        return None;
+    }
+    let result = data[*pos..*pos + len].to_vec();
+    *pos += len;
+    Some(result)
+}
+
+/// Decode a CBOR text string from raw bytes.
+fn decode_cbor_text(data: &[u8]) -> Option<alloc::string::String> {
+    if data.is_empty() {
+        return None;
+    }
+    let mut pos = 0;
+    let b = data[pos];
+    pos += 1;
+    if (b >> 5) != 3 {
+        return None; // Not text
+    }
+    let len = read_cbor_uint_arg(data, &mut pos, b & 0x1f)?;
+    if pos + len > data.len() {
+        return None;
+    }
+    core::str::from_utf8(&data[pos..pos + len])
+        .ok()
+        .map(alloc::string::String::from)
+}
+
+/// Decode a CBOR byte string from raw bytes.
+fn decode_cbor_bstr(data: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    if data.is_empty() {
+        return None;
+    }
+    let mut pos = 0;
+    let b = data[pos];
+    pos += 1;
+    if (b >> 5) != 2 {
+        return None; // Not bstr
+    }
+    let len = read_cbor_uint_arg(data, &mut pos, b & 0x1f)?;
+    if pos + len > data.len() {
+        return None;
+    }
+    Some(data[pos..pos + len].to_vec())
+}
+
+/// Decode a CBOR unsigned integer from raw bytes.
+fn decode_cbor_uint(data: &[u8]) -> Option<usize> {
+    if data.is_empty() {
+        return None;
+    }
+    let mut pos = 0;
+    read_cbor_small_uint(data, &mut pos)
 }
 
 /// Check if TPM (TCG2 protocol) is available in this UEFI environment

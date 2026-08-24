@@ -43,19 +43,22 @@ const FDO_HMAC_HANDLE: u32 = 0x81020003;
 const FDO_NV_INDEX_DCTPM: u32 = 0x01D10001;
 
 /// Run the Device Initialization protocol
-pub fn run_di_protocol() -> Status {
+/// If `cli_url` is Some, use that as the DI server URL (from -di flag).
+/// Otherwise, try well-known DNS names.
+pub fn run_di_protocol(cli_url: Option<&str>) -> Status {
     info!("===========================================");
     info!("  FDO Device Initialization (DI) Protocol");
     info!("===========================================");
     
     // 1. Get manufacturing server URL
-    let mfg_server_url = match get_manufacturing_server_url() {
+    let mfg_server_url = match get_di_server_url(cli_url) {
         Some(url) => {
             info!("Manufacturing server: {}", url);
             url
         }
         None => {
-            error!("No manufacturing server URL configured");
+            error!("No manufacturing server URL available");
+            error!("  Use: fdo-uefi.efi -di http://server:port");
             return Status::NOT_FOUND;
         }
     };
@@ -181,12 +184,41 @@ pub fn run_di_protocol() -> Status {
     Status::SUCCESS
 }
 
-/// Get manufacturing server URL from UEFI variable
-/// Per fdo-appnote-device-mfg-info.bs §mfg-server-discovery
-fn get_manufacturing_server_url() -> Option<String> {
-    // TODO: Read from UEFI variable "FdoMfgServerUrl"
-    // pe2 (192.168.200.30) runs the go-fdo DI server on port 8080
-    Some(String::from("http://192.168.200.30:8080"))
+/// Get DI (manufacturing) server URL.
+/// Priority: 1) CLI flag, 2) well-known DNS names.
+///
+/// Well-known DNS names per fdo-appnote-device-mfg-info.bs:
+///   _fdo._tcp   — DNS-SD style service discovery
+///   fdo-mfg     — simple well-known hostname
+///
+/// TODO: Add UEFI variable "FdoMfgServerUrl" as additional source.
+/// TODO: Actually attempt DNS resolution and connectivity test for each
+///       well-known name before returning it (currently returns first name
+///       without verification — the HTTP POST will fail if unreachable).
+fn get_di_server_url(cli_url: Option<&str>) -> Option<String> {
+    // 1) Explicit CLI override
+    if let Some(url) = cli_url {
+        info!("DI server: using CLI-provided URL");
+        return Some(String::from(url));
+    }
+
+    // 2) Try well-known DNS names
+    // NOTE: UEFI DNS resolution is not yet implemented, so these will
+    // only work if a local DNS server resolves them. For now, log them
+    // and return the first one. In practice, users should use -di flag.
+    const WELL_KNOWN_DI_NAMES: &[&str] = &[
+        "_fdo._tcp",
+        "fdo-mfg",
+    ];
+    const DEFAULT_DI_PORT: u16 = 8080;
+
+    for name in WELL_KNOWN_DI_NAMES {
+        let url = format!("http://{}:{}", name, DEFAULT_DI_PORT);
+        info!("DI server: will try well-known name: {}", url);
+        return Some(url);
+    }
+
+    None
 }
 
 /// Get device serial number (placeholder)

@@ -47,6 +47,59 @@ cargo +nightly build --release \
 # Output: target/x86_64-unknown-uefi/release/fdo-uefi.efi
 ```
 
+## Command-Line Options
+
+The client accepts arguments from the EFI shell:
+
+```text
+Usage: fdo-uefi.efi [options]
+  -di <url>   DI (manufacturing) server URL
+  -rv <url>   RV/Owner server URL (TO1/TO2 override)
+  -h          Show usage help
+```
+
+### Examples
+
+```text
+# Run DI against a specific manufacturing server
+Shell> fdo-uefi.efi -di http://192.168.1.100:8080
+
+# Run TO1/TO2 against a specific owner server (overrides credential)
+Shell> fdo-uefi.efi -rv http://fdo-server.local:8080
+
+# Both (DI server for first boot, RV for onboarding)
+Shell> fdo-uefi.efi -di http://mfg-server:8080 -rv http://owner-server:8080
+
+# Show help
+Shell> fdo-uefi.efi -h
+```
+
+### Server Discovery
+
+**DI (Device Initialization):**
+
+The client discovers the manufacturing server in this order:
+
+1. **`-di` flag** — explicit URL from the command line
+2. **Well-known DNS names** — `_fdo._tcp:8080`, `fdo-mfg:8080` (per DNS-SD conventions)
+
+> **Note:** DNS resolution is not yet implemented in the UEFI client.
+> For now, use the `-di` flag to specify the server explicitly.
+> Well-known DNS names are logged but will fail unless resolved by local DNS.
+
+**TO1/TO2 (Onboarding):**
+
+The client discovers the rendezvous/owner server in this order:
+
+1. **`-rv` flag** — explicit URL from the command line
+2. **TPM credential** — the RV info stored in the DCTPM NV index during DI
+   (contains DNS name or IP address, port, and protocol from the ownership voucher)
+3. **Error** — if neither is available, the client logs an error and exits
+
+The RV URL is normally written to TPM NV during Device Initialization and
+contains the rendezvous server address from the ownership voucher. The `-rv`
+flag is useful for testing or when the credential's RV info is incorrect.
+
 ## Execution Flow
 
 The UEFI client automatically detects which protocol to run based on TPM state:
