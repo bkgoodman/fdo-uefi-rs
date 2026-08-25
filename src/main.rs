@@ -25,6 +25,8 @@ mod fdo;
 mod bmo;
 mod chainload;
 mod di;
+#[cfg(feature = "rv-firmware")]
+mod rv_firmware;
 
 /// Parsed command-line options
 struct FdoOptions {
@@ -154,6 +156,29 @@ fn main() -> Status {
     }
     info!("TPM detected (TCG2 protocol available).");
     
+    // RV-based firmware delivery check (if feature enabled)
+    // In combined binary mode, check for firmware updates first.
+    // If a newer image is available, chainload it.
+    // If no update (same version or server unreachable), fall through to normal onboarding.
+    #[cfg(feature = "rv-firmware")]
+    {
+        info!("Checking for RV-based firmware update...");
+        match rv_firmware::check_and_deliver() {
+            rv_firmware::DeliveryResult::Chainloaded => {
+                info!("Firmware image was chainloaded and returned.");
+                info!("FDO UEFI Client exiting.");
+                boot::stall(Duration::from_secs(2));
+                return Status::SUCCESS;
+            }
+            rv_firmware::DeliveryResult::NoUpdate => {
+                info!("No firmware update available, continuing to onboarding...");
+            }
+            rv_firmware::DeliveryResult::Error => {
+                info!("Firmware delivery error, continuing to onboarding...");
+            }
+        }
+    }
+
     // Check if device credentials exist in TPM
     info!("Checking for FDO credentials in TPM...");
     

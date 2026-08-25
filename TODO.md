@@ -87,6 +87,27 @@ to the ECDH x-coordinate result before passing to KDF.
 - [ ] BIOS parameter setting (fdo.bmo:set) - enroll/change BIOS config (e.g. enable Secure Boot, EFI DB keys)
 - [ ] **Secure Boot + BMO** - allow unsigned BMO payloads to execute when Secure Boot is on (owner-signed via FDO = sufficient trust)
 
+### RV-Based Firmware Delivery (rv-firmware feature) - E2E VERIFIED 2026-08-25
+- [x] HTTP GET added to dual-stack (tcp4_http.rs + http_api.rs dispatcher)
+- [x] COSE_Sign1 parsing and ECDSA P-256 (ES256) signature verification via `p256` crate
+- [x] RV extension tag parsing (FirmwarePath/FirmwareURL/MinFirmwareRev from DCTPM)
+- [x] Anti-rollback firmware revision counter in TPM NV (0x01D10002)
+- [x] Hardcoded platform vendor public key (X/Y coordinates)
+- [x] Combined binary support: RV delivery → fall-through to TO1/TO2 if no update
+- [x] Feature-gated behind `rv-firmware` Cargo feature
+- [x] `cargo check` passes with `--features rv-firmware`
+- [x] Fix CBOR tag 18 parsing in cose_verify.rs (cbor_read_uint_value→cbor_read_uint_arg)
+- [x] QEMU integration test: swtpm + quick-di + HTTP firmware server → 9/9 checks PASSED (pe2)
+- [x] OnLogic k800 real hardware test: firmware download + COSE verify + chainload PASSED (2026-08-25)
+- [x] `rv-firmware-di` build feature: optional DI inside Stage 1 (OEM-friendly, no factory Stage 2 server)
+- [x] Modular architecture documented: `docs/modular-architecture.md`
+- [ ] Full-stack test: Stage 1 (rv-firmware+DI) → chainload Stage 2 (TO2+BMO) → chainload Stage 3 (UKI)
+- [ ] Flash-update mode (write firmware to SPI flash, reboot) — dynamic chainload only for now
+- [ ] Read platform trust anchor from EFI Secure Boot DB (db/dbx) instead of hardcoded key
+- [ ] HTTPS/TLS support for firmware download
+- [ ] `.fwh` header-only pre-validation (download header first, check rev, then full image)
+- [ ] Replace placeholder platform key constants with real key from fdo-meta-tool
+
 ### Pending
 - [ ] Credential replacement after successful TO2
 

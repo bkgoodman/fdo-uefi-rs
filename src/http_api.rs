@@ -189,3 +189,32 @@ fn ensure_network_configured() {
 pub fn http_post(url: &str, body: &[u8], msg_type: u8) -> Option<Vec<u8>> {
     http_post_with_session(url, body, msg_type, None).map(|r| r.body)
 }
+
+/// Perform HTTP GET request, returning the response body.
+/// Dispatches to the appropriate transport backend (EFI_HTTP or TCP4).
+/// Used by rv-firmware to download firmware images.
+#[cfg(feature = "rv-firmware")]
+pub fn http_get(url: &str) -> Option<alloc::vec::Vec<u8>> {
+    // Try UEFI HTTP protocol first (if compiled in)
+    #[cfg(feature = "uefi-http")]
+    {
+        let result = crate::http::http_get(url);
+        if result.is_some() {
+            return result;
+        }
+    }
+
+    // Fall back to TCP4-based HTTP (if compiled in)
+    #[cfg(feature = "tcp4-http")]
+    {
+        ensure_network_configured();
+        log::info!("Using TCP4 HTTP transport for GET");
+        return crate::tcp4_http::tcp4_http_get(url);
+    }
+
+    #[cfg(not(feature = "tcp4-http"))]
+    {
+        log::error!("No HTTP transport available for GET");
+        return None;
+    }
+}

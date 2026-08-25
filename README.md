@@ -1,55 +1,132 @@
 # FDO UEFI Client (Rust)
 
-A UEFI application implementing FDO 2.0 TO1/TO2 protocols and BMO FSIM, written in Rust.
+A modular UEFI application for FIDO Device Onboard (FDO), written in Rust.
+Supports the full device lifecycle — from factory provisioning (DI) through
+owner onboarding (TO1/TO2) to OS/firmware delivery (BMO) — as a set of
+build-time composable stages.
 
-## Overview
+## Boot Chain Overview
 
-This is a full FDO (FIDO Device Onboard) client running as a UEFI application for device
-onboarding during firmware boot. It implements:
+The FDO UEFI client implements a multi-stage boot chain. Each stage is
+optional and controlled by Cargo build features. The stages are:
 
-- **DI protocol** - Device Initialization (manufacturing/provisioning)
-- **TO1 protocol** - Rendezvous server communication
-- **TO2 protocol** - Owner server communication with encrypted ServiceInfo exchange
-- **BMO FSIM** - Bare Metal Onboarding for EFI image transfer and chainload
-- **TPM 2.0** - Key creation, credential storage, HMAC, and ECDH key exchange
-
-## Prerequisites
-
-### Build Machine
-
-```bash
-# Rust nightly with UEFI target
-rustup install nightly
-rustup +nightly component add rust-src
-
-# Or use: make deps
+```text
+┌─────────────────────────────────────────────────────────────────────┐
+│  FDO Firmware Stub  (feature: rv-firmware)                         │
+│  Lives in platform firmware (SPI flash / BIOS)                     │
+│                                                                     │
+│  ┌─ Optional DI (feature: rv-firmware-di) ──────────────────────┐  │
+│  │  If no credentials in TPM:                                    │  │
+│  │    DI Protocol → manufacturing server → Write DCTPM to TPM   │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  1. Read DCTPM from TPM NV (includes RV firmware extension tags)   │
+│  2. HTTP GET signed firmware image from FirmwareURL                │
+│  3. Verify COSE_Sign1 signature against platform vendor key        │
+│  4. Anti-rollback check (firmware revision counter in TPM NV)      │
+│  5. Chainload FDO Installer Image ──┐                              │
+└──────────────────────────────────────┼──────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  FDO Installer Image  (default build, no extra features needed)    │
+│  Downloaded at runtime by the FDO Firmware Stub,                   │
+│  or stored in firmware alongside it, or run standalone             │
+│                                                                     │
+│  ┌─ DI (always compiled in) ────────────────────────────────────┐  │
+│  │  If no credentials in TPM:                                    │  │
+│  │    DI Protocol → manufacturing server → Write DCTPM to TPM   │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  1. TO1: Rendezvous server discovery                               │
+│  2. TO2: Owner server communication (encrypted ServiceInfo)        │
+│  3. BMO FSIM: Receive OS/firmware payload (inline, URL, or meta)   │
+│  4. Chainload payload ──────────────┐                              │
+└──────────────────────────────────────┼──────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Payload  (not part of this project)                               │
+│  Delivered by the FDO Installer Image via BMO                      │
+│  Examples: OS installer, UKI, firmware update, BIOS config tool    │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Test Machine (pe2)
-
-```bash
-# Ubuntu/Debian packages
-sudo apt-get install qemu-system-x86 ovmf mtools dosfstools swtpm
-
-# go-fdo server binary
-# Build from ../go-fdo with: make build
-```
+**Key point:** DI (Device Initialization) can run in either stage — or both.
+If the FDO Firmware Stub includes DI (`rv-firmware-di`), the device can
+self-provision at the factory without needing a server to serve the
+FDO Installer Image just for DI. If the FDO Installer Image is run directly
+(without the FDO Firmware Stub), it handles DI on its own.
 
 ## Building
 
+All builds use Rust nightly with the UEFI target. The common build flags are:
+
 ```bash
-# Release build (recommended)
-cargo +nightly build --release \
-    -Zbuild-std=core,alloc \
-    -Zbuild-std-features=compiler-builtins-mem \
-    --target x86_64-unknown-uefi
+CARGO_FLAGS="-Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem --target x86_64-unknown-uefi"
+```
+
+### Build Configurations
+
+**FDO Installer Image** — the default build. Runs DI (if no credentials),
+TO1/TO2, BMO, and chainloads the payload. This is what most people want.
+
+```bash
+cargo +nightly build --release $CARGO_FLAGS
 
 # Output: target/x86_64-unknown-uefi/release/fdo-uefi.efi
 ```
 
+**FDO Firmware Stub** — minimal firmware-resident image. Reads firmware
+RV tags from TPM, downloads and verifies a signed FDO Installer Image,
+and chainloads it. No DI; assumes TPM was provisioned externally
+(e.g., by `quick-di`).
+
+```bash
+cargo +nightly build --release --features rv-firmware $CARGO_FLAGS
+```
+
+**FDO Firmware Stub with DI** — same as above, but if no credentials
+exist in the TPM, runs DI first. This is the recommended OEM
+configuration: a single firmware image that self-provisions at the
+factory and then downloads + chainloads the FDO Installer Image.
+
+```bash
+cargo +nightly build --release --features rv-firmware-di $CARGO_FLAGS
+```
+
+### Build Features Reference
+
+| Feature | Stage | Description |
+|---------|-------|-------------|
+| `uefi-http` | Both | HTTP via `EFI_HTTP_PROTOCOL` (default; works in OVMF/QEMU) |
+| `tcp4-http` | Both | HTTP via raw TCP4 (default; works on real hardware without HttpDxe) |
+| `rv-firmware` | FDO Firmware Stub | RV-based firmware delivery: download + COSE_Sign1 verify + chainload |
+| `rv-firmware-di` | FDO Firmware Stub | Adds DI support inside the FDO Firmware Stub (implies `rv-firmware`) |
+
+See [docs/modular-architecture.md](docs/modular-architecture.md) for
+deployment scenarios and how the stages compose in different environments.
+
+### Prerequisites
+
+**Build machine:**
+
+```bash
+rustup install nightly
+rustup +nightly component add rust-src
+```
+
+**Test machine (pe2):**
+
+```bash
+sudo apt-get install qemu-system-x86 ovmf mtools dosfstools swtpm
+# go-fdo server: build from ../go-fdo with `make build`
+```
+
 ## Command-Line Options
 
-The client accepts arguments from the EFI shell:
+Both the FDO Firmware Stub and FDO Installer Image accept arguments from
+the EFI shell:
 
 ```text
 Usage: fdo-uefi.efi [options]
@@ -61,55 +138,55 @@ Usage: fdo-uefi.efi [options]
 ### Examples
 
 ```text
-# Run DI against a specific manufacturing server
+# DI against a specific manufacturing server
 Shell> fdo-uefi.efi -di http://192.168.1.100:8080
 
-# Run TO1/TO2 against a specific owner server (overrides credential)
+# TO1/TO2 against a specific owner server (overrides credential)
 Shell> fdo-uefi.efi -rv http://fdo-server.local:8080
 
 # Both (DI server for first boot, RV for onboarding)
 Shell> fdo-uefi.efi -di http://mfg-server:8080 -rv http://owner-server:8080
-
-# Show help
-Shell> fdo-uefi.efi -h
 ```
 
 ### Server Discovery
 
 **DI (Device Initialization):**
 
-The client discovers the manufacturing server in this order:
-
 1. **`-di` flag** — explicit URL from the command line
 2. **Well-known DNS names** — `_fdo._tcp:8080`, `fdo-mfg:8080` (per DNS-SD conventions)
 
 > **Note:** DNS resolution is not yet implemented in the UEFI client.
-> For now, use the `-di` flag to specify the server explicitly.
-> Well-known DNS names are logged but will fail unless resolved by local DNS.
+> Use the `-di` flag to specify the server explicitly.
 
 **TO1/TO2 (Onboarding):**
 
-The client discovers the rendezvous/owner server in this order:
-
 1. **`-rv` flag** — explicit URL from the command line
-2. **TPM credential** — the RV info stored in the DCTPM NV index during DI
-   (contains DNS name or IP address, port, and protocol from the ownership voucher)
-3. **Error** — if neither is available, the client logs an error and exits
-
-The RV URL is normally written to TPM NV during Device Initialization and
-contains the rendezvous server address from the ownership voucher. The `-rv`
-flag is useful for testing or when the credential's RV info is incorrect.
+2. **TPM credential** — the RV URL stored in DCTPM NV index during DI
+3. **Error** — if neither is available, logs error and exits
 
 ## Execution Flow
 
-The UEFI client automatically detects which protocol to run based on TPM state:
-
-1. **No credentials in TPM** → Run **DI protocol** (Device Initialization)
-2. **Credentials exist** → Run **TO1/TO2 protocols** (Onboarding)
-
 ```text
-Boot → Check TPM NV → No credentials? → DI Protocol → Write DCTPM → Done
-                   → Has credentials? → TO1 → TO2 → BMO → Chainload
+Boot
+  │
+  ├─ TPM present? ──No──▶ error, exit
+  │
+  ├─ [FDO Firmware Stub: rv-firmware enabled?]
+  │    │
+  │    ├─ [rv-firmware-di enabled + no DCTPM?]
+  │    │     └─▶ DI Protocol → Write DCTPM to TPM
+  │    │
+  │    ├─ Read DCTPM → parse RV firmware tags
+  │    │    ├─ FirmwareURL found → HTTP GET → COSE verify → chainload FDO Installer Image
+  │    │    └─ No firmware URL → fall through to FDO Installer Image logic
+  │    │
+  │    └─ (chainloaded image returns → exit)
+  │
+  ├─ [FDO Installer Image logic]
+  │    ├─ DCTPM exists + GUID found → TO1 → TO2 → BMO → chainload payload
+  │    └─ No credentials → DI Protocol → Write DCTPM → done (reboot to onboard)
+  │
+  └─ exit
 ```
 
 ## Testing
@@ -420,30 +497,44 @@ fdo-server -debug server -http 0.0.0.0:8080 -db /tmp/fdo.db -rv-bypass \
 
 ```text
 fdo-uefi-rs/
-├── Cargo.toml          # Package manifest
-├── README.md           # This file
-├── TODO.md             # Development status and known issues
-├── spec.md             # Technical specification
-├── test-di.sh          # DI protocol integration test (positive + negative)
-├── start3.sh           # Full TO2+BMO automated test script
+├── Cargo.toml               # Package manifest (features defined here)
+├── README.md                # This file
+├── TODO.md                  # Development status and known issues
+├── spec.md                  # Technical specification
+├── docs/
+│   └── modular-architecture.md  # Deployment scenarios, stage composition
+├── test-di.sh               # DI protocol integration test (positive + negative)
+├── test-rv-firmware.sh      # FDO Firmware Stub QEMU integration test
+├── start3.sh                # Full TO2+BMO automated test script
+├── boot_to_efi_shell.sh     # Reboot k800 into EFI shell for hardware tests
+├── update.sh                # Deploy EFI binary to k800 hardware
 ├── .cargo/
-│   └── config.toml     # Cargo config (UEFI target)
+│   └── config.toml          # Cargo config (UEFI target)
 └── src/
-    ├── main.rs         # Entry point, auto-detects DI vs TO1/TO2
-    ├── di/             # DI protocol module
-    │   ├── mod.rs      # Module exports
-    │   ├── protocol.rs # DI message flow and TPM operations
-    │   └── mfginfo.rs  # DeviceMfgInfo structure
-    ├── fdo.rs          # FDO TO1/TO2 protocol implementation
-    ├── http.rs         # UEFI HTTP client
-    ├── tpm.rs          # TPM 2.0 operations (keys, HMAC, NV, signing)
-    ├── cbor.rs         # CBOR encoder/decoder
-    ├── bmo.rs          # BMO FSIM handler
-    └── chainload.rs    # EFI image chainloading
+    ├── main.rs              # Entry point: FDO Firmware Stub → FDO Installer Image
+    ├── di/                  # DI protocol module (used by both stages)
+    │   ├── mod.rs           # Module exports
+    │   ├── protocol.rs      # DI message flow and TPM operations
+    │   └── mfginfo.rs       # DeviceMfgInfo structure
+    ├── rv_firmware/         # FDO Firmware Stub module (feature: rv-firmware)
+    │   ├── mod.rs           # Entry point: check_and_deliver()
+    │   ├── rv_parse.rs      # Parse RV firmware tags (16/17/18) from DCTPM
+    │   ├── cose_verify.rs   # COSE_Sign1 parsing + ECDSA P-256 verification
+    │   ├── platform_key.rs  # Hardcoded platform vendor public key
+    │   └── anti_rollback.rs # Firmware revision counter in TPM NV
+    ├── fdo.rs               # FDO TO1/TO2 protocol implementation
+    ├── http_api.rs          # HTTP dispatcher (uefi-http or tcp4-http)
+    ├── http.rs              # EFI_HTTP_PROTOCOL client (feature: uefi-http)
+    ├── tcp4_http.rs         # Raw TCP4 HTTP client (feature: tcp4-http)
+    ├── tpm.rs               # TPM 2.0 (keys, HMAC, NV, signing, DCTPM)
+    ├── bmo.rs               # BMO FSIM handler
+    └── chainload.rs         # EFI image chainloading (LoadImage/StartImage)
 ```
 
 ## Current Status
 
+- **FDO Firmware Stub** (`rv-firmware`): ✅ Verified on k800 hardware (2026-08-25)
+- **FDO Firmware Stub DI** (`rv-firmware-di`): ✅ Implemented, compiles
 - **DI**: ✅ Complete (DIAppStart, DISetCredentials, DISetHMAC, DIDone)
 - **TO1**: ✅ Complete (HelloRV, ProveToRV, RVRedirect)
 - **TO2**: ✅ Complete (all 12 message types, encrypted ServiceInfo)

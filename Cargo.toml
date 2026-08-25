@@ -11,6 +11,10 @@ default = ["uefi-http", "tcp4-http"]
 uefi-http = []
 # Use TCP4-based HTTP (works on most real hardware without HTTP DXE driver)
 tcp4-http = []
+# RV-based firmware delivery (pre-onboarding firmware update via COSE_Sign1)
+rv-firmware = ["dep:p256", "dep:ecdsa"]
+# DI support inside rv-firmware Stage 1 (OEM-friendly: no factory server needed for Stage 2)
+rv-firmware-di = ["rv-firmware"]
 
 [dependencies]
 log = "0.4"
@@ -19,6 +23,8 @@ uefi-raw = "0.15"  # For HttpMethod::POST access (matches uefi 0.38)
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 hmac = { version = "0.12", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"], optional = true }
+ecdsa = { version = "0.16", default-features = false, features = ["verifying"], optional = true }
 
 # Note: fdo-data-formats with serde has no_std issues in UEFI target.
 # Using manual CBOR encoding for now until serde issues are resolved.

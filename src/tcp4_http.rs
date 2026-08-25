@@ -720,6 +720,267 @@ fn parse_http_response(data: &[u8]) -> Option<HttpPostResponse> {
     })
 }
 
+/// Perform an HTTP GET via TCP4 protocol
+/// Used by rv-firmware to download firmware images from RV URLs.
+/// Tries all available TCP4 ServiceBinding handles to find one that connects.
+#[cfg(feature = "rv-firmware")]
+pub fn tcp4_http_get(url: &str) -> Option<Vec<u8>> {
+    let (ip, port, path) = parse_url(url)?;
+    let hostname = url.split('/').nth(2).unwrap_or("localhost");
+
+    info!("TCP4 HTTP GET {}.{}.{}.{}:{}{}", ip[0], ip[1], ip[2], ip[3], port, path);
+
+    let sb_handles = find_tcp4_service_bindings();
+    if sb_handles.is_empty() {
+        error!("TCP4: No ServiceBinding handles available");
+        return None;
+    }
+
+    let (tcp4, child_handle, sb_handle) = unsafe {
+        let mut result = None;
+        let cached = LAST_WORKING_NIC.load(Ordering::Relaxed);
+
+        if cached >= 0 && (cached as usize) < sb_handles.len() {
+            let idx = cached as usize;
+            if let Some(conn) = try_connect_on_handle(sb_handles[idx], idx, ip, port) {
+                result = Some(conn);
+            }
+        }
+
+        if result.is_none() {
+            for (idx, &handle) in sb_handles.iter().enumerate() {
+                if cached >= 0 && idx == cached as usize { continue; }
+                if !has_nonzero_mac(handle) { continue; }
+                if let Some(conn) = try_connect_on_handle(handle, idx, ip, port) {
+                    LAST_WORKING_NIC.store(idx as i8, Ordering::Relaxed);
+                    result = Some(conn);
+                    break;
+                }
+            }
+        }
+
+        match result {
+            Some(r) => r,
+            None => {
+                error!("TCP4: Failed to connect on any handle for GET");
+                return None;
+            }
+        }
+    };
+
+    unsafe {
+        // Build HTTP GET request
+        let request = format!(
+            "GET {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            path, hostname
+        );
+
+        let mut send_buf: Vec<u8> = Vec::with_capacity(request.len());
+        send_buf.extend_from_slice(request.as_bytes());
+
+        debug!("TCP4: Sending GET request ({} bytes)", send_buf.len());
+
+        // Transmit
+        let tx_event = match create_event() {
+            Some(e) => e,
+            None => {
+                destroy_tcp4_child(sb_handle, child_handle);
+                return None;
+            }
+        };
+
+        #[repr(C)]
+        struct TxDataWithFragment {
+            push: Boolean,
+            urgent: Boolean,
+            data_length: u32,
+            fragment_count: u32,
+            fragment: Tcp4FragmentData,
+        }
+
+        let mut tx_data = TxDataWithFragment {
+            push: Boolean::TRUE,
+            urgent: Boolean::FALSE,
+            data_length: send_buf.len() as u32,
+            fragment_count: 1,
+            fragment: Tcp4FragmentData {
+                fragment_length: send_buf.len() as u32,
+                fragment_buf: send_buf.as_mut_ptr(),
+            },
+        };
+
+        let mut tx_token = Tcp4IoToken {
+            completion_token: Tcp4CompletionToken {
+                event: tx_event,
+                status: RawStatus::NOT_READY,
+            },
+            packet: Tcp4Packet {
+                tx_data: &mut tx_data as *mut TxDataWithFragment as *mut Tcp4TransmitData,
+            },
+        };
+
+        let status = ((*tcp4).transmit)(tcp4, &mut tx_token);
+        if status != RawStatus::SUCCESS {
+            error!("TCP4: GET transmit failed: {:?}", status);
+            close_event(tx_event);
+            destroy_tcp4_child(sb_handle, child_handle);
+            return None;
+        }
+
+        let mut sent = false;
+        for i in 0..1000 {
+            let _ = ((*tcp4).poll)(tcp4);
+            if check_event(tx_event) {
+                if tx_token.completion_token.status == RawStatus::SUCCESS {
+                    debug!("TCP4: GET request sent after {} polls", i);
+                    sent = true;
+                }
+                break;
+            }
+            boot::stall(core::time::Duration::from_millis(10));
+        }
+        close_event(tx_event);
+
+        if !sent {
+            error!("TCP4: GET transmit timed out");
+            destroy_tcp4_child(sb_handle, child_handle);
+            return None;
+        }
+
+        // Receive response — firmware images can be large, start with 1MB
+        let mut response_buf = vec![0u8; 1024 * 1024];
+        let mut total_received = 0usize;
+
+        for _round in 0..500 {
+            let rx_event = match create_event() {
+                Some(e) => e,
+                None => break,
+            };
+
+            #[repr(C)]
+            struct RxDataWithFragment {
+                urgent: Boolean,
+                data_length: u32,
+                fragment_count: u32,
+                fragment: Tcp4FragmentData,
+            }
+
+            let remaining = response_buf.len() - total_received;
+            if remaining == 0 {
+                // Grow buffer
+                response_buf.resize(response_buf.len() + 1024 * 1024, 0);
+            }
+            let remaining = response_buf.len() - total_received;
+
+            let mut rx_data = RxDataWithFragment {
+                urgent: Boolean::FALSE,
+                data_length: remaining as u32,
+                fragment_count: 1,
+                fragment: Tcp4FragmentData {
+                    fragment_length: remaining as u32,
+                    fragment_buf: response_buf[total_received..].as_mut_ptr(),
+                },
+            };
+
+            let mut rx_token = Tcp4IoToken {
+                completion_token: Tcp4CompletionToken {
+                    event: rx_event,
+                    status: RawStatus::NOT_READY,
+                },
+                packet: Tcp4Packet {
+                    rx_data: &mut rx_data as *mut RxDataWithFragment as *mut Tcp4ReceiveData,
+                },
+            };
+
+            let status = ((*tcp4).receive)(tcp4, &mut rx_token);
+            if status != RawStatus::SUCCESS {
+                debug!("TCP4: GET receive returned: {:?}", status);
+                close_event(rx_event);
+                break;
+            }
+
+            let mut got_data = false;
+            for _j in 0..1000 {
+                let _ = ((*tcp4).poll)(tcp4);
+                if check_event(rx_event) {
+                    if rx_token.completion_token.status == RawStatus::SUCCESS {
+                        let chunk_len = rx_data.fragment.fragment_length as usize;
+                        total_received += chunk_len;
+                        debug!("TCP4: GET received {} bytes (total: {})", chunk_len, total_received);
+                        got_data = true;
+                    }
+                    break;
+                }
+                boot::stall(core::time::Duration::from_millis(10));
+            }
+            close_event(rx_event);
+
+            if !got_data { break; }
+
+            // Check if response is complete
+            if let Some(header_end) = find_header_end(&response_buf[..total_received]) {
+                if let Some(content_len) = extract_content_length(&response_buf[..header_end]) {
+                    if total_received >= header_end + content_len {
+                        debug!("TCP4: GET complete ({} headers + {} body)", header_end, content_len);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Close TCP connection
+        let close_evt = create_event();
+        if let Some(evt) = close_evt {
+            let mut close_token = Tcp4CloseToken {
+                completion_token: Tcp4CompletionToken {
+                    event: evt,
+                    status: RawStatus::NOT_READY,
+                },
+                abort_on_close: Boolean::TRUE,
+            };
+            let _ = ((*tcp4).close)(tcp4, &mut close_token);
+            for _ in 0..100 {
+                let _ = ((*tcp4).poll)(tcp4);
+                if check_event(evt) { break; }
+                boot::stall(core::time::Duration::from_millis(5));
+            }
+            close_event(evt);
+        }
+
+        destroy_tcp4_child(sb_handle, child_handle);
+
+        if total_received == 0 {
+            error!("TCP4: GET received no data");
+            return None;
+        }
+
+        // Extract body from HTTP response
+        response_buf.truncate(total_received);
+        if let Some(header_end) = find_header_end(&response_buf) {
+            // Check HTTP status
+            if let Ok(headers_str) = core::str::from_utf8(&response_buf[..header_end]) {
+                if let Some(first_line) = headers_str.lines().next() {
+                    info!("TCP4 HTTP GET response: {}", first_line);
+                    // Check for non-200 status
+                    if !first_line.contains("200") {
+                        error!("TCP4: GET failed with status: {}", first_line);
+                        return None;
+                    }
+                }
+            }
+            let body = response_buf[header_end..].to_vec();
+            info!("TCP4 HTTP GET completed: {} bytes", body.len());
+            Some(body)
+        } else {
+            error!("TCP4: GET response has no HTTP headers");
+            None
+        }
+    }
+}
+
 /// Check if TCP4 Service Binding is available
 pub fn tcp4_is_available() -> bool {
     !find_tcp4_service_bindings().is_empty()
