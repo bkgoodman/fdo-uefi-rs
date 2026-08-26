@@ -826,19 +826,39 @@ pub fn tpm_sign_with_persistent(persistent_handle: u32, digest: &[u8; 32]) -> Op
     // Persistent handles (0x81xxxxxx) are always accessible; they are not
     // transient contexts and are not flushed by the UEFI resource manager.
     let cmd = build_sign_cmd(persistent_handle, digest);
+    
+    // Retry loop for TPM_RC_RETRY (0x922) — the TPM may need time to
+    // become ready after flushing transient handles or other operations.
+    // This matches the retry pattern used by EvictControl and NV DefineSpace.
+    let mut signed = false;
     let mut response = vec![0u8; 512];
-    
-    info!("TPM: Signing with persistent handle 0x{:08x}...", persistent_handle);
-    let result = tcg.submit_command(&cmd, &mut response);
-    
-    if result.is_err() {
-        warn!("TPM2_Sign command failed for handle 0x{:08x}", persistent_handle);
+    for attempt in 0..5 {
+        response = vec![0u8; 512];
+        info!("TPM: Signing with persistent handle 0x{:08x} (attempt {})...", persistent_handle, attempt);
+        let result = tcg.submit_command(&cmd, &mut response);
+        
+        if result.is_err() {
+            warn!("TPM2_Sign submit failed for handle 0x{:08x} (attempt {})", persistent_handle, attempt);
+            boot::stall(core::time::Duration::from_millis(200));
+            continue;
+        }
+        
+        let rc = unpack_u32(&response[6..10]);
+        if rc == 0x922 {
+            info!("TPM2_Sign got TPM_RC_RETRY (0x922), retrying... (attempt {})", attempt);
+            boot::stall(core::time::Duration::from_millis(200));
+            continue;
+        }
+        if rc == 0 {
+            signed = true;
+            break;
+        }
+        warn!("TPM2_Sign error: 0x{:08x} for handle 0x{:08x}", rc, persistent_handle);
         return None;
     }
     
-    let rc = unpack_u32(&response[6..10]);
-    if rc != 0 {
-        warn!("TPM2_Sign error: 0x{:08x} for handle 0x{:08x}", rc, persistent_handle);
+    if !signed {
+        warn!("TPM2_Sign failed after retries for handle 0x{:08x}", persistent_handle);
         return None;
     }
     
@@ -1525,39 +1545,6 @@ fn read_cbor_small_uint(data: &[u8], pos: &mut usize) -> Option<usize> {
         return None; // Not an unsigned int
     }
     read_cbor_uint_arg(data, pos, b & 0x1f)
-}
-
-/// Read a CBOR byte string at pos, returning the raw bytes.
-fn read_cbor_bstr(data: &[u8], pos: &mut usize) -> Option<alloc::vec::Vec<u8>> {
-    if *pos >= data.len() {
-        return None;
-    }
-    let b = data[*pos];
-    *pos += 1;
-    let major = b >> 5;
-    if major != 2 {
-        // Not a byte string — try to skip and return None
-        // But we already consumed the byte, so we need to handle this
-        let additional = b & 0x1f;
-        // Re-parse as a skip from after the initial byte
-        let arg = read_cbor_uint_arg(data, pos, additional)?;
-        match major {
-            0 | 1 => {} // int, already consumed
-            3 => { *pos += arg; } // text string
-            4 => { for _ in 0..arg { skip_cbor_value(data, pos); } }
-            5 => { for _ in 0..arg*2 { skip_cbor_value(data, pos); } }
-            7 => {} // simple
-            _ => {}
-        }
-        return None;
-    }
-    let len = read_cbor_uint_arg(data, pos, b & 0x1f)?;
-    if *pos + len > data.len() {
-        return None;
-    }
-    let result = data[*pos..*pos + len].to_vec();
-    *pos += len;
-    Some(result)
 }
 
 /// Decode a CBOR text string from raw bytes.
