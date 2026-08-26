@@ -1,3 +1,7 @@
+<!-- Copyright 2026 Dell Technologies, All Rights Reserved -->
+<!-- Author: Brad Goodman <bradley.goodman@dell.com> -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # TODO - FDO UEFI Client
 
 ## Current Status
@@ -99,9 +103,14 @@ to the ECDH x-coordinate result before passing to KDF.
 - [x] Fix CBOR tag 18 parsing in cose_verify.rs (cbor_read_uint_value→cbor_read_uint_arg)
 - [x] QEMU integration test: swtpm + quick-di + HTTP firmware server → 9/9 checks PASSED (pe2)
 - [x] OnLogic k800 real hardware test: firmware download + COSE verify + chainload PASSED (2026-08-25)
-- [x] `rv-firmware-di` build feature: optional DI inside Stage 1 (OEM-friendly, no factory Stage 2 server)
+- [x] `di` build feature: independent DI feature gate (replaces `rv-firmware-di`; works with `rv-firmware` or standalone)
+- [x] `fdo-installer` build feature: independent TO1/TO2/BMO feature gate
+- [x] Feature refactor: `di`, `fdo-installer`, `rv-firmware` are now three independent Cargo features (2026-08-27)
 - [x] Modular architecture documented: `docs/modular-architecture.md`
+- [x] Productization guide: `docs/productization-guide.md` (flash vs RAM, DI placement, update mechanisms)
 - [ ] Full-stack test: Stage 1 (rv-firmware+DI) → chainload Stage 2 (TO2+BMO) → chainload Stage 3 (UKI)
+- [ ] Single-binary flash-resident build: rv-firmware + fdo-installer in one binary. Firmware Stub checks for
+  update, then falls through to Installer Image code (no chainload). Needs build + test of combined binary.
 - [ ] Flash-update mode (write firmware to SPI flash, reboot) — dynamic chainload only for now
 - [ ] Read platform trust anchor from EFI Secure Boot DB (db/dbx) instead of hardcoded key
 - [ ] HTTPS/TLS support for firmware download

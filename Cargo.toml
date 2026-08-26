@@ -2,19 +2,22 @@
 name = "fdo-uefi"
 version = "0.1.0"
 edition = "2021"
-authors = ["Brad Goodman"]
+authors = ["Brad Goodman <bradley.goodman@dell.com>"]
 description = "FDO TO1/TO2 client as a UEFI application"
+license = "Apache-2.0"
 
 [features]
-default = ["uefi-http", "tcp4-http"]
+default = ["uefi-http", "tcp4-http", "di", "fdo-installer"]
 # Use EFI_HTTP_PROTOCOL (available in OVMF/QEMU, some server firmware)
 uefi-http = []
 # Use TCP4-based HTTP (works on most real hardware without HTTP DXE driver)
 tcp4-http = []
+# Device Initialization — FDO DI protocol (manufacturing/provisioning)
+di = []
+# FDO Installer Image — TO1/TO2 onboarding + BMO payload delivery
+fdo-installer = []
 # RV-based firmware delivery (pre-onboarding firmware update via COSE_Sign1)
 rv-firmware = ["dep:p256", "dep:ecdsa"]
-# DI support inside rv-firmware Stage 1 (OEM-friendly: no factory server needed for Stage 2)
-rv-firmware-di = ["rv-firmware"]
 
 [dependencies]
 log = "0.4"

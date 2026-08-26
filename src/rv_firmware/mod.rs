@@ -47,12 +47,12 @@ pub fn check_and_deliver() -> DeliveryResult {
     info!("  RV-Based Firmware Delivery");
     info!("===========================================");
 
-    // Optional DI: If rv-firmware-di is enabled and no credentials exist,
+    // Optional DI: If the `di` feature is enabled and no credentials exist,
     // run DI first to provision the TPM with DCTPM (including firmware RV tags).
-    // This allows an OEM to ship a BIOS with rv-firmware + DI and have the
+    // This allows an OEM to ship a BIOS with rv-firmware + di and have the
     // device self-provision at the factory without needing a server to serve
-    // a separate Stage 2 component for DI.
-    #[cfg(feature = "rv-firmware-di")]
+    // a separate FDO Installer Image for DI.
+    #[cfg(feature = "di")]
     {
         if tpm::tpm_nv_read(0x01D10001).is_none() {
             info!("No DCTPM in TPM — attempting Device Initialization...");

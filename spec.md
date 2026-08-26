@@ -1,3 +1,7 @@
+<!-- Copyright 2026 Dell Technologies, All Rights Reserved -->
+<!-- Author: Brad Goodman <bradley.goodman@dell.com> -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # FDO UEFI Client - Technical Specification
 
 ## Scope

@@ -1,0 +1,96 @@
+<!-- Copyright 2026 Dell Technologies, All Rights Reserved -->
+<!-- Author: Brad Goodman <bradley.goodman@dell.com> -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 680" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <filter id="shadow" x="-2%" y="-2%" width="104%" height="108%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="720" height="680" rx="8" fill="#f8fafc"/>
+
+  <!-- Title -->
+  <text x="360" y="32" text-anchor="middle" font-size="16" font-weight="700" fill="#0f172a">FDO UEFI Client — Boot Chain</text>
+
+  <!-- ─── DI Block ─── -->
+  <rect x="40" y="52" width="640" height="100" rx="10" fill="#fefce8" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="6 3" filter="url(#shadow)"/>
+  <text x="60" y="74" font-size="13" font-weight="700" fill="#854d0e">DI — Device Initialization</text>
+  <text x="640" y="74" text-anchor="end" font-size="11" fill="#a16207" font-style="italic">feature: di</text>
+  <text x="60" y="93" font-size="11" fill="#713f12">Optional — runs only when no credentials (DCTPM) exist in TPM.</text>
+  <text x="60" y="108" font-size="11" fill="#713f12">Provisions TPM via DI protocol against a manufacturing server.</text>
+  <text x="60" y="123" font-size="11" fill="#713f12">Can be compiled into the Firmware Stub, the Installer Image, or run externally (quick-di).</text>
+  <text x="60" y="141" font-size="10" fill="#92400e" font-style="italic">Dashed border = can appear in any stage that has the "di" feature enabled.</text>
+
+  <!-- Arrow DI → Stub -->
+  <line x1="360" y1="152" x2="360" y2="172" stroke="#64748b" stroke-width="1.5"/>
+  <polygon points="352,172 360,182 368,172" fill="#64748b"/>
+
+  <!-- ─── FDO Firmware Stub ─── -->
+  <rect x="40" y="182" width="640" height="148" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5" filter="url(#shadow)"/>
+  <!-- Header band -->
+  <rect x="40" y="182" width="640" height="30" rx="10" fill="#3b82f6"/>
+  <rect x="40" y="200" width="640" height="12" fill="#3b82f6"/>
+  <text x="60" y="201" font-size="13" font-weight="700" fill="#ffffff">FDO Firmware Stub</text>
+  <text x="640" y="201" text-anchor="end" font-size="11" fill="#bfdbfe" font-style="italic">feature: rv-firmware</text>
+
+  <!-- Description -->
+  <text x="60" y="232" font-size="11.5" fill="#1e3a5f" font-weight="600">Simple, vendor-signed firmware loader — NOT part of the FDO spec.</text>
+  <text x="60" y="248" font-size="11" fill="#334155">Dynamically loads (into RAM) or updates FDO firmware components</text>
+  <text x="60" y="263" font-size="11" fill="#334155">prior to onboarding, using vendor-signed COSE_Sign1 bundles.</text>
+
+  <!-- Steps -->
+  <text x="60" y="285" font-size="10.5" fill="#475569">1. Read DCTPM from TPM NV (RV firmware extension tags)</text>
+  <text x="60" y="299" font-size="10.5" fill="#475569">2. HTTP GET signed firmware image → COSE_Sign1 verify → anti-rollback check</text>
+  <text x="60" y="313" font-size="10.5" fill="#475569">3. Chainload downloaded Installer Image (separate binaries),</text>
+  <text x="72" y="326" font-size="10.5" fill="#475569">or fall through to Installer Image code (single combined binary).</text>
+
+  <!-- Arrow Stub → Installer -->
+  <line x1="360" y1="340" x2="360" y2="352" stroke="#64748b" stroke-width="1.5"/>
+  <polygon points="352,352 360,362 368,352" fill="#64748b"/>
+  <text x="374" y="350" font-size="9" fill="#64748b" font-style="italic">chainload or fall-through</text>
+
+  <!-- ─── FDO Installer Image ─── -->
+  <rect x="40" y="360" width="640" height="148" rx="10" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5" filter="url(#shadow)"/>
+  <!-- Header band -->
+  <rect x="40" y="360" width="640" height="30" rx="10" fill="#16a34a"/>
+  <rect x="40" y="378" width="640" height="12" fill="#16a34a"/>
+  <text x="60" y="379" font-size="13" font-weight="700" fill="#ffffff">FDO Installer Image</text>
+  <text x="640" y="379" text-anchor="end" font-size="11" fill="#bbf7d0" font-style="italic">feature: fdo-installer</text>
+
+  <!-- Description -->
+  <text x="60" y="410" font-size="11.5" fill="#14532d" font-weight="600">FDO Device Onboard — implements the FIDO Device Onboard specification.</text>
+  <text x="60" y="426" font-size="11" fill="#334155">Performs actual device onboarding: authenticates to the Owner service,</text>
+  <text x="60" y="441" font-size="11" fill="#334155">establishes encrypted channel, and receives the deployment payload via BMO.</text>
+
+  <!-- Steps -->
+  <text x="60" y="463" font-size="10.5" fill="#475569">1. TO1 — Rendezvous server discovery</text>
+  <text x="60" y="477" font-size="10.5" fill="#475569">2. TO2 — Owner server handshake + encrypted ServiceInfo exchange</text>
+  <text x="60" y="491" font-size="10.5" fill="#475569">3. BMO FSIM — Receive OS/firmware payload (inline, URL, or meta) → chainload</text>
+
+  <!-- Arrow Installer → Payload -->
+  <line x1="360" y1="508" x2="360" y2="528" stroke="#64748b" stroke-width="1.5"/>
+  <polygon points="352,528 360,538 368,528" fill="#64748b"/>
+  <text x="374" y="526" font-size="9" fill="#64748b" font-style="italic">chainload</text>
+
+  <!-- ─── Payload ─── -->
+  <rect x="40" y="538" width="640" height="68" rx="10" fill="#faf5ff" stroke="#a855f7" stroke-width="1.5" filter="url(#shadow)"/>
+  <!-- Header band -->
+  <rect x="40" y="538" width="640" height="26" rx="10" fill="#9333ea"/>
+  <rect x="40" y="554" width="640" height="10" fill="#9333ea"/>
+  <text x="60" y="556" font-size="13" font-weight="700" fill="#ffffff">Payload</text>
+  <text x="640" y="556" text-anchor="end" font-size="11" fill="#e9d5ff" font-style="italic">not part of this project</text>
+  <text x="60" y="581" font-size="11" fill="#334155">Delivered by the FDO Installer Image via BMO. Examples: OS installer, UKI, firmware update.</text>
+  <text x="60" y="596" font-size="11" fill="#334155">Chainloaded via UEFI LoadImage / StartImage.</text>
+
+  <!-- Legend -->
+  <rect x="40" y="624" width="640" height="46" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
+  <rect x="54" y="636" width="14" height="10" rx="2" fill="#eff6ff" stroke="#3b82f6" stroke-width="1"/>
+  <text x="74" y="645" font-size="10" fill="#475569">Vendor-signed loader (pre-FDO)</text>
+  <rect x="250" y="636" width="14" height="10" rx="2" fill="#f0fdf4" stroke="#22c55e" stroke-width="1"/>
+  <text x="270" y="645" font-size="10" fill="#475569">FDO spec onboarding</text>
+  <rect x="420" y="636" width="14" height="10" rx="2" fill="#fefce8" stroke="#ca8a04" stroke-width="1" stroke-dasharray="4 2"/>
+  <text x="440" y="645" font-size="10" fill="#475569">Provisioning (appears in any stage)</text>
+  <text x="54" y="661" font-size="10" fill="#94a3b8">All stages are optional and independently feature-gated via Cargo build features.</text>
+</svg>

@@ -1,7 +1,11 @@
+<!-- Copyright 2026 Dell Technologies, All Rights Reserved -->
+<!-- Author: Brad Goodman <bradley.goodman@dell.com> -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # FDO UEFI Client — Modular Architecture
 
 **Date**: 2026-08-25
-**Author**: Brad Goodman
+**Author**: Brad Goodman <bradley.goodman@dell.com>
 **Status**: DRAFT
 
 ---
@@ -57,33 +61,46 @@ The boot flow has up to three stages:
 |---------|-------------|----------|
 | `uefi-http` | EFI_HTTP_PROTOCOL transport (OVMF, some server firmware) | HTTP via UEFI stack |
 | `tcp4-http` | TCP4-based HTTP (most real hardware) | HTTP via raw TCP4 |
+| `di` | Device Initialization — FDO DI protocol | Manufacturing/provisioning |
+| `fdo-installer` | FDO Installer Image — TO1/TO2 + BMO | Onboarding + payload delivery |
 | `rv-firmware` | RV-based firmware delivery (FDO Firmware Stub) | COSE_Sign1, p256, ecdsa |
-| `rv-firmware-di` | DI support inside FDO Firmware Stub | DI protocol + rv-firmware |
 
 ### Build Configurations
 
-**FDO Installer Image only** (TO1/TO2 + BMO, with DI auto-detect):
+**Default build** (DI + FDO Installer Image — provisions if needed, then onboards):
 
 ```bash
-cargo +nightly build --release   # default features: uefi-http, tcp4-http
+cargo +nightly build --release   # default features: uefi-http, tcp4-http, di, fdo-installer
 ```
 
-**FDO Firmware Stub only** (rv-firmware, no DI — smallest image):
+**FDO Installer Image only** (no DI — device was provisioned externally):
 
 ```bash
-cargo +nightly build --release --features rv-firmware
+cargo +nightly build --release --no-default-features --features uefi-http,tcp4-http,fdo-installer
 ```
 
-**FDO Firmware Stub with DI** (rv-firmware + DI — OEM-friendly, no factory server needed):
+**DI only** (just provision the TPM, nothing else):
 
 ```bash
-cargo +nightly build --release --features rv-firmware-di
+cargo +nightly build --release --no-default-features --features uefi-http,tcp4-http,di
 ```
 
-**Combined FDO Firmware Stub + FDO Installer Image** (rv-firmware with full fallback to TO1/TO2):
+**FDO Firmware Stub only** (no DI, no onboarding — smallest image):
 
 ```bash
-cargo +nightly build --release --features rv-firmware   # single binary, both stages
+cargo +nightly build --release --no-default-features --features uefi-http,tcp4-http,rv-firmware
+```
+
+**FDO Firmware Stub + DI** (OEM-friendly, self-provisioning firmware stub):
+
+```bash
+cargo +nightly build --release --no-default-features --features uefi-http,tcp4-http,rv-firmware,di
+```
+
+**Everything** (firmware stub + DI + full onboarding in single binary):
+
+```bash
+cargo +nightly build --release --no-default-features --features uefi-http,tcp4-http,rv-firmware,di,fdo-installer
 ```
 
 ---
@@ -193,7 +210,7 @@ Version-aware Stage 1 must know its own revision number.
 | COSE_Sign1 verification | Yes | Platform vendor public key |
 | Anti-rollback check | Yes | TPM NV counter at 0x01D10002 |
 | Chainload FDO Installer Image | Yes | LoadImage/StartImage |
-| Device Initialization (DI) | Optional | Build feature `rv-firmware-di` |
+| Device Initialization (DI) | Optional | Build feature `di` (independent of `rv-firmware`) |
 
 ### Stage 2: FDO Installer Image (default build)
 
@@ -223,7 +240,7 @@ main()
   │
   ├─ [rv-firmware feature enabled?]
   │     │
-  │     ├─ [rv-firmware-di feature enabled?]
+  │     ├─ [di feature enabled?]
   │     │     │
   │     │     └─ No DCTPM in TPM? ──▶  Run DI protocol
   │     │         │                     (provisions TPM with credentials
@@ -238,10 +255,10 @@ main()
   │     │
   │     └─ (fall through to FDO Installer Image logic)
   │
-  ├─ Check DCTPM for GUID
-  │     ├─ Found: run TO1/TO2 (onboarding)
+  ├─ [di OR fdo-installer feature enabled?]
+  │     ├─ GUID found + [fdo-installer]: run TO1/TO2 (onboarding)
   │     │     └─ BMO → chainload payload → exit
-  │     └─ Not found: run DI protocol → exit
+  │     └─ Not found + [di]: run DI protocol → exit
   │
   └─ exit
 ```
@@ -255,8 +272,8 @@ main()
 | QEMU DI | (default) | DI protocol against go-fdo server |
 | QEMU TO2+BMO | (default) | Full onboarding with BMO chainload |
 | QEMU rv-firmware | rv-firmware | Firmware download + COSE verify + chainload |
-| QEMU full stack | rv-firmware, rv-firmware-di | DI → rv-firmware → chainload FDO Installer Image → TO2 → BMO |
+| QEMU full stack | rv-firmware, di, fdo-installer | DI → rv-firmware → chainload FDO Installer Image → TO2 → BMO |
 | k800 DI | (default) | DI on real hardware TPM |
 | k800 TO2+BMO | (default) | Full onboarding on real hardware |
 | k800 rv-firmware | rv-firmware | Firmware delivery on real hardware |
-| k800 full stack | rv-firmware, rv-firmware-di | Full 3-stage boot on real hardware |
+| k800 full stack | rv-firmware, di, fdo-installer | Full 3-stage boot on real hardware |

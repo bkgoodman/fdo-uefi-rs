@@ -21,9 +21,12 @@ mod http_api;
 mod http;
 #[cfg(feature = "tcp4-http")]
 mod tcp4_http;
+#[cfg(feature = "fdo-installer")]
 mod fdo;
+#[cfg(feature = "fdo-installer")]
 mod bmo;
 mod chainload;
+#[cfg(feature = "di")]
 mod di;
 #[cfg(feature = "rv-firmware")]
 mod rv_firmware;
@@ -180,29 +183,46 @@ fn main() -> Status {
     }
 
     // Check if device credentials exist in TPM
-    info!("Checking for FDO credentials in TPM...");
-    
-    match tpm::read_fdo_guid() {
-        Some(guid) => {
-            // Credentials exist - run TO1/TO2 onboarding
-            info!("Device GUID found: {:02x?}", guid);
-            run_onboarding(&guid, &opts);
-        }
-        None => {
-            // No credentials - attempt Device Initialization
-            info!("No credentials found in TPM.");
-            info!("Attempting Device Initialization (DI)...");
-            
-            match di::run_di_protocol(opts.di_url.as_deref()) {
-                Status::SUCCESS => {
-                    info!("Device Initialization completed successfully.");
-                    info!("Reboot required to proceed with onboarding.");
+    #[cfg(any(feature = "di", feature = "fdo-installer"))]
+    {
+        info!("Checking for FDO credentials in TPM...");
+        
+        match tpm::read_fdo_guid() {
+            Some(guid) => {
+                // Credentials exist - run TO1/TO2 onboarding
+                info!("Device GUID found: {:02x?}", guid);
+                #[cfg(feature = "fdo-installer")]
+                run_onboarding(&guid, &opts);
+                #[cfg(not(feature = "fdo-installer"))]
+                {
+                    let _ = guid;
+                    info!("FDO Installer not compiled in — nothing to do.");
                 }
-                Status::NOT_FOUND => {
-                    info!("No manufacturing server available. Exiting.");
+            }
+            None => {
+                // No credentials - attempt Device Initialization
+                #[cfg(feature = "di")]
+                {
+                    info!("No credentials found in TPM.");
+                    info!("Attempting Device Initialization (DI)...");
+                    
+                    match di::run_di_protocol(opts.di_url.as_deref()) {
+                        Status::SUCCESS => {
+                            info!("Device Initialization completed successfully.");
+                            info!("Reboot required to proceed with onboarding.");
+                        }
+                        Status::NOT_FOUND => {
+                            info!("No manufacturing server available. Exiting.");
+                        }
+                        status => {
+                            info!("Device Initialization failed: {:?}", status);
+                        }
+                    }
                 }
-                status => {
-                    info!("Device Initialization failed: {:?}", status);
+                #[cfg(not(feature = "di"))]
+                {
+                    info!("No credentials found in TPM.");
+                    info!("DI not compiled in — cannot provision. Exiting.");
                 }
             }
         }
@@ -215,6 +235,7 @@ fn main() -> Status {
     Status::SUCCESS
 }
 
+#[cfg(feature = "fdo-installer")]
 /// Run TO1/TO2 onboarding protocols
 fn run_onboarding(device_guid: &[u8; 16], opts: &FdoOptions) {
     // RV URL priority: 1) CLI -rv flag, 2) parsed from TPM credential, 3) error
