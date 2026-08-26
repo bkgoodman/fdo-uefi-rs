@@ -35,7 +35,9 @@ const MSG_TYPE_DI_DONE: u8 = 13;
 /// FDO 2.0 capability flags
 const CAPABILITY_FLAGS_FDO20: u32 = 0x0001;
 
-/// TPM persistent handles (per securing-fdo-in-tpm.bs)
+/// Default TPM persistent handles for DI key creation (per securing-fdo-in-tpm.bs).
+/// These are recorded in DCTPM after creation. The TO2 path reads the actual
+/// handles from DCTPM.DeviceKeyHandle / DCTPM.HMACKeyHandle — never hardcoded.
 const FDO_DAK_HANDLE: u32 = 0x81020002;
 const FDO_HMAC_HANDLE: u32 = 0x81020003;
 

@@ -187,15 +187,17 @@ fn main() -> Status {
     {
         info!("Checking for FDO credentials in TPM...");
         
-        match tpm::read_fdo_guid() {
-            Some(guid) => {
+        match tpm::read_fdo_credentials() {
+            Some(creds) => {
                 // Credentials exist - run TO1/TO2 onboarding
-                info!("Device GUID found: {:02x?}", guid);
+                info!("Device GUID found: {:02x?}", creds.guid);
+                info!("DeviceKeyHandle: 0x{:08x}", creds.device_key_handle);
+                info!("HMACKeyHandle: 0x{:08x}", creds.hmac_key_handle);
                 #[cfg(feature = "fdo-installer")]
-                run_onboarding(&guid, &opts);
+                run_onboarding(&creds, &opts);
                 #[cfg(not(feature = "fdo-installer"))]
                 {
-                    let _ = guid;
+                    let _ = creds;
                     info!("FDO Installer not compiled in — nothing to do.");
                 }
             }
@@ -236,8 +238,10 @@ fn main() -> Status {
 }
 
 #[cfg(feature = "fdo-installer")]
-/// Run TO1/TO2 onboarding protocols
-fn run_onboarding(device_guid: &[u8; 16], opts: &FdoOptions) {
+/// Run TO1/TO2 onboarding protocols.
+/// Per securing-fdo-in-tpm.bs spec, the device key handle is read from
+/// DCTPM.DeviceKeyHandle — never hardcoded.
+fn run_onboarding(creds: &tpm::FdoCredentials, opts: &FdoOptions) {
     // RV URL priority: 1) CLI -rv flag, 2) parsed from TPM credential, 3) error
     let owner_url = if let Some(ref url) = opts.rv_url {
         info!("Using CLI-provided RV/Owner URL");
@@ -261,10 +265,10 @@ fn run_onboarding(device_guid: &[u8; 16], opts: &FdoOptions) {
     // Run TO1 protocol
     info!("");
     info!("--- TO1 Protocol ---");
-    fdo::test_to1_protocol(&owner_url, device_guid);
+    fdo::test_to1_protocol(&owner_url, &creds.guid);
     
-    // Run TO2 protocol
+    // Run TO2 protocol (pass device_key_handle from DCTPM per spec)
     info!("");
     info!("--- TO2 Protocol ---");
-    fdo::test_to2_protocol(&owner_url, device_guid);
+    fdo::test_to2_protocol(&owner_url, &creds.guid, creds.device_key_handle);
 }

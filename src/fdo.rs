@@ -1614,7 +1614,8 @@ pub fn perform_to2_hello(owner_url: &str, guid: &[u8; 16]) -> Result<(To2HelloDe
 }
 
 /// Perform TO2 protocol (initial steps - unencrypted)
-pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
+/// device_key_handle: persistent TPM handle for the DAK, read from DCTPM.DeviceKeyHandle
+pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> Result<(), FdoError> {
     use crate::tpm;
     
     info!("=== Starting TO2 Protocol ===");
@@ -1676,16 +1677,12 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     
     info!("TO2: Building COSE signature for ProveDevice20...");
     
-    // Flush the ECDH transient handle before DAK CreatePrimary+Sign.
-    // UEFI TCG2 doesn't auto-flush transients between sessions, so the ECDH
-    // key blocks CreatePrimary for the DAK.
+    // Flush the ECDH transient handle before signing.
+    // UEFI TCG2 doesn't auto-flush transients, so the ECDH key occupies
+    // a transient slot. Flushing it ensures TPM2_Sign can proceed cleanly.
     // After signing, we'll recreate the ECDH key for ECDH_ZGen.
-    info!("TO2: Flushing ECDH transient handle 0x{:08x} before DAK sign...", ecdh_key.handle);
+    info!("TO2: Flushing ECDH transient handle 0x{:08x} before signing...", ecdh_key.handle);
     tpm::tpm_flush_context(ecdh_key.handle);
-    
-    // NOTE: tpm_read_public skipped here — it would leave a DAK transient
-    // that conflicts with tpm_sign_with_dak. The DAK public key was already
-    // embedded in the device certificate during DI.
     
     // Build the payload bytes
     let payload = build_to2_prove_device_payload(
@@ -1720,8 +1717,11 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
     let sig_hash = sha256(&sig_structure);
     info!("  Sig_structure hash: {:02x?}", &sig_hash);
     
-    // Sign with TPM DAK
-    let signature = tpm::tpm_sign_with_dak(&sig_hash)
+    // Sign with TPM DAK using the persistent handle from DCTPM.DeviceKeyHandle.
+    // Per securing-fdo-in-tpm.bs spec: "The client does not need to know how
+    // the keys were created (Primary vs. ordinary, which hierarchy)."
+    info!("TO2: Signing with DAK at persistent handle 0x{:08x} (from DCTPM)", device_key_handle);
+    let signature = tpm::tpm_sign_with_persistent(device_key_handle, &sig_hash)
         .ok_or_else(|| FdoError::CryptoError(String::from("TPM signing failed")))?;
     info!("  TPM signature: {} bytes", signature.len());
     info!("  Signature r: {:02x?}", &signature[..32]);
@@ -2007,10 +2007,10 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16]) -> Result<(), FdoError> {
 }
 
 /// Test TO2 protocol against a live server
-pub fn test_to2_protocol(owner_url: &str, guid: &[u8; 16]) {
+pub fn test_to2_protocol(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) {
     info!("=== TO2 Protocol Test ===");
     
-    match perform_to2(owner_url, guid) {
+    match perform_to2(owner_url, guid, device_key_handle) {
         Ok(()) => info!("TO2 test completed successfully!"),
         Err(e) => error!("TO2 test failed: {:?}", e),
     }

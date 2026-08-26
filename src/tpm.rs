@@ -21,9 +21,6 @@ const TPM2_CC_ECDH_ZGEN: u32 = 0x00000154;
 const TPM2_CC_FLUSH_CONTEXT: u32 = 0x00000165;
 const TPM2_CC_SIGN: u32 = 0x0000015D;
 
-/// FDO persistent key handle for Device Attestation Key (DAK)
-const FDO_DAK_HANDLE: u32 = 0x81020002;
-
 /// TPM2 constants
 const TPM2_RS_PW: u32 = 0x40000009;  // Password authorization
 const TPM2_RH_OWNER: u32 = 0x40000001;  // Owner hierarchy
@@ -687,44 +684,94 @@ pub fn tpm_flush_context(handle: u32) {
 /// TPM2_CC_ReadPublic command code
 const TPM2_CC_READ_PUBLIC: u32 = 0x00000173;
 
-/// Read the DAK public key by recreating it via CreatePrimary.
-/// Since UEFI TCG2 cannot access persistent handles, we recreate
-/// the key (deterministic — same template = same key) to get the public key.
-/// Returns (x, y) coordinates for ECC keys
-pub fn tpm_read_public(_handle: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+/// Read the public key from a persistent TPM handle using TPM2_ReadPublic.
+/// Per securing-fdo-in-tpm.bs spec, persistent handles are always accessible.
+/// Returns (x, y) coordinates for ECC keys.
+pub fn tpm_read_public(handle: u32) -> Option<(Vec<u8>, Vec<u8>)> {
     let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
     
-    // Recreate DAK via CreatePrimary (deterministic)
-    let cmd = build_create_primary_signing_cmd();
-    let mut response = vec![0u8; 1024];
+    // Build TPM2_ReadPublic command (no auth session needed)
+    let mut cmd = vec![0u8; 14];
+    pack_u16(&mut cmd[0..2], TPM2_ST_NO_SESSIONS);
+    pack_u32(&mut cmd[2..6], 14); // command size
+    pack_u32(&mut cmd[6..10], TPM2_CC_READ_PUBLIC);
+    pack_u32(&mut cmd[10..14], handle);
     
-    info!("TPM: Recreating DAK to read public key...");
-    let result = tcg.submit_command(&cmd, &mut response);
-    
-    if result.is_err() {
-        warn!("TPM: CreatePrimary (DAK) for ReadPublic failed");
+    let mut response = vec![0u8; 512];
+    info!("TPM: ReadPublic on handle 0x{:08x}...", handle);
+    if tcg.submit_command(&cmd, &mut response).is_err() {
+        warn!("TPM: ReadPublic submit failed for 0x{:08x}", handle);
         return None;
     }
     
-    // Parse response
-    if response.len() < 14 {
-        warn!("TPM: CreatePrimary response too short: {} bytes", response.len());
+    let rc = unpack_u32(&response[6..10]);
+    if rc != 0 {
+        warn!("TPM: ReadPublic error 0x{:08x} for handle 0x{:08x}", rc, handle);
         return None;
     }
     
-    let response_code = unpack_u32(&response[6..10]);
-    if response_code != 0 {
-        warn!("TPM: CreatePrimary (DAK) error: 0x{:08x}", response_code);
+    // Parse TPM2B_PUBLIC from response
+    // Response layout after header (10 bytes):
+    //   TPM2B_PUBLIC: 2-byte size, then TPMT_PUBLIC
+    //   TPMT_PUBLIC: type(2), nameAlg(2), objectAttributes(4), authPolicy(2+n),
+    //                then parameters + unique
+    let resp_size = unpack_u32(&response[2..6]) as usize;
+    if resp_size < 14 {
         return None;
     }
     
-    // Use parse_create_primary_response which handles the CreatePrimary response format
-    let key_pair = parse_create_primary_response(&response)?;
-    info!("TPM: Public key read via CreatePrimary: x={} bytes, y={} bytes", 
-          key_pair.public_x.len(), key_pair.public_y.len());
+    let mut pos = 10; // after header
+    if pos + 2 > response.len() { return None; }
+    let pub_size = unpack_u16(&response[pos..pos+2]) as usize;
+    pos += 2;
     
-    Some((key_pair.public_x, key_pair.public_y))
+    if pos + pub_size > response.len() || pub_size < 14 {
+        return None;
+    }
+    
+    let pub_start = pos;
+    let alg_type = unpack_u16(&response[pos..pos+2]);
+    pos += 2; // type
+    pos += 2; // nameAlg
+    pos += 4; // objectAttributes
+    
+    // authPolicy (TPM2B)
+    if pos + 2 > response.len() { return None; }
+    let auth_size = unpack_u16(&response[pos..pos+2]) as usize;
+    pos += 2 + auth_size;
+    
+    if alg_type != TPM2_ALG_ECC {
+        warn!("TPM: ReadPublic: not ECC key (type=0x{:04x})", alg_type);
+        return None;
+    }
+    
+    // ECC parameters: symmetric(2), scheme(2+2), curveID(2), kdf(2) = 10 bytes
+    pos += 2; // symmetric
+    let scheme_alg = unpack_u16(&response[pos..pos+2]);
+    pos += 2;
+    if scheme_alg != TPM2_ALG_NULL {
+        pos += 2; // scheme hashAlg
+    }
+    pos += 2; // curveID
+    pos += 2; // kdf scheme (TPM_ALG_NULL)
+    
+    // unique: TPMS_ECC_POINT = {TPM2B x, TPM2B y}
+    if pos + 2 > pub_start + pub_size { return None; }
+    let x_size = unpack_u16(&response[pos..pos+2]) as usize;
+    pos += 2;
+    if pos + x_size > pub_start + pub_size { return None; }
+    let x = response[pos..pos+x_size].to_vec();
+    pos += x_size;
+    
+    if pos + 2 > pub_start + pub_size { return None; }
+    let y_size = unpack_u16(&response[pos..pos+2]) as usize;
+    pos += 2;
+    if pos + y_size > pub_start + pub_size { return None; }
+    let y = response[pos..pos+y_size].to_vec();
+    
+    info!("TPM: ReadPublic 0x{:08x}: x={} bytes, y={} bytes", handle, x.len(), y.len());
+    Some((x, y))
 }
 
 // P-256 curve order N (for low-S normalization)
@@ -766,42 +813,32 @@ fn subtract_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     result
 }
 
-/// Sign a SHA-256 digest using the FDO Device Attestation Key (DAK)
-/// Returns the signature as concatenated r || s (64 bytes for P-256)
-/// Applies low-S normalization per BIP-0062 / RFC 6979
-///
-/// Since the UEFI TCG2 protocol cannot access persistent handles across
-/// sessions, we recreate the DAK via CreatePrimary (deterministic — same
-/// hierarchy + same template = same key) and sign in the same session.
-pub fn tpm_sign_with_dak(digest: &[u8; 32]) -> Option<Vec<u8>> {
+/// Sign a SHA-256 digest using a persistent TPM signing key.
+/// Per securing-fdo-in-tpm.bs spec, the FDO client SHALL locate the Device key
+/// by reading DCTPM.DeviceKeyHandle and sign using that persistent handle directly.
+/// Returns the signature as concatenated r || s (64 bytes for P-256).
+/// Applies low-S normalization per BIP-0062 / RFC 6979.
+pub fn tpm_sign_with_persistent(persistent_handle: u32, digest: &[u8; 32]) -> Option<Vec<u8>> {
     let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
     
-    // Recreate DAK via CreatePrimary (deterministic — same key every time)
-    let create_cmd = build_create_primary_signing_cmd();
-    let mut create_resp = vec![0u8; 1024];
-    info!("TPM: Recreating DAK via CreatePrimary for signing...");
-    if tcg.submit_command(&create_cmd, &mut create_resp).is_err() {
-        warn!("TPM: CreatePrimary (DAK) failed");
-        return None;
-    }
-    let create_rc = unpack_u32(&create_resp[6..10]);
-    if create_rc != 0 {
-        warn!("TPM: CreatePrimary (DAK) error: 0x{:08x}", create_rc);
-        return None;
-    }
-    let dak_handle = unpack_u32(&create_resp[10..14]);
-    info!("TPM: DAK recreated: transient handle=0x{:08x}", dak_handle);
-    
-    // Sign with the transient handle (same session — handle is valid)
-    let cmd = build_sign_cmd(dak_handle, digest);
+    // Sign directly with the persistent handle — no CreatePrimary needed.
+    // Persistent handles (0x81xxxxxx) are always accessible; they are not
+    // transient contexts and are not flushed by the UEFI resource manager.
+    let cmd = build_sign_cmd(persistent_handle, digest);
     let mut response = vec![0u8; 512];
     
-    info!("TPM: Signing with DAK (handle 0x{:08x})...", dak_handle);
+    info!("TPM: Signing with persistent handle 0x{:08x}...", persistent_handle);
     let result = tcg.submit_command(&cmd, &mut response);
     
     if result.is_err() {
-        warn!("TPM2_Sign command failed");
+        warn!("TPM2_Sign command failed for handle 0x{:08x}", persistent_handle);
+        return None;
+    }
+    
+    let rc = unpack_u32(&response[6..10]);
+    if rc != 0 {
+        warn!("TPM2_Sign error: 0x{:08x} for handle 0x{:08x}", rc, persistent_handle);
         return None;
     }
     
@@ -829,14 +866,6 @@ pub fn tpm_sign_with_dak(digest: &[u8; 32]) -> Option<Vec<u8>> {
     let mut signature = Vec::with_capacity(64);
     signature.extend_from_slice(&r_padded);
     signature.extend_from_slice(&s_padded);
-    
-    // Flush the DAK transient handle within this same session to free the slot.
-    // UEFI TCG2 doesn't auto-flush transients, so leaving it loaded would
-    // block the next CreatePrimary (e.g. ECDH key recreation).
-    let flush_cmd = build_flush_context_cmd(dak_handle);
-    let mut flush_resp = vec![0u8; 32];
-    let _ = tcg.submit_command(&flush_cmd, &mut flush_resp);
-    info!("TPM: Flushed DAK transient handle 0x{:08x}", dak_handle);
     
     Some(signature)
 }
@@ -965,10 +994,89 @@ fn skip_cbor_value(data: &[u8], pos: &mut usize) -> bool {
     }
 }
 
-/// Read FDO device credential GUID from TPM NV (DCTPM index)
-/// DCTPM is a CBOR array or map with GUID at index/key 4
-pub fn read_fdo_guid() -> Option<[u8; 16]> {
-    // Try the consolidated DCTPM index (0x01D10001)
+/// FDO device credentials parsed from DCTPM NV blob.
+/// Per securing-fdo-in-tpm.bs spec, the client SHALL read these handles
+/// from DCTPM and use them directly — never assume hardcoded values.
+pub struct FdoCredentials {
+    pub guid: [u8; 16],
+    pub device_key_handle: u32,
+    pub hmac_key_handle: u32,
+}
+
+/// Read a CBOR unsigned integer at the current position.
+/// Handles additional info values 0-23, 24 (1-byte), 25 (2-byte), 26 (4-byte).
+fn read_cbor_uint(data: &[u8], pos: &mut usize) -> Option<u32> {
+    if *pos >= data.len() {
+        return None;
+    }
+    let initial = data[*pos];
+    *pos += 1;
+    if (initial >> 5) != 0 {
+        return None; // Not major type 0 (unsigned int)
+    }
+    let add = initial & 0x1f;
+    if add < 24 {
+        Some(add as u32)
+    } else if add == 24 && *pos < data.len() {
+        let v = data[*pos] as u32;
+        *pos += 1;
+        Some(v)
+    } else if add == 25 && *pos + 2 <= data.len() {
+        let v = ((data[*pos] as u32) << 8) | (data[*pos + 1] as u32);
+        *pos += 2;
+        Some(v)
+    } else if add == 26 && *pos + 4 <= data.len() {
+        let v = ((data[*pos] as u32) << 24) | ((data[*pos+1] as u32) << 16)
+              | ((data[*pos+2] as u32) << 8) | (data[*pos+3] as u32);
+        *pos += 4;
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// Read a CBOR bstr at the current position and return its bytes.
+fn read_cbor_bstr<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    if *pos >= data.len() {
+        return None;
+    }
+    let initial = data[*pos];
+    *pos += 1;
+    if (initial >> 5) != 2 {
+        return None; // Not major type 2 (bstr)
+    }
+    let add = initial & 0x1f;
+    let len = if add < 24 {
+        add as usize
+    } else if add == 24 && *pos < data.len() {
+        let n = data[*pos] as usize;
+        *pos += 1;
+        n
+    } else if add == 25 && *pos + 2 <= data.len() {
+        let n = ((data[*pos] as usize) << 8) | (data[*pos + 1] as usize);
+        *pos += 2;
+        n
+    } else {
+        return None;
+    };
+    if *pos + len > data.len() {
+        return None;
+    }
+    let result = &data[*pos..*pos + len];
+    *pos += len;
+    Some(result)
+}
+
+/// Read FDO device credentials from TPM NV (DCTPM index).
+/// Per securing-fdo-in-tpm.bs spec, the client SHALL read DCTPM to get:
+///   - GUID (index/key 4)
+///   - DeviceKeyHandle (index/key 8)
+///   - HMACKeyHandle (index/key 9)
+///
+/// DCTPM layout (CBOR array or map):
+///   0: Magic, 1: Active, 2: Version, 3: DeviceInfo, 4: GUID,
+///   5: RvInfo, 6: PubKeyHash, 7: KeyType, 8: DeviceKeyHandle, 9: HMACKeyHandle
+pub fn read_fdo_credentials() -> Option<FdoCredentials> {
     info!("Checking TPM NV for DCTPM at index 0x{:08x}...", FDO_NV_INDEX_ALT);
     let data = match tpm_nv_read(FDO_NV_INDEX_ALT) {
         Some(d) => d,
@@ -979,8 +1087,6 @@ pub fn read_fdo_guid() -> Option<[u8; 16]> {
     };
     info!("DCTPM NV data: {} bytes, first 16: {:02x?}", data.len(), &data[..data.len().min(16)]);
     
-    // Parse CBOR map to extract GUID at key 4
-    // CBOR map format: 0xA0-0xBF for small maps, or 0xB9/0xBA/0xBB for larger
     if data.is_empty() {
         warn!("DCTPM NV data is empty");
         return None;
@@ -990,7 +1096,6 @@ pub fn read_fdo_guid() -> Option<[u8; 16]> {
     let initial = data[pos];
     pos += 1;
     
-    // Check for CBOR array (major type 4) or map (major type 5)
     let major = initial >> 5;
     let additional = initial & 0x1f;
     
@@ -1006,67 +1111,63 @@ pub fn read_fdo_guid() -> Option<[u8; 16]> {
     };
     
     if major == 4 {
-        // CBOR array - GUID is at index 4
+        // CBOR array — fields at fixed indices
         info!("DCTPM: CBOR array with {} items", num_items);
-        if num_items < 5 {
-            warn!("DCTPM: array too short for GUID at index 4");
+        if num_items < 10 {
+            warn!("DCTPM: array needs >= 10 items (has {}), missing key handles", num_items);
             return None;
         }
         
-        // Skip items 0-3 to get to GUID at index 4
+        // Skip items 0-3 (Magic, Active, Version, DeviceInfo)
         for idx in 0..4 {
-            if pos >= data.len() {
-                return None;
-            }
-            let skip_result = skip_cbor_value(&data, &mut pos);
-            if !skip_result {
+            if !skip_cbor_value(&data, &mut pos) {
                 warn!("DCTPM: failed to skip item {}", idx);
                 return None;
             }
         }
         
-        // Now at index 4 - should be GUID (16-byte bstr)
-        if pos >= data.len() {
+        // Item 4: GUID (16-byte bstr)
+        let guid_bytes = read_cbor_bstr(&data, &mut pos)?;
+        if guid_bytes.len() != 16 {
+            warn!("DCTPM: GUID should be 16 bytes, got {}", guid_bytes.len());
             return None;
         }
-        let val_byte = data[pos];
-        pos += 1;
-        
-        // Check for bstr (major type 2)
-        if (val_byte >> 5) != 2 {
-            warn!("DCTPM: GUID should be bstr, got major {}", val_byte >> 5);
-            return None;
-        }
-        
-        let len = (val_byte & 0x1f) as usize;
-        if len != 16 {
-            warn!("DCTPM: GUID should be 16 bytes, got {}", len);
-            return None;
-        }
-        
-        if pos + 16 > data.len() {
-            warn!("DCTPM: not enough data for GUID");
-            return None;
-        }
-        
         let mut guid = [0u8; 16];
-        guid.copy_from_slice(&data[pos..pos+16]);
-        info!("DCTPM: Found GUID at array index 4: {:02x?}", guid);
-        return Some(guid);
-    } else if major == 5 {
-        // CBOR map with integer keys - GUID at key 4
-        info!("DCTPM: CBOR map with {} pairs", num_items);
+        guid.copy_from_slice(guid_bytes);
+        info!("DCTPM: GUID: {:02x?}", guid);
         
-        // Iterate through map looking for key 4 (GUID)
+        // Skip items 5-7 (RvInfo, PubKeyHash, KeyType)
+        for idx in 5..8 {
+            if !skip_cbor_value(&data, &mut pos) {
+                warn!("DCTPM: failed to skip item {}", idx);
+                return None;
+            }
+        }
+        
+        // Item 8: DeviceKeyHandle (uint32)
+        let device_key_handle = read_cbor_uint(&data, &mut pos)?;
+        info!("DCTPM: DeviceKeyHandle: 0x{:08x}", device_key_handle);
+        
+        // Item 9: HMACKeyHandle (uint32)
+        let hmac_key_handle = read_cbor_uint(&data, &mut pos)?;
+        info!("DCTPM: HMACKeyHandle: 0x{:08x}", hmac_key_handle);
+        
+        return Some(FdoCredentials { guid, device_key_handle, hmac_key_handle });
+    } else if major == 5 {
+        // CBOR map — find keys 4, 8, 9
+        info!("DCTPM: CBOR map with {} pairs", num_items);
+        let mut guid: Option<[u8; 16]> = None;
+        let mut device_key_handle: Option<u32> = None;
+        let mut hmac_key_handle: Option<u32> = None;
+        
         for _ in 0..num_items {
             if pos >= data.len() {
                 break;
             }
             
-            // Read key (should be small unsigned int)
+            // Read map key (unsigned int)
             let key_byte = data[pos];
             pos += 1;
-            
             let key = if (key_byte >> 5) == 0 {
                 let add = key_byte & 0x1f;
                 if add < 24 {
@@ -1082,42 +1183,60 @@ pub fn read_fdo_guid() -> Option<[u8; 16]> {
                 return None;
             };
             
-            if key == 4 {
-                // Key 4 is GUID - should be 16-byte bstr
-                if pos >= data.len() {
-                    return None;
+            match key {
+                4 => {
+                    // GUID (16-byte bstr)
+                    let guid_bytes = read_cbor_bstr(&data, &mut pos)?;
+                    if guid_bytes.len() != 16 {
+                        warn!("DCTPM: GUID should be 16 bytes, got {}", guid_bytes.len());
+                        return None;
+                    }
+                    let mut g = [0u8; 16];
+                    g.copy_from_slice(guid_bytes);
+                    info!("DCTPM: GUID: {:02x?}", g);
+                    guid = Some(g);
                 }
-                let val_byte = data[pos];
-                pos += 1;
-                
-                if (val_byte >> 5) != 2 {
-                    warn!("DCTPM: GUID should be bstr");
-                    return None;
+                8 => {
+                    // DeviceKeyHandle (uint32)
+                    let h = read_cbor_uint(&data, &mut pos)?;
+                    info!("DCTPM: DeviceKeyHandle: 0x{:08x}", h);
+                    device_key_handle = Some(h);
                 }
-                
-                let len = (val_byte & 0x1f) as usize;
-                if len != 16 || pos + 16 > data.len() {
-                    return None;
+                9 => {
+                    // HMACKeyHandle (uint32)
+                    let h = read_cbor_uint(&data, &mut pos)?;
+                    info!("DCTPM: HMACKeyHandle: 0x{:08x}", h);
+                    hmac_key_handle = Some(h);
                 }
-                
-                let mut guid = [0u8; 16];
-                guid.copy_from_slice(&data[pos..pos+16]);
-                info!("DCTPM: Found GUID in map: {:02x?}", guid);
-                return Some(guid);
-            } else {
-                // Skip this value using helper
-                if !skip_cbor_value(&data, &mut pos) {
-                    return None;
+                _ => {
+                    if !skip_cbor_value(&data, &mut pos) {
+                        return None;
+                    }
                 }
             }
         }
         
-        warn!("DCTPM: GUID (key 4) not found in map");
-        return None;
+        match (guid, device_key_handle, hmac_key_handle) {
+            (Some(g), Some(dk), Some(hk)) => {
+                return Some(FdoCredentials { guid: g, device_key_handle: dk, hmac_key_handle: hk });
+            }
+            _ => {
+                warn!("DCTPM: missing required fields (guid={}, dkh={}, hkh={})",
+                      guid.is_some(), device_key_handle.is_some(), hmac_key_handle.is_some());
+                return None;
+            }
+        }
     }
     
     warn!("DCTPM: unsupported major type {}", major);
     None
+}
+
+/// Read FDO device credential GUID from TPM NV (DCTPM index).
+/// Convenience wrapper around read_fdo_credentials() for callers that
+/// only need the GUID.
+pub fn read_fdo_guid() -> Option<[u8; 16]> {
+    read_fdo_credentials().map(|c| c.guid)
 }
 
 /// RV variable IDs (per FDO spec RendezvousVariable)
