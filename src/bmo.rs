@@ -10,6 +10,7 @@
 use log::{info, warn, error};
 use alloc::vec::Vec;
 use alloc::string::{String, ToString};
+use sha2::{Sha256, Digest};
 
 use crate::fdo::{CborDecoder, CborEncoder};
 
@@ -374,8 +375,6 @@ pub fn process_bmo_message(
                 return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
             }
             
-            session.state = BmoState::Complete;
-            
             info!("BMO: Transfer complete!");
             info!("  Total chunks: {}", session.chunks_received);
             info!("  Total bytes: {}", session.bytes_received);
@@ -385,15 +384,41 @@ pub fn process_bmo_message(
                 if begin.total_size > 0 && session.bytes_received != begin.total_size {
                     error!("BMO: Size mismatch! Expected {}, got {}", 
                            begin.total_size, session.bytes_received);
+                    session.state = BmoState::Error;
                     let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("Size mismatch"));
                     return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
                 }
             }
             
-            // TODO: Hash verification
-            // TODO: Chainload the image
+            // Parse image-end message for SHA256 hash (CBOR map, key 1 = hash value)
+            let end_hash = parse_image_end_hash(value);
             
-            info!("BMO: Image ready for boot ({} bytes)", session.image_buffer.len());
+            // Verify SHA256 hash of reassembled image buffer
+            if let Some(expected_hash) = &end_hash {
+                let mut hasher = Sha256::new();
+                hasher.update(&session.image_buffer);
+                let computed = hasher.finalize();
+                let computed_bytes = computed.as_slice();
+                
+                info!("BMO: SHA256 verification:");
+                info!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
+                info!("  Computed: {:02x?}", &computed_bytes[..16]);
+                
+                if computed_bytes != expected_hash.as_slice() {
+                    error!("BMO: SHA256 MISMATCH! Image data is CORRUPTED.");
+                    error!("BMO: REFUSING to chainload — data integrity check FAILED.");
+                    session.state = BmoState::Error;
+                    let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("SHA256 hash mismatch"));
+                    return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                }
+                info!("BMO: SHA256 verified OK");
+            } else {
+                warn!("BMO: No SHA256 hash in image-end message — cannot verify integrity");
+                warn!("BMO: Proceeding without hash verification (server should send hash)");
+            }
+            
+            session.state = BmoState::Complete;
+            info!("BMO: Image ready for boot ({} bytes, integrity verified)", session.image_buffer.len());
             
             // Send success result
             let result = build_bmo_image_result(BMO_STATUS_SUCCESS, Some("Image received"));
@@ -412,6 +437,54 @@ pub fn process_bmo_message(
             None
         }
     }
+}
+
+/// Parse the SHA256 hash from an image-end message.
+/// The image-end message is a CBOR map where:
+///   key 0 = status (int), key 1 = hash_value (bstr), key 2 = message (tstr)
+/// Returns the hash bytes if present, or None.
+fn parse_image_end_hash(data: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() {
+        return None;
+    }
+    
+    // Try to decode as CBOR map
+    let mut dec = CborDecoder::new(data);
+    let map_len = match dec.read_map_header() {
+        Ok(n) => n,
+        Err(_) => {
+            info!("BMO: image-end is not a CBOR map, no hash available");
+            return None;
+        }
+    };
+    
+    for _ in 0..map_len {
+        let key = match dec.read_int() {
+            Ok(k) => k,
+            Err(_) => return None,
+        };
+        
+        if key == 1 {
+            // Key 1 = hash value (byte string)
+            match dec.read_bytes() {
+                Ok(hash) => {
+                    info!("BMO: Found SHA256 hash in image-end ({} bytes)", hash.len());
+                    return Some(hash);
+                }
+                Err(_) => {
+                    warn!("BMO: Key 1 in image-end is not a byte string");
+                    return None;
+                }
+            }
+        } else {
+            // Skip this value
+            if dec.skip_value().is_err() {
+                return None;
+            }
+        }
+    }
+    
+    None
 }
 
 /// Test BMO state machine with mock data

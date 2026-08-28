@@ -127,28 +127,41 @@ fn parse_rv_firmware_info_at(data: &[u8], pos: &mut usize) -> Option<RvFirmwareI
         server_url: None,
     };
 
-    // Read outer array header (array of directives)
+    // RvInfo may be bstr-wrapped (server encodes as CBOR byte string
+    // containing the CBOR array) or a bare array.
     let outer_initial = data[*pos];
+    let outer_major = outer_initial >> 5;
+    let (rv_data, mut inner_pos) = if outer_major == 2 {
+        let bstr = read_cbor_bstr_raw(data, pos)?;
+        info!("RV-FW: RvInfo is bstr-wrapped ({} bytes), unwrapping...", bstr.len());
+        (bstr, 0usize)
+    } else {
+        (data.to_vec(), *pos)
+    };
+    let rv = &rv_data[..];
+    let pos = &mut inner_pos;
+
+    let arr_initial = rv[*pos];
     *pos += 1;
-    if (outer_initial >> 5) != 4 {
-        warn!("RV-FW: RvInfo should be array");
+    if (arr_initial >> 5) != 4 {
+        warn!("RV-FW: RvInfo should be array, got major {}", arr_initial >> 5);
         return None;
     }
-    let outer_len = read_cbor_uint_arg(data, pos, outer_initial & 0x1f)?;
+    let outer_len = read_cbor_uint_arg(rv, pos, arr_initial & 0x1f)?;
     info!("RV-FW: RvInfo has {} directive(s)", outer_len);
 
     for _dir_idx in 0..outer_len {
-        if *pos >= data.len() {
+        if *pos >= rv.len() {
             break;
         }
-        let dir_initial = data[*pos];
+        let dir_initial = rv[*pos];
         *pos += 1;
         let dir_major = dir_initial >> 5;
         if dir_major != 4 {
-            skip_cbor_value(data, pos);
+            skip_cbor_value(rv, pos);
             continue;
         }
-        let dir_len = read_cbor_uint_arg(data, pos, dir_initial & 0x1f)?;
+        let dir_len = read_cbor_uint_arg(rv, pos, dir_initial & 0x1f)?;
 
         let mut dns_name: Option<String> = None;
         let mut ip_addr: Option<[u8; 4]> = None;
@@ -156,31 +169,31 @@ fn parse_rv_firmware_info_at(data: &[u8], pos: &mut usize) -> Option<RvFirmwareI
         let mut scheme = "http";
 
         for _ in 0..dir_len {
-            if *pos >= data.len() {
+            if *pos >= rv.len() {
                 break;
             }
 
             // Each RvInstruction is [variable, value]
-            let instr_initial = data[*pos];
+            let instr_initial = rv[*pos];
             *pos += 1;
             if (instr_initial >> 5) != 4 {
-                skip_cbor_value(data, pos);
+                skip_cbor_value(rv, pos);
                 continue;
             }
-            let instr_len = read_cbor_uint_arg(data, pos, instr_initial & 0x1f)?;
+            let instr_len = read_cbor_uint_arg(rv, pos, instr_initial & 0x1f)?;
             if instr_len < 2 {
                 for _ in 0..instr_len {
-                    skip_cbor_value(data, pos);
+                    skip_cbor_value(rv, pos);
                 }
                 continue;
             }
 
-            let var_id = read_cbor_uint_at(data, pos).unwrap_or(255) as u8;
-            let value_bytes = read_cbor_bstr_raw(data, pos);
+            let var_id = read_cbor_uint_at(rv, pos).unwrap_or(255) as u8;
+            let value_bytes = read_cbor_bstr_raw(rv, pos);
 
             // Skip extra fields
             for _ in 2..instr_len {
-                skip_cbor_value(data, pos);
+                skip_cbor_value(rv, pos);
             }
 
             let value_bytes = match value_bytes {
@@ -197,14 +210,18 @@ fn parse_rv_firmware_info_at(data: &[u8], pos: &mut usize) -> Option<RvFirmwareI
                 }
                 RV_IP_ADDRESS => {
                     if let Some(ip_bytes) = decode_cbor_bstr(&value_bytes) {
+                        let mut ip = [0u8; 4];
                         if ip_bytes.len() == 4 {
-                            let mut ip = [0u8; 4];
                             ip.copy_from_slice(&ip_bytes);
                             info!("RV-FW: IP = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
                             ip_addr = Some(ip);
+                        } else if ip_bytes.len() == 16 {
+                            // IPv4-mapped IPv6: last 4 bytes are IPv4
+                            ip.copy_from_slice(&ip_bytes[12..16]);
+                            info!("RV-FW: IP (v4-mapped) = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                            ip_addr = Some(ip);
                         } else if ip_bytes.len() == 5 {
-                            // Skip family byte
-                            let mut ip = [0u8; 4];
+                            // Family byte + IPv4
                             ip.copy_from_slice(&ip_bytes[1..5]);
                             info!("RV-FW: IP = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
                             ip_addr = Some(ip);

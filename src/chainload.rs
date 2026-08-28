@@ -72,6 +72,70 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
         return Err(uefi::Status::LOAD_ERROR.into());
     }
 
+    // PE header sanity gate — REFUSE to chainload if PE structure looks wrong
+    {
+        let pe_off = u32::from_le_bytes([
+            image_data[0x3C], image_data[0x3D], image_data[0x3E], image_data[0x3F],
+        ]) as usize;
+        
+        // Verify PE header is within bounds (need at least 56 bytes past PE sig for optional header)
+        if pe_off + 56 > image_data.len() {
+            error!("Chainload: PE header at 0x{:x} overflows image ({} bytes) — REFUSING to load", pe_off, image_data.len());
+            return Err(uefi::Status::LOAD_ERROR.into());
+        }
+        
+        let entry = u32::from_le_bytes([
+            image_data[pe_off + 40], image_data[pe_off + 41],
+            image_data[pe_off + 42], image_data[pe_off + 43],
+        ]);
+        let image_base = u64::from_le_bytes([
+            image_data[pe_off + 48], image_data[pe_off + 49],
+            image_data[pe_off + 50], image_data[pe_off + 51],
+            image_data[pe_off + 52], image_data[pe_off + 53],
+            image_data[pe_off + 54], image_data[pe_off + 55],
+        ]);
+        
+        // Read SizeOfImage from optional header (offset 56 from PE sig for PE32+)
+        let size_of_image = if pe_off + 80 <= image_data.len() {
+            u32::from_le_bytes([
+                image_data[pe_off + 80], image_data[pe_off + 81],
+                image_data[pe_off + 82], image_data[pe_off + 83],
+            ])
+        } else {
+            0
+        };
+        
+        info!("Chainload: PE header at offset 0x{:x}", pe_off);
+        info!("Chainload: AddressOfEntryPoint=0x{:x}, ImageBase=0x{:x}, SizeOfImage=0x{:x}", entry, image_base, size_of_image);
+        info!("Chainload: First 16 bytes: {:02x?}", &image_data[..16]);
+        let mid = image_data.len() / 2;
+        info!("Chainload: Mid bytes @{}: {:02x?}", mid, &image_data[mid..core::cmp::min(mid+16, image_data.len())]);
+        info!("Chainload: Last 16 bytes: {:02x?}", &image_data[image_data.len()-16..]);
+
+        // Simple integrity checksum: sum of all bytes + XOR of all bytes
+        let mut sum: u64 = 0;
+        let mut xor: u8 = 0;
+        for &b in image_data.iter() {
+            sum = sum.wrapping_add(b as u64);
+            xor ^= b;
+        }
+        info!("Chainload: Integrity: len={} sum=0x{:x} xor=0x{:02x}", image_data.len(), sum, xor);
+        
+        // Safety checks — HALT if anything looks wrong
+        if entry == 0 {
+            error!("Chainload: AddressOfEntryPoint is 0 — REFUSING to load (corrupt PE?)");
+            return Err(uefi::Status::LOAD_ERROR.into());
+        }
+        if size_of_image > 0 && entry >= size_of_image {
+            error!("Chainload: Entry point 0x{:x} >= SizeOfImage 0x{:x} — REFUSING to load", entry, size_of_image);
+            return Err(uefi::Status::LOAD_ERROR.into());
+        }
+        if size_of_image > 0 && (image_data.len() as u32) > size_of_image * 2 {
+            error!("Chainload: File size {} >> SizeOfImage 0x{:x} — REFUSING to load", image_data.len(), size_of_image);
+            return Err(uefi::Status::LOAD_ERROR.into());
+        }
+    }
+
     // Try direct memory load first using LoadImageSource::FromBuffer
     info!("Chainload: Attempting direct memory load...");
     
@@ -108,6 +172,14 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
         info!("Chainload: Image loaded at {:p}, size={}", base, size);
     }
 
+    // Tear down network stack before chainload.
+    // The IP4 driver (when DHCP is active) keeps timer events registered for
+    // ARP cache refresh and DHCP lease renewal. If these fire during or after
+    // StartImage, they can dereference stale pointers and cause wild jumps
+    // (e.g., #UD at 0xA0000). Disconnecting the network controller cancels
+    // all driver-managed events before we transfer control.
+    teardown_network();
+
     // Start the image
     info!("Chainload: Starting image...");
     
@@ -125,6 +197,51 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Tear down the UEFI network stack before chainloading.
+///
+/// When TCP4 uses `use_default_address: TRUE` (DHCP mode), the IP4 driver
+/// keeps asynchronous timer events registered (ARP cache maintenance, DHCP
+/// lease renewal). If these fire during `StartImage`, they can dereference
+/// freed/stale pointers and cause wild jumps (e.g., #UD at 0x000A0000).
+///
+/// This function disconnects all drivers from every SNP (network) handle,
+/// which tears down IP4Dxe, TcpDxe, ArpDxe, etc., cancelling their timers.
+fn teardown_network() {
+    use uefi::proto::network::snp::SimpleNetwork;
+    use uefi::Identify;
+
+    info!("Chainload: Tearing down network stack before StartImage...");
+
+    // Find all SNP handles
+    let snp_handles = match uefi::boot::locate_handle_buffer(
+        uefi::boot::SearchType::ByProtocol(&SimpleNetwork::GUID)
+    ) {
+        Ok(h) => h,
+        Err(_) => {
+            info!("Chainload: No SNP handles found, nothing to tear down");
+            return;
+        }
+    };
+
+    info!("Chainload: Disconnecting {} network controller(s)...", snp_handles.len());
+
+    for (idx, &handle) in snp_handles.iter().enumerate() {
+        // DisconnectController with NULL driver handle disconnects ALL drivers
+        // from this controller, which tears down IP4, TCP4, ARP, DHCP, etc.
+        match uefi::boot::disconnect_controller(handle, None, None) {
+            Ok(_) => info!("Chainload: NIC #{} disconnected", idx),
+            Err(e) => {
+                // NOT_FOUND just means no drivers were connected — that's fine
+                if e.status() != uefi::Status::NOT_FOUND {
+                    warn!("Chainload: NIC #{} disconnect failed: {:?}", idx, e.status());
+                }
+            }
+        }
+    }
+
+    info!("Chainload: Network teardown complete");
 }
 
 /// Load image by writing to temp file first (fallback for OVMF)

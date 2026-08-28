@@ -1382,31 +1382,49 @@ fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::Strin
         return None;
     }
 
-    // Read outer array header (array of directives)
+    // RvInfo may be either a bare CBOR array or bstr-wrapped (the server
+    // encodes it as a CBOR byte string containing the CBOR array).
+    // Unwrap bstr if present, then parse the inner array.
     let outer_initial = data[*pos];
-    *pos += 1;
     let outer_major = outer_initial >> 5;
-    if outer_major != 4 {
-        warn!("RV: RvInfo should be array, got major {}", outer_major);
+    let (rv_data, mut inner_pos) = if outer_major == 2 {
+        // bstr-wrapped: read the byte string, then parse its contents
+        let bstr = read_cbor_bstr(data, pos)?;
+        info!("RV: RvInfo is bstr-wrapped ({} bytes), unwrapping...", bstr.len());
+        (bstr.to_vec(), 0usize)
+    } else {
+        // Direct array — copy and use from current position
+        (data.to_vec(), *pos)
+    };
+    let rv_ref = &rv_data[..];
+
+    let arr_initial = rv_ref[inner_pos];
+    inner_pos += 1;
+    let arr_major = arr_initial >> 5;
+    if arr_major != 4 {
+        warn!("RV: RvInfo should be array, got major {}", arr_major);
         return None;
     }
-    let outer_len = read_cbor_uint_arg(data, pos, outer_initial & 0x1f)?;
+    let outer_len = read_cbor_uint_arg(rv_ref, &mut inner_pos, arr_initial & 0x1f)?;
+    // Update pos to point past the bstr (for bstr case, already done by read_cbor_bstr)
+    // For the direct case, we'll update pos at the end via inner_pos.
+    let pos = &mut inner_pos;
     info!("RV: RvInfo has {} directive(s)", outer_len);
 
     for dir_idx in 0..outer_len {
         // Each directive is an array of RvInstructions
-        if *pos >= data.len() {
+        if *pos >= rv_ref.len() {
             break;
         }
-        let dir_initial = data[*pos];
+        let dir_initial = rv_ref[*pos];
         *pos += 1;
         let dir_major = dir_initial >> 5;
         if dir_major != 4 {
             warn!("RV: directive {} should be array", dir_idx);
-            skip_cbor_value(data, pos);
+            skip_cbor_value(rv_ref, pos);
             continue;
         }
-        let dir_len = match read_cbor_uint_arg(data, pos, dir_initial & 0x1f) {
+        let dir_len = match read_cbor_uint_arg(rv_ref, pos, dir_initial & 0x1f) {
             Some(n) => n,
             None => continue,
         };
@@ -1418,38 +1436,40 @@ fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::Strin
 
         for _ in 0..dir_len {
             // Each RvInstruction is [variable, value]
-            if *pos >= data.len() {
+            if *pos >= rv_ref.len() {
                 break;
             }
-            let instr_initial = data[*pos];
+            let instr_initial = rv_ref[*pos];
             *pos += 1;
             let instr_major = instr_initial >> 5;
             if instr_major != 4 {
                 // Not an array — skip
-                skip_cbor_value(data, pos);
+                skip_cbor_value(rv_ref, pos);
                 continue;
             }
-            let instr_len = match read_cbor_uint_arg(data, pos, instr_initial & 0x1f) {
+            let instr_len = match read_cbor_uint_arg(rv_ref, pos, instr_initial & 0x1f) {
                 Some(n) => n,
                 None => continue,
             };
             if instr_len < 2 {
                 // Skip malformed instruction
                 for _ in 0..instr_len {
-                    skip_cbor_value(data, pos);
+                    skip_cbor_value(rv_ref, pos);
                 }
                 continue;
             }
 
             // Read variable ID (unsigned int)
-            let var_id = read_cbor_small_uint(data, pos).unwrap_or(255) as u8;
+            let var_id = read_cbor_small_uint(rv_ref, pos).unwrap_or(255) as u8;
 
             // Read value (byte string — CBOR-encoded content)
-            let value_bytes = read_cbor_bstr(data, pos);
+            let value_bytes = read_cbor_bstr(rv_ref, pos);
+            info!("RV: instruction var_id={}, value={:?}", var_id,
+                  value_bytes.as_ref().map(|v| &v[..core::cmp::min(v.len(), 20)]));
 
             // Skip any extra fields beyond the first 2
             for _ in 2..instr_len {
-                skip_cbor_value(data, pos);
+                skip_cbor_value(rv_ref, pos);
             }
 
             let value_bytes = match value_bytes {
@@ -1466,13 +1486,27 @@ fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::Strin
                     }
                 }
                 RV_IP_ADDRESS => {
-                    // Value is CBOR byte string (4 bytes for IPv4)
+                    // Value is CBOR byte string: 4 bytes (IPv4), 16 bytes
+                    // (IPv4-mapped IPv6 — Go's net.IP is always 16 bytes),
+                    // or 5 bytes (family byte + IPv4).
                     if let Some(ip_bytes) = decode_cbor_bstr(&value_bytes) {
+                        let mut ip = [0u8; 4];
                         if ip_bytes.len() == 4 {
-                            let mut ip = [0u8; 4];
                             ip.copy_from_slice(&ip_bytes);
                             info!("RV: IP = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
                             ip_addr = Some(ip);
+                        } else if ip_bytes.len() == 16 {
+                            // IPv4-mapped IPv6: last 4 bytes are IPv4
+                            ip.copy_from_slice(&ip_bytes[12..16]);
+                            info!("RV: IP (v4-mapped) = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                            ip_addr = Some(ip);
+                        } else if ip_bytes.len() == 5 {
+                            // Family byte + IPv4
+                            ip.copy_from_slice(&ip_bytes[1..5]);
+                            info!("RV: IP = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                            ip_addr = Some(ip);
+                        } else {
+                            info!("RV: IP address has unexpected length {}", ip_bytes.len());
                         }
                     }
                 }

@@ -1956,28 +1956,19 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
         }
     }
     
-    // Log BMO session state and chainload if image received
+    // Log BMO session state
     info!("TO2 Step 5 complete: ServiceInfo exchange finished");
     info!("  BMO state: {:?}", bmo_session.state);
-    
     if matches!(bmo_session.state, BmoState::Complete) && !bmo_session.image_buffer.is_empty() {
         info!("  BMO image received: {} bytes", bmo_session.image_buffer.len());
-        info!("  Attempting to chainload received image...");
-        
-        match chainload_image(&bmo_session.image_buffer) {
-            Ok(()) => {
-                info!("  Chainload completed successfully!");
-            }
-            Err(e) => {
-                error!("  Chainload failed: {:?}", e);
-            }
-        }
     } else if !bmo_session.image_buffer.is_empty() {
         warn!("  BMO image buffer has {} bytes but state is {:?}", 
               bmo_session.image_buffer.len(), bmo_session.state);
     }
     
-    // Step 6: Done/DoneAck
+    // Step 6: Done/DoneAck — MUST complete before chainload, because the
+    // chainloaded image (OS installer, UKI, etc.) will take over the machine
+    // and never return.
     info!("TO2 Step 6: Sending Done...");
     
     // Build Done (msg 90): [nonce_to2_setup_dv]
@@ -2003,6 +1994,23 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     info!("  nonce_to2_prove_dv: {:02x?}", &done_ack.nonce[..8]);
     
     info!("=== TO2 Protocol Complete! ===");
+    
+    // Chainload AFTER Done/DoneAck — this is the point of no return.
+    // The chainloaded image (OS installer, UKI, GRUB, etc.) takes over
+    // the machine and will typically never return.
+    if matches!(bmo_session.state, BmoState::Complete) && !bmo_session.image_buffer.is_empty() {
+        info!("Chainloading BMO image ({} bytes)...", bmo_session.image_buffer.len());
+        
+        match chainload_image(&bmo_session.image_buffer) {
+            Ok(()) => {
+                info!("Chainloaded image returned (unexpected for real payloads)");
+            }
+            Err(e) => {
+                error!("Chainload failed: {:?}", e);
+            }
+        }
+    }
+    
     Ok(())
 }
 
