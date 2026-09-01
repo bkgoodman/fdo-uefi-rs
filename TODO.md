@@ -413,10 +413,13 @@ Stage 1 (RV firmware delivery) confirmed working on K800 with the hello payload.
 Next: full chain, where each stage is a genuinely separate binary.
 
 | Stage | Build | Size | Role |
-|-------|-------|------|------|
-| 1 | `--no-default-features --features uefi-http,tcp4-http,rv-firmware` | 182272 | On ESP. Reads DCTPM, downloads + verifies COSE, chainloads Stage 2 |
-| 2 | `--no-default-features --features uefi-http,tcp4-http,fdo-installer` | 230912 | Delivered via COSE. Runs TO1/TO2 + BMO, chainloads Stage 3 |
-| 3 | `test-keys/payload_image.efi` | 51374 | Hello-world EFI app |
+|-------|-------|-----:|------|
+| 1 | `--no-default-features --features uefi-http,tcp4-http,rv-firmware,di` | 238.5 KiB | On ESP. Reads DCTPM, downloads + verifies COSE, chainloads Stage 2 |
+| 2 | `--no-default-features --features uefi-http,tcp4-http,fdo-installer` | 226 KiB | Delivered via COSE. Runs TO1/TO2 + BMO, chainloads Stage 3 |
+| 3 | `test-keys/payload_image.efi` | 50 KiB | Hello-world EFI app |
+
+Stage 1 gained `di` so it can re-provision itself (`-force-di`); a pure
+`rv-firmware` stub is 178 KiB but cannot rewrite its own DCTPM.
 
 Stage 1 deliberately excludes `fdo-installer`, and Stage 2 deliberately excludes
 `rv-firmware` — otherwise Stage 2 would run the firmware check again and
@@ -515,3 +518,67 @@ first; the new firmware config takes effect on the next boot.
 - [ ] Stage 1 is now built as `rv-firmware,di` (the README's "self-provisioning
   firmware stub", recommended OEM config) so it can re-provision itself. A pure
   `rv-firmware` Stage 1 cannot, and would need a separate DI binary deployed.
+
+## Build Size Analysis — all 7 feature combinations (2026-09-01)
+
+Release builds, `x86_64-unknown-uefi`, all with `uefi-http,tcp4-http`.
+Full table with use cases lives in README.md under "Valid Feature Combinations".
+
+| `di` | `fdo-installer` | `rv-firmware` | Size | over base |
+|:----:|:---------------:|:-------------:|---------:|----------:|
+| | | | 51 KiB | base |
+| ✓ | | | 162 KiB | +111 KiB |
+| | | ✓ | 178 KiB | +127 KiB |
+| | ✓ | | 226 KiB | +175 KiB |
+| ✓ | | ✓ | 238.5 KiB | +187.5 KiB |
+| ✓ | ✓ | | 264 KiB | +213 KiB |
+| | ✓ | ✓ | 306 KiB | +255 KiB |
+| ✓ | ✓ | ✓ | 340 KiB | +289 KiB |
+
+Marginal cost, alone vs added to a build that already has the other two:
+
+| Feature | alone | incremental |
+|---------|---------:|-----------:|
+| `di` | +111 KiB | +34 KiB |
+| `fdo-installer` | +175 KiB | +101.5 KiB |
+| `rv-firmware` | +127 KiB | +76 KiB |
+
+### Observations
+
+- The two columns differ by shared code (CBOR, COSE, TPM, HTTP helpers) that
+  each feature needs but the linker only includes once. `di` alone costs
+  +111 KiB but only +34 KiB incrementally — nearly all of it is already linked.
+- The transports alone are 51 KiB, so no build gets smaller than that.
+- Stage 1 as shipped today (`rv-firmware,di`, self-provisioning) is 238.5 KiB.
+  Dropping `di` — provisioning at the factory with a separate tool instead —
+  would save 60.5 KiB, worth considering if Stage 1 is flash-resident.
+- The everything binary (340 KiB) is roughly 2x the minimal stub (178 KiB).
+
+### Stripped sizes: identical (verified, 2026-09-01)
+
+An earlier note here claimed these were "unstripped debug-symbol-bearing
+builds". That was wrong. Rebuilding every combination with
+`RUSTFLAGS="-C strip=symbols"` produces **byte-identical** output:
+
+```
+di                            162 KiB   -> 162 KiB
+rv-firmware                   178 KiB   -> 178 KiB
+di,fdo-installer,rv-firmware  340 KiB   -> 340 KiB
+```
+
+Two reasons:
+
+- The UEFI target links MSVC-style: debug info goes to a separate
+  `fdo_uefi.pdb` (128 KiB) which is never part of the `.efi`. The image has no
+  PE debug directory — data directory index 6 is RVA 0, size 0.
+- `[profile.release]` already sets `lto = true`, `opt-level = "z"`,
+  `panic = "abort"`.
+
+So the chart numbers are the real shippable sizes, and there is no build-flag
+headroom left. Section breakdown of the 238.5 KiB `rv-firmware,di` build:
+`.text` 173 KiB (73%), `.rdata` 61 KiB (26%), `.reloc` 1.9 KiB, `.data` 80 B,
+`.eh_frame` 64 B — almost entirely code and read-only data.
+
+- [ ] The only remaining lever is content, not flags: `.rdata` at 61 KiB is
+  substantial and a large share of it is log format strings. A build-time
+  feature to compile out non-error logging would be the next real saving.

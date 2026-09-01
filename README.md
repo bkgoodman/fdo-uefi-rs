@@ -125,15 +125,57 @@ cargo +nightly build --release --no-default-features \
 
 ### Valid Feature Combinations
 
-| `di` | `fdo-installer` | `rv-firmware` | Use Case |
-|:----:|:---------------:|:-------------:|----------|
-| ✓ | ✓ | | **Default.** Provision + onboard + payload delivery |
-| | ✓ | | Onboard only (pre-provisioned device) |
-| ✓ | | | Provision only (DI tool) |
-| | | ✓ | Firmware stub only (pre-provisioned, chainloads Installer Image) |
-| ✓ | | ✓ | Self-provisioning firmware stub (OEM factory) |
-| ✓ | ✓ | ✓ | Single binary: firmware update check → fall through → DI + onboard |
-| | ✓ | ✓ | Single binary: firmware update check → fall through → onboard (pre-provisioned) |
+Sizes are release builds for `x86_64-unknown-uefi`, measured 2026-09-01.
+All include both HTTP transports (`uefi-http,tcp4-http`), which alone cost
+51 KiB — that is the "base" the deltas below are measured against.
+
+**These are shippable sizes: stripping changes nothing.** Rebuilding with
+`-C strip=symbols` produces byte-identical output, because the toolchain writes
+debug info to a separate `fdo_uefi.pdb` (128 KiB, MSVC convention) that never
+ends up in the `.efi`. The image has no PE debug directory (RVA 0, size 0), and
+`[profile.release]` already sets `lto = true`, `opt-level = "z"` and
+`panic = "abort"`. There is no easy headroom left in these numbers.
+
+| `di` | `fdo-installer` | `rv-firmware` | Size | over base | Use Case |
+|:----:|:---------------:|:-------------:|--------:|----------:|----------|
+| | | | 51 KiB | — | Transports only (not useful; baseline for comparison) |
+| ✓ | | | 162 KiB | +111 KiB | Provision only (DI tool) |
+| | | ✓ | 178 KiB | +127 KiB | Firmware stub only (pre-provisioned, chainloads Installer Image) |
+| | ✓ | | 226 KiB | +175 KiB | Onboard only (pre-provisioned device) |
+| ✓ | | ✓ | 238.5 KiB | +187.5 KiB | Self-provisioning firmware stub (OEM factory) |
+| ✓ | ✓ | | 264 KiB | +213 KiB | **Default.** Provision + onboard + payload delivery |
+| | ✓ | ✓ | 306 KiB | +255 KiB | Firmware update check → fall through → onboard (pre-provisioned) |
+| ✓ | ✓ | ✓ | 340 KiB | +289 KiB | Single binary: firmware update check → fall through → DI + onboard |
+
+Marginal cost of each feature added to the bare transports:
+
+| Feature | Alone | Added to the other two |
+|---------|---------:|-----------:|
+| `di` | +111 KiB | +34 KiB |
+| `fdo-installer` | +175 KiB | +101.5 KiB |
+| `rv-firmware` | +127 KiB | +76 KiB |
+
+The gap between the two columns is shared code — CBOR, COSE, TPM, and HTTP
+helpers that each feature pulls in but only pays for once. `di` in particular
+looks expensive alone (+111 KiB) yet adds only +34 KiB to a build that already
+has the other two, because almost everything it needs is already linked.
+
+Practical consequence for a flash-constrained Stage 1: the firmware stub is
+178 KiB standalone, or 238.5 KiB if it must self-provision (`di` added). The
+full single binary is 340 KiB — roughly double the minimal stub.
+
+Where the space goes, for the 238.5 KiB `rv-firmware,di` build:
+
+| Section | Size | Share |
+|---------|---------:|------:|
+| `.text` | 173 KiB | 73% |
+| `.rdata` | 61 KiB | 26% |
+| `.reloc` | 1.9 KiB | 1% |
+| `.data` | 80 B | — |
+| `.eh_frame` | 64 B | — |
+
+Almost all of it is code and read-only data, so further reduction means removing
+functionality (or the log strings in `.rdata`), not build-flag tuning.
 
 See [docs/modular-architecture.md](docs/modular-architecture.md) for
 deployment scenarios and how the stages compose in different environments.
