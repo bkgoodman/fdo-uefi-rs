@@ -164,10 +164,23 @@ the EFI shell:
 
 ```text
 Usage: fdo-uefi.efi [options]
-  -di <url>   DI (manufacturing) server URL
-  -rv <url>   RV/Owner server URL (TO1/TO2 override)
-  -h          Show usage help
+  -di <url>          DI (manufacturing) server URL
+  -rv <url>          RV/Owner server URL (TO1/TO2 override)
+  -force-di          Run DI even if TPM already holds credentials
+  -load-mode <m>     Chainload source: buffer|file|auto (default auto)
+  -chainload <path>  Chainload a PE straight off the ESP and exit
+  -watchdog [secs]   Arm watchdog for [secs] (default 30) and exit
+  -h                 Show usage help
 ```
+
+| Option | Purpose |
+| ------ | ------- |
+| `-di <url>` | Explicit DI (manufacturing) server. Overrides DNS discovery. |
+| `-rv <url>` | Explicit RV/Owner server for TO1/TO2. Overrides the URL stored in the TPM credential. |
+| `-force-di` | Ignore any existing TPM credential and re-provision from scratch. |
+| `-load-mode <m>` | Pin the chainload `LoadImage` source. Applies to all chainload sites. |
+| `-chainload <path>` | Diagnostic. Load a PE from the ESP and chainload it, then exit. |
+| `-watchdog [secs]` | Diagnostic. Arm the watchdog and exit immediately. |
 
 ### Examples
 
@@ -180,7 +193,98 @@ Shell> fdo-uefi.efi -rv http://fdo-server.local:8080
 
 # Both (DI server for first boot, RV for onboarding)
 Shell> fdo-uefi.efi -di http://mfg-server:8080 -rv http://owner-server:8080
+
+# Re-provision against a different server (see -force-di below)
+Shell> fdo-uefi.efi -force-di -di http://newserver:8080 -rv http://newserver:8080
 ```
+
+### `-force-di` — re-provisioning against a different server
+
+Normally the client runs DI **only** when the TPM holds no credentials; if a
+credential is present it goes straight to TO1/TO2. That is the correct
+production behaviour, but it blocks a common test case: pointing an
+already-provisioned device at a *different* server.
+
+The GUID in the TPM only means something to the server that issued it. A
+different server has no voucher for that GUID, so TO1 fails no matter how good
+the network path is. `-force-di` skips the credential check and re-provisions,
+so the new server ends up with a matching voucher.
+
+### `-load-mode` — which `LoadImage` source to use
+
+UEFI `LoadImage` can take the image either as raw bytes already in memory
+(`FromBuffer`) or as a file path for the firmware to read itself
+(`FromDevicePath`). This flag pins which one `chainload_image()` uses, at every
+chainload site (control test, BMO, and RV firmware).
+
+| Mode | Behaviour |
+| ---- | --------- |
+| `auto` (default) | `FromBuffer` first, fall back to an ESP temp file |
+| `buffer` | `FromBuffer` only — **fails** rather than falling back |
+| `file` | ESP temp file + `FromDevicePath` only — **fails** rather than falling back |
+
+`FromBuffer` is what production wants: the protocol delivers bytes over the wire
+(BMO chunks, or an image extracted from a COSE envelope), and loading them
+directly requires no writable ESP and leaves no temp file behind. The file path
+exists as a fallback for firmware that refuses buffer loads.
+
+Use `buffer` or `file` when you need a *deterministic* answer about which source
+a given firmware accepts — with `auto`, a silent fallback makes the log
+ambiguous about what actually happened.
+
+```text
+# Prove the firmware accepts memory loads
+Shell> fdo-uefi.efi -load-mode buffer -chainload \EFI\payload_image.efi
+
+# Prove the firmware accepts file loads
+Shell> fdo-uefi.efi -load-mode file -chainload \EFI\payload_image.efi
+```
+
+### `-chainload <path>` — loader isolation test
+
+Reads a PE from the ESP and calls the same `chainload_image()` used by the BMO
+and RV-firmware paths, then exits. It runs **before** any TPM or network
+initialisation, so the only variables are the loader and the binary.
+
+```text
+Shell> fdo-uefi.efi -chainload \EFI\payload_image.efi
+```
+
+Use it to decide whether a chainload failure is the loader/binary or the
+surrounding environment: if this succeeds but BMO or Stage 1 fail with the same
+PE, the loader is not at fault.
+
+## Watchdog
+
+The client arms the UEFI watchdog automatically. **No manual setup is needed** —
+it is armed before argument parsing, so it covers every mode.
+
+| Phase | Timeout | Notes |
+| ----- | ------- | ----- |
+| Application entry | **900s (15 min)** | Armed unconditionally; covers DI + TO1 + TO2 + BMO transfer |
+| Immediately before `StartImage` | **60s** | Tighter window so a hung chainloaded image reboots quickly |
+| After `StartImage` returns | **900s** | Restored, so the rest of the run is not killed by the 60s window |
+| Clean exit to the shell | **disarmed** | You are at a prompt, not hung |
+
+Look for `Watchdog: armed for 900 seconds` near the top of the output and
+`Watchdog: disarmed (clean exit)` at the end.
+
+To change the timeout, edit `WATCHDOG_TIMEOUT_SECS` in `src/main.rs`.
+
+> **Caveat:** the 60s window applies while a chainloaded image is running. That
+> is ample for a small EFI app, but an image that legitimately runs longer
+> (an OS installer, for example) will be cut off by a reboot.
+
+### Testing the watchdog itself
+
+```text
+Shell> fdo-uefi.efi -watchdog 60
+```
+
+Arms the watchdog for 60 seconds and exits immediately without running FDO. If
+the firmware's watchdog works, the machine reboots after the timeout; if it
+stays at the shell prompt, the firmware does not honour the watchdog. Useful to
+confirm you have a recovery path before running anything that might hang.
 
 ### Server Discovery
 
@@ -203,6 +307,12 @@ Shell> fdo-uefi.efi -di http://mfg-server:8080 -rv http://owner-server:8080
 ```text
 Boot
   │
+  ├─ Arm watchdog (900s)
+  │
+  ├─ [-chainload <path>] ──▶ load PE from ESP → chainload → exit
+  │
+  ├─ [-watchdog <secs>] ──▶ arm watchdog → exit
+  │
   ├─ TPM present? ──No──▶ error, exit
   │
   ├─ [feature: rv-firmware]
@@ -218,14 +328,17 @@ Boot
   │
   ├─ [feature: di OR fdo-installer]
   │    │
-  │    ├─ DCTPM exists + GUID found?
+  │    ├─ DCTPM exists + GUID found?  (skipped entirely if -force-di)
   │    │    └─ [feature: fdo-installer] → TO1 → TO2 → BMO → chainload payload
   │    │
-  │    └─ No credentials?
+  │    └─ No credentials (or -force-di)?
   │         └─ [feature: di] → DI Protocol → Write DCTPM → done (reboot to onboard)
   │
-  └─ exit
+  └─ exit (watchdog disarmed)
 ```
+
+> **Note:** the `-chainload` and `-watchdog` modes short-circuit before the TPM
+> check, so neither requires a TPM or a network.
 
 ## Testing
 

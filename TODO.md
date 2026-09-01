@@ -203,3 +203,90 @@ echo -n "" | timeout 1 nc -U "$WORKDIR/swtpm-server" 2>/dev/null || true
 - swtpm requires initial connection to server socket before QEMU can use ctrl socket
 - Server must use correct database matching the voucher from DI
 - GUID in client must match what quick-di-tpm created (reads from TPM NV automatically)
+
+## FWImageHash Verification (2026-09-01)
+
+- [x] **Verify `FWImageHash` against the extracted EFI image** in
+  `src/rv_firmware/cose_verify.rs`. The hash was previously parsed into
+  `FirmwarePayload.image_hash` and never checked. `verify_image_hash()` now
+  computes SHA-256/SHA-384 over the extracted bytes and returns
+  `VerifyResult::ImageHashMismatch` / `UnsupportedHashAlgorithm` on failure;
+  `rv_firmware::mod` refuses to chainload in those cases.
+  - Confirmed against `test-keys/signed_payload.cose`: declared and computed
+    SHA-256 both `5daf1c35...20bb3529`, so extraction is byte-exact.
+  - Same gap existed in `efi-fdo-bmo/src/cose_verify.c` and was fixed there too.
+
+## Chainload Crash Investigation — corrections (2026-09-01)
+
+- The old comment in `chainload.rs` claiming AMI firmware does not apply PE
+  relocations for `FromBuffer` loads was **wrong** and has been replaced.
+  Every committed version of this file used `FromBuffer`, including `7a0038e`
+  ("BMO Chain loading works on K800"). The load source is a constant across the
+  works->crashes transition and cannot explain it.
+- `ImageBase=0x0` with an empty PE base relocation directory is normal gnu-efi
+  output (verified against a fresh `efi-fdo-bmo` build), not a corrupt image.
+- The payload in `test-keys/signed_payload.cose` is a **gnu-efi/C binary**
+  (`LibInstallProtocolInterfaces` symbols), not a Rust hello app — worth
+  confirming which binary we actually intend to be testing with.
+- [ ] **Outstanding A/B test:** chainload the identical PE via BMO (proven path)
+  and via Stage 1 on the K800. Isolates payload from environment in one shot.
+- [ ] Re-evaluate whether the file-first load order in `chainload_image()` should
+  be reverted to buffer-first, once the A/B result is known.
+
+## Bug: teardown_network() left the session with no NIC (2026-09-01)
+
+Found during the K800 A/B test. `chainload_image()` calls `teardown_network()`,
+which does `disconnect_controller(handle, None, None)` on every SNP handle.
+That unbinds ALL drivers from the NIC — including SnpDxe, which uninstalls
+`SimpleNetwork` from the handle. Consequences:
+
+- Any later run in the same UEFI session reports
+  `No SNP handles found - network driver not loaded`, then
+  `TCP4: No ServiceBinding handles found`, and every HTTP POST fails.
+- Not just a test artefact: the real Stage 1 flow chainloads, and on
+  `DeliveryResult::Chainloaded` the image RETURNS and we fall through to normal
+  TO1/TO2 onboarding — with the network stack destroyed. Same for the BMO path
+  if the chainloaded image returns.
+
+- [x] Fixed: `teardown_network()` now returns the handles it disconnected and
+  `chainload_image()` calls `reconnect_network()` after `StartImage` returns.
+  Teardown is only safe if we never come back; we do come back.
+- [ ] Revisit whether the teardown is needed at all. It was added in `405ef3b`
+  as a mitigation for a crash whose cause is still unproven, and the K800
+  control test (leg 0, `-chainload`, no network) passed without it mattering.
+
+## K800 Chainload Investigation — RESULT (2026-09-01)
+
+Both legs passed on OnLogic K800 hardware.
+
+- **Leg 0** `-load-mode buffer -chainload \EFI\payload_image.efi` — SUCCESS.
+  Proves the firmware accepts `LoadImageSource::FromBuffer`. No temp file, no
+  network, no TPM.
+- **Leg A** full DI/TO1/TO2 -> BMO -> chainload of the same PE, buffer mode —
+  SUCCESS. Payload ran, returned, NICs reconnected, clean exit.
+
+### Conclusion: chainloading was never broken
+
+The "AMI firmware does not apply PE relocations for FromBuffer" theory is
+disproven on hardware. Memory loading works. The `FromDevicePath` rewrite was
+unnecessary and the default order is back to buffer-first.
+
+### Still unknown
+
+**We never reproduced the original crash in this session.** We cannot claim to
+have fixed it. Remaining candidates, in order:
+
+- [ ] `teardown_network()` is STILL running in the successful path, so we have
+  not tested whether it is needed. If the original crash was DHCP timers firing
+  during `StartImage`, teardown is masking it; if teardown was never needed,
+  it is pure risk. Test: add a flag to skip teardown and re-run leg A.
+- [ ] The payload binary in use at the time of the original crash is unknown and
+  may not have been the one we tested with.
+- [ ] Pre-fix, `teardown_network()` left the session with no NIC. Failures caused
+  by that would have looked like a chainload problem but were not.
+
+### Minor tech debt introduced
+
+- [ ] `LOAD_MODE` in `chainload.rs` is a `static mut` accessed through `unsafe`.
+  Fine for single-threaded UEFI boot services, but a `Cell`/`OnceCell` or an
+  explicit parameter threaded through `chainload_image()` would be cleaner.

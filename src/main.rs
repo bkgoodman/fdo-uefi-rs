@@ -31,12 +31,29 @@ mod di;
 #[cfg(feature = "rv-firmware")]
 mod rv_firmware;
 
+/// Global watchdog timeout, in seconds.
+///
+/// Armed at entry and re-armed after a chainloaded image returns, so a hang
+/// anywhere in the run auto-reboots instead of requiring a lab visit.
+pub const WATCHDOG_TIMEOUT_SECS: usize = 900; // 15 minutes
+
 /// Parsed command-line options
 struct FdoOptions {
     /// Override DI (manufacturing) server URL
     di_url: Option<String>,
     /// Override RV/Owner server URL (for TO1/TO2)
     rv_url: Option<String>,
+    /// Just set watchdog and exit (for testing watchdog reboot)
+    watchdog_test: Option<usize>,
+    /// Chainload a PE straight off the ESP and exit (control test —
+    /// no network, no TPM, no FDO)
+    chainload_file: Option<String>,
+    /// Run DI even if credentials already exist in the TPM.
+    /// Needed when re-provisioning against a different server, since the
+    /// existing GUID has no voucher in the new server's database.
+    force_di: bool,
+    /// Pin the chainload LoadImage source (buffer vs ESP file)
+    load_mode: chainload::LoadMode,
 }
 
 /// Well-known FDO manufacturing server DNS names (per fdo-appnote-device-mfg-info.bs)
@@ -54,7 +71,14 @@ const DEFAULT_DI_PORT: u16 = 8080;
 ///            -rv <url>   Override RV/Owner server URL
 ///            -h          Show usage help
 fn parse_args() -> FdoOptions {
-    let mut opts = FdoOptions { di_url: None, rv_url: None };
+    let mut opts = FdoOptions {
+        di_url: None,
+        rv_url: None,
+        watchdog_test: None,
+        chainload_file: None,
+        force_di: false,
+        load_mode: chainload::LoadMode::Auto,
+    };
 
     let loaded_image = match boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()) {
         Ok(li) => li,
@@ -109,6 +133,53 @@ fn parse_args() -> FdoOptions {
                     i += 1;
                 }
             }
+            "-watchdog" => {
+                let secs = if i + 1 < tokens.len() {
+                    match tokens[i + 1].parse::<usize>() {
+                        Ok(n) => { i += 2; n }
+                        Err(_) => { i += 1; 30 }
+                    }
+                } else {
+                    i += 1;
+                    30
+                };
+                info!("CLI: Watchdog test mode — will arm {}s watchdog and exit", secs);
+                opts.watchdog_test = Some(secs);
+            }
+            "-load-mode" => {
+                if i + 1 < tokens.len() {
+                    opts.load_mode = match tokens[i + 1] {
+                        "buffer" => chainload::LoadMode::BufferOnly,
+                        "file" => chainload::LoadMode::FileOnly,
+                        "auto" => chainload::LoadMode::Auto,
+                        other => {
+                            error!("CLI: unknown -load-mode '{}' (use buffer|file|auto)", other);
+                            chainload::LoadMode::Auto
+                        }
+                    };
+                    info!("CLI: Chainload load mode = {:?}", opts.load_mode);
+                    i += 2;
+                } else {
+                    error!("CLI: -load-mode requires buffer|file|auto");
+                    i += 1;
+                }
+            }
+            "-force-di" => {
+                info!("CLI: Force DI — will re-provision even if TPM credentials exist");
+                opts.force_di = true;
+                i += 1;
+            }
+            "-chainload" => {
+                if i + 1 < tokens.len() {
+                    let path = String::from(tokens[i + 1]);
+                    info!("CLI: Chainload control test — will load {} directly", path);
+                    opts.chainload_file = Some(path);
+                    i += 2;
+                } else {
+                    error!("CLI: -chainload requires a file path (e.g. \\EFI\\hello.efi)");
+                    i += 1;
+                }
+            }
             "-h" | "--help" | "-help" | "/?" => {
                 info!("");
                 info!("Usage: fdo-uefi.efi [options]");
@@ -116,6 +187,16 @@ fn parse_args() -> FdoOptions {
                 info!("              e.g. -di http://192.168.1.100:8080");
                 info!("  -rv <url>   RV/Owner server URL (TO1/TO2 override)");
                 info!("              e.g. -rv http://fdo-server.local:8080");
+                info!("  -watchdog [s] Arm watchdog for [s] seconds (default 30) and exit");
+                info!("              Tests firmware watchdog reboot without running FDO");
+                info!("  -load-mode <m>  Chainload source: buffer|file|auto (default auto)");
+                info!("              buffer = LoadImage from memory, no fallback");
+                info!("              file   = LoadImage from ESP temp file, no fallback");
+                info!("  -force-di   Run DI even if TPM already holds credentials");
+                info!("              Use when re-provisioning against a new server");
+                info!("  -chainload <path>  Chainload a PE straight off the ESP and exit");
+                info!("              e.g. -chainload \\EFI\\hello.efi");
+                info!("              Control test: no network, no TPM, no FDO");
                 info!("  -h          Show this help");
                 info!("");
                 info!("If no -di URL is given, the client tries well-known DNS names:");
@@ -137,9 +218,52 @@ fn parse_args() -> FdoOptions {
     opts
 }
 
+/// Read a file from the ESP that this application was loaded from.
+///
+/// Used by the `-chainload` control test so we can feed a known-good PE to
+/// `chainload_image()` without involving the network, the TPM, or FDO.
+fn load_file_from_esp(path: &str) -> Option<Vec<u8>> {
+    use uefi::proto::media::file::{File, FileAttribute, FileMode};
+    use uefi::proto::media::fs::SimpleFileSystem;
+    use uefi::CString16;
+
+    let device_handle = {
+        let li = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()).ok()?;
+        li.device()?
+    };
+
+    let mut fs = boot::open_protocol_exclusive::<SimpleFileSystem>(device_handle).ok()?;
+    let mut root = fs.open_volume().ok()?;
+
+    let cpath = CString16::try_from(path).ok()?;
+    let handle = root.open(&cpath, FileMode::Read, FileAttribute::empty()).ok()?;
+    let mut file = handle.into_regular_file()?;
+
+    // Read in chunks and grow. We deliberately avoid FileInfo/get_boxed_info
+    // here: it pulls in wcslen, which isn't available in this no_std target.
+    let mut out: Vec<u8> = Vec::new();
+    let mut chunk = alloc::vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    Some(out)
+}
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
+    
+    // Set a global watchdog timer — if anything hangs or crashes into a loop,
+    // the firmware will automatically reboot after this timeout.
+    // This is a safety net to avoid needing a physical hard-reset.
+    match boot::set_watchdog_timer(WATCHDOG_TIMEOUT_SECS, 0x10000, None) {
+        Ok(_) => info!("Watchdog: armed for {} seconds (auto-reboot on hang)", WATCHDOG_TIMEOUT_SECS),
+        Err(e) => warn!("Watchdog: failed to set timer: {:?} (continuing without)", e.status()),
+    }
     
     info!("===========================================");
     info!("  FDO UEFI Client");
@@ -147,6 +271,50 @@ fn main() -> Status {
     
     // Parse command-line arguments
     let opts = parse_args();
+    
+    // Apply the chainload source override to every chainload site (control
+    // test, BMO, and RV firmware) so a single flag pins the behaviour.
+    chainload::set_load_mode(opts.load_mode);
+    
+    // Watchdog test mode: just arm the watchdog and exit immediately.
+    // Usage: fdo-uefi.efi -watchdog 30
+    // The machine should auto-reboot after 30 seconds, proving watchdog works.
+    // If it doesn't reboot, the firmware's watchdog is broken/unsupported.
+    if let Some(secs) = opts.watchdog_test {
+        info!("=== WATCHDOG TEST MODE ===");
+        info!("Arming watchdog for {} seconds, then exiting.", secs);
+        info!("If watchdog works: machine will reboot in ~{} seconds.", secs);
+        info!("If watchdog broken: machine will stay at EFI shell.");
+        match boot::set_watchdog_timer(secs, 0x10002, None) {
+            Ok(_) => info!("Watchdog armed: {} seconds. Exiting now. Good luck!", secs),
+            Err(e) => error!("Watchdog FAILED to arm: {:?} — firmware may not support it", e.status()),
+        }
+        boot::stall(Duration::from_secs(2));
+        return Status::SUCCESS;
+    }
+    
+    // Chainload control test: read a PE off the ESP and chainload it directly.
+    // Deliberately runs BEFORE any TPM or network initialisation, so the only
+    // variables are the loader and the binary. If this works but the BMO or
+    // Stage 1 paths crash with the same binary, the loader is exonerated and
+    // the fault is in the environment (network stack, boot stage) instead.
+    if let Some(ref path) = opts.chainload_file {
+        info!("=== CHAINLOAD CONTROL TEST ===");
+        info!("Loading {} from ESP (no network, no TPM, no FDO)", path);
+        match load_file_from_esp(path) {
+            Some(data) => {
+                info!("Read {} bytes from {}", data.len(), path);
+                match chainload::chainload_image(&data) {
+                    Ok(()) => info!("Control test: chainload returned successfully"),
+                    Err(e) => error!("Control test: chainload FAILED: {:?}", e.status()),
+                }
+            }
+            None => error!("Control test: could not read {} from ESP", path),
+        }
+        let _ = boot::set_watchdog_timer(0, 0x10000, None);
+        boot::stall(Duration::from_secs(5));
+        return Status::SUCCESS;
+    }
     
     // Check for TPM presence first
     if !tpm::tpm_is_present() {
@@ -187,7 +355,18 @@ fn main() -> Status {
     {
         info!("Checking for FDO credentials in TPM...");
         
-        match tpm::read_fdo_credentials() {
+        // -force-di: ignore any existing credential and re-provision. The GUID
+        // already in the TPM only means something to the server that issued it;
+        // pointing at a different server requires a fresh DI so that server has
+        // a matching voucher.
+        let existing = if opts.force_di {
+            info!("Force DI requested — ignoring any existing TPM credentials");
+            None
+        } else {
+            tpm::read_fdo_credentials()
+        };
+
+        match existing {
             Some(creds) => {
                 // Credentials exist - run TO1/TO2 onboarding
                 info!("Device GUID found: {:02x?}", creds.guid);
@@ -232,6 +411,11 @@ fn main() -> Status {
     
     info!("");
     info!("FDO UEFI Client exiting.");
+    
+    // Disarm watchdog on clean exit
+    let _ = boot::set_watchdog_timer(0, 0x10000, None);
+    info!("Watchdog: disarmed (clean exit)");
+    
     boot::stall(Duration::from_secs(2));
     
     Status::SUCCESS

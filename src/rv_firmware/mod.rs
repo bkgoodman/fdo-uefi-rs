@@ -148,6 +148,16 @@ pub fn check_and_deliver() -> DeliveryResult {
             error!("  Architecture mismatch: {} (expected x86_64)", arch);
             return DeliveryResult::Error;
         }
+        cose_verify::VerifyResult::ImageHashMismatch => {
+            error!("  FWImageHash does not match the extracted EFI image!");
+            error!("  Image is NOT trusted. Refusing to chainload.");
+            return DeliveryResult::Error;
+        }
+        cose_verify::VerifyResult::UnsupportedHashAlgorithm(alg) => {
+            error!("  Unsupported FWImageHash algorithm: {}", alg);
+            error!("  Cannot verify image integrity. Refusing to chainload.");
+            return DeliveryResult::Error;
+        }
         cose_verify::VerifyResult::ParseError(msg) => {
             error!("  COSE parse error: {}", msg);
             return DeliveryResult::Error;

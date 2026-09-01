@@ -11,11 +11,16 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use log::{info, warn, error};
+use sha2::{Sha256, Sha384, Digest};
 
 use super::platform_key;
 
 /// COSE Algorithm identifiers (RFC 9053)
 const COSE_ALG_ES256: i32 = -7;
+
+/// COSE hash algorithm identifiers (IANA COSE Algorithms registry)
+const COSE_ALG_SHA256: i32 = -16;
+const COSE_ALG_SHA384: i32 = -43;
 
 /// FDO Firmware payload magic number ("FDOF")
 const FW_MAGIC: u32 = 0x46444F46;
@@ -57,6 +62,10 @@ pub enum VerifyResult {
     UnsupportedAlgorithm(i32),
     /// Architecture mismatch
     ArchitectureMismatch(String),
+    /// FWImageHash did not match the extracted image bytes
+    ImageHashMismatch,
+    /// FWImageHash used a hash algorithm we cannot compute
+    UnsupportedHashAlgorithm(i32),
 }
 
 /// Verify and extract firmware from a COSE_Sign1 signed image.
@@ -102,7 +111,75 @@ pub fn verify_firmware(signed_data: &[u8]) -> VerifyResult {
     }
     let image_data = sign1.payload[payload.image_offset..payload.image_offset + payload.image_size].to_vec();
 
+    // 7. Verify FWImageHash against the extracted image bytes.
+    //
+    // The COSE signature already covers these bytes, so this is a defence-in-depth
+    // check: it catches a mis-parsed image_offset/image_size (which would extract
+    // authentic-but-wrong bytes) and a producer whose declared hash disagrees with
+    // what it actually embedded. Chainloading a mis-sliced PE is exactly how you
+    // get a wild jump into garbage, so refuse rather than guess.
+    match verify_image_hash(&payload, &image_data) {
+        HashCheck::Ok => info!("COSE: FWImageHash verified OK ({} bytes)", image_data.len()),
+        HashCheck::Mismatch => {
+            error!("COSE: FWImageHash MISMATCH — extracted image does not match declared hash");
+            error!("COSE: REFUSING to chainload (image would be untrustworthy)");
+            return VerifyResult::ImageHashMismatch;
+        }
+        HashCheck::Unsupported(alg) => {
+            error!("COSE: Unsupported FWImageHash algorithm {} — cannot verify image", alg);
+            return VerifyResult::UnsupportedHashAlgorithm(alg);
+        }
+    }
+
     VerifyResult::Ok(payload, image_data)
+}
+
+/// Outcome of the FWImageHash check
+enum HashCheck {
+    Ok,
+    Mismatch,
+    Unsupported(i32),
+}
+
+/// Compute the digest of `image` per the payload's declared hash algorithm and
+/// compare it to the declared FWImageHash.
+///
+/// A missing (empty) hash is treated as a mismatch: the payload format requires
+/// FWImageHash, so its absence means we cannot establish image integrity and we
+/// must not chainload.
+fn verify_image_hash(payload: &FirmwarePayload, image: &[u8]) -> HashCheck {
+    if payload.image_hash.is_empty() {
+        error!("COSE: FWImageHash is empty — cannot verify image integrity");
+        return HashCheck::Mismatch;
+    }
+
+    let computed: Vec<u8> = match payload.image_hash_type {
+        COSE_ALG_SHA256 => {
+            let mut h = Sha256::new();
+            h.update(image);
+            h.finalize().to_vec()
+        }
+        COSE_ALG_SHA384 => {
+            let mut h = Sha384::new();
+            h.update(image);
+            h.finalize().to_vec()
+        }
+        other => return HashCheck::Unsupported(other),
+    };
+
+    if computed.len() != payload.image_hash.len() {
+        error!("COSE: FWImageHash length mismatch: declared {} bytes, computed {} bytes",
+               payload.image_hash.len(), computed.len());
+        return HashCheck::Mismatch;
+    }
+
+    if computed != payload.image_hash {
+        error!("COSE: Declared: {:02x?}", &payload.image_hash[..core::cmp::min(16, payload.image_hash.len())]);
+        error!("COSE: Computed: {:02x?}", &computed[..core::cmp::min(16, computed.len())]);
+        return HashCheck::Mismatch;
+    }
+
+    HashCheck::Ok
 }
 
 /// Parse a COSE_Sign1 envelope from CBOR data.
