@@ -167,7 +167,9 @@ Usage: fdo-uefi.efi [options]
   -di <url>          DI (manufacturing) server URL
   -rv <url>          RV/Owner server URL (TO1/TO2 override)
   -force-di          Run DI even if TPM already holds credentials
-  -load-mode <m>     Chainload source: buffer|file|auto (default auto)
+  -load-mode <m>     Chainload source: buffer|file (default buffer)
+  -teardown          Disconnect NICs before StartImage (diagnostic)
+  -v                 Verbose: per-round transport logging (off by default)
   -chainload <path>  Chainload a PE straight off the ESP and exit
   -watchdog [secs]   Arm watchdog for [secs] (default 30) and exit
   -h                 Show usage help
@@ -179,6 +181,8 @@ Usage: fdo-uefi.efi [options]
 | `-rv <url>` | Explicit RV/Owner server for TO1/TO2. Overrides the URL stored in the TPM credential. |
 | `-force-di` | Ignore any existing TPM credential and re-provision from scratch. |
 | `-load-mode <m>` | Pin the chainload `LoadImage` source. Applies to all chainload sites. |
+| `-teardown` | Disconnect NICs before `StartImage`. Diagnostic; off by default. |
+| `-v` / `-verbose` | Re-enable the per-round transport logging suppressed by default. |
 | `-chainload <path>` | Diagnostic. Load a PE from the ESP and chainload it, then exit. |
 | `-watchdog [secs]` | Diagnostic. Arm the watchdog and exit immediately. |
 
@@ -210,6 +214,39 @@ different server has no voucher for that GUID, so TO1 fails no matter how good
 the network path is. `-force-di` skips the credential check and re-provisions,
 so the new server ends up with a matching voucher.
 
+### `-v` — console verbosity
+
+**Writing to the UEFI console is the dominant cost of a run.** The same session
+takes 5-10 minutes rendered on screen versus roughly 19 seconds redirected to a
+file. Log volume is therefore a runtime concern, not just a readability one.
+
+By default the log level is `Info` and the per-round transport chatter has been
+demoted to `Debug`, which cuts about **62% of lines and 72% of characters** from
+a full DI + TO1 + TO2 run. What is suppressed:
+
+- NIC enumeration and link-state probing (repeated for all 6 NICs, every round)
+- TCP4 ServiceBinding selection, child-handle creation, configure, connect
+- HTTP request/response headers, poll counts, body hex dumps
+- The `SNP mode: {...}` structure dump (~2.6 KB in a single line)
+- COSE and CBOR hex dumps, including session key and signature material
+
+What remains: the protocol milestones that set up the transaction, plus **one
+progress line per HTTP round**:
+
+```text
+[ INFO]: TCP4 HTTP POST to 192.168.200.30:8080/fdo/200/msg/82 (226 bytes)
+```
+
+`-v` restores everything by raising the level to `Trace`.
+
+```text
+Shell> fdo-uefi.efi -v -di http://192.168.200.30:8080 -rv http://192.168.200.30:8080
+```
+
+> **Note:** the suppressed output included the AES session key (`COSE: key`) and
+> the derived SEK preview on every encrypted round. Those are now `Debug`, so
+> they no longer reach the console on a normal run.
+
 ### `-load-mode` — which `LoadImage` source to use
 
 UEFI `LoadImage` can take the image either as raw bytes already in memory
@@ -219,25 +256,52 @@ chainload site (control test, BMO, and RV firmware).
 
 | Mode | Behaviour |
 | ---- | --------- |
-| `auto` (default) | `FromBuffer` first, fall back to an ESP temp file |
-| `buffer` | `FromBuffer` only — **fails** rather than falling back |
-| `file` | ESP temp file + `FromDevicePath` only — **fails** rather than falling back |
+| `buffer` (default) | `FromBuffer` — load straight from memory |
+| `file` | Write to an ESP temp file, then `FromDevicePath`. **Diagnostic only.** |
 
-`FromBuffer` is what production wants: the protocol delivers bytes over the wire
-(BMO chunks, or an image extracted from a COSE envelope), and loading them
-directly requires no writable ESP and leaves no temp file behind. The file path
-exists as a fallback for firmware that refuses buffer loads.
+**There is no automatic fallback, by design.** Memory loading is the only
+production behaviour: the protocol delivers bytes over the wire (BMO chunks, or
+an image extracted from a COSE envelope), and `FromBuffer` needs no writable ESP
+and leaves nothing on disk. A silent fallback would write the payload to the ESP
+without anyone asking, and would make the log ambiguous about which mechanism
+actually ran. If a buffer load fails, it fails loudly and tells you to retry
+with `-load-mode file`.
 
-Use `buffer` or `file` when you need a *deterministic* answer about which source
-a given firmware accepts — with `auto`, a silent fallback makes the log
-ambiguous about what actually happened.
+No firmware we have tested needs `file`: OVMF/QEMU and the OnLogic K800 both
+load from memory successfully. The mode exists so that a machine which genuinely
+cannot is a one-flag diagnosis rather than a code change.
 
 ```text
-# Prove the firmware accepts memory loads
-Shell> fdo-uefi.efi -load-mode buffer -chainload \EFI\payload_image.efi
-
-# Prove the firmware accepts file loads
+# Diagnose a suspected buffer-load failure
 Shell> fdo-uefi.efi -load-mode file -chainload \EFI\payload_image.efi
+```
+
+### `-teardown` — pre-StartImage network teardown (off by default)
+
+Commit 405ef3b added a step that disconnected every NIC before `StartImage`, on
+the theory that IP4/DHCP timer events firing during the transfer of control
+could dereference stale pointers and cause a wild jump.
+
+**That theory did not hold up, and the teardown is now off by default.**
+
+- The original crash was perfectly deterministic and always landed on the same
+  address (`0xA0000`, the VGA window). A stray timer callback would land
+  somewhere different each time; a fixed target indicates deliberate arithmetic.
+- Chainloading with the teardown disabled was confirmed working on K800
+  hardware.
+
+The teardown is not free. `disconnect_controller(handle, None, None)` unbinds
+*all* drivers from the NIC, including SnpDxe, which uninstalls `SimpleNetwork`
+from the handle. Without a matching reconnect the rest of the UEFI session has
+no network at all — a later run of this app in the same shell reports
+`No SNP handles found`.
+
+`-teardown` re-enables it if you ever need to test that theory again. When it is
+used, the NICs are reconnected after `StartImage` returns — not for our benefit
+(we exit immediately) but so the session is left as we found it.
+
+```text
+Shell> fdo-uefi.efi -teardown -di http://server:8080 -rv http://server:8080
 ```
 
 ### `-chainload <path>` — loader isolation test

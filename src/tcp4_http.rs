@@ -84,7 +84,7 @@ fn find_tcp4_service_bindings() -> Vec<uefi::Handle> {
     let tcp4_sb_guid = uefi::guid!("00720665-67eb-4a99-baf7-d3c33a1c7cc9");
     match boot::locate_handle_buffer(boot::SearchType::ByProtocol(&tcp4_sb_guid)) {
         Ok(handles) => {
-            info!("TCP4: Found {} ServiceBinding handle(s)", handles.len());
+            debug!("TCP4: Found {} ServiceBinding handle(s)", handles.len());
             handles.to_vec()
         }
         Err(_) => {
@@ -257,7 +257,7 @@ unsafe fn try_connect_on_handle(
     ip: [u8; 4],
     port: u16,
 ) -> Option<(*mut Tcp4Protocol, uefi_raw::Handle, uefi::Handle)> {
-    info!("TCP4: Trying ServiceBinding handle #{} ({:?})", handle_idx, sb_handle);
+    debug!("TCP4: Trying ServiceBinding handle #{} ({:?})", handle_idx, sb_handle);
     
     let child_handle = create_tcp4_child(sb_handle)?;
     let tcp4 = match open_tcp4(child_handle) {
@@ -303,9 +303,9 @@ unsafe fn try_connect_on_handle(
         control_option: &mut tcp_option,
     };
     if use_dhcp {
-        info!("TCP4: Handle #{}: Using DHCP address (use_default_address=TRUE)", handle_idx);
+        debug!("TCP4: Handle #{}: Using DHCP address (use_default_address=TRUE)", handle_idx);
     } else {
-        info!("TCP4: Handle #{}: Using static IP {}.{}.{}.{} (DHCP not available)",
+        debug!("TCP4: Handle #{}: Using static IP {}.{}.{}.{} (DHCP not available)",
             handle_idx, STATIC_IP[0], STATIC_IP[1], STATIC_IP[2], STATIC_IP[3]);
     }
     
@@ -349,7 +349,7 @@ unsafe fn try_connect_on_handle(
         let _ = ((*tcp4).poll)(tcp4);
         if check_event(connect_event) {
             if connect_token.completion_token.status == RawStatus::SUCCESS {
-                info!("TCP4: Handle #{}: Connected after {} polls!", handle_idx, i);
+                debug!("TCP4: Handle #{}: Connected after {} polls!", handle_idx, i);
                 connected = true;
             } else {
                 warn!("TCP4: Handle #{}: Connect error: {:?}", handle_idx, connect_token.completion_token.status);
@@ -376,7 +376,7 @@ pub fn tcp4_http_post(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     let (ip, port, path) = parse_url(url)?;
     let hostname = url.split('/').nth(2).unwrap_or("localhost");
     
-    info!("TCP4 HTTP POST to {}.{}.{}.{}:{}{} ({} bytes)", ip[0], ip[1], ip[2], ip[3], port, path, body.len());
+    debug!("TCP4 HTTP POST to {}.{}.{}.{}:{}{} ({} bytes)", ip[0], ip[1], ip[2], ip[3], port, path, body.len());
     
     // Find all TCP4 Service Binding handles and try each one
     let sb_handles = find_tcp4_service_bindings();
@@ -392,7 +392,7 @@ pub fn tcp4_http_post(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
         // If we have a cached working handle, try it first
         if cached >= 0 && (cached as usize) < sb_handles.len() {
             let idx = cached as usize;
-            info!("TCP4: Trying cached NIC handle #{} first", idx);
+            debug!("TCP4: Trying cached NIC handle #{} first", idx);
             if let Some(conn) = try_connect_on_handle(sb_handles[idx], idx, ip, port) {
                 result = Some(conn);
             }
@@ -411,7 +411,7 @@ pub fn tcp4_http_post(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
                 }
                 if let Some(conn) = try_connect_on_handle(handle, idx, ip, port) {
                     LAST_WORKING_NIC.store(idx as i8, Ordering::Relaxed);
-                    info!("TCP4: Caching NIC handle #{} for future use", idx);
+                    debug!("TCP4: Caching NIC handle #{} for future use", idx);
                     result = Some(conn);
                     break;
                 }
@@ -696,7 +696,7 @@ fn parse_http_response(data: &[u8]) -> Option<HttpPostResponse> {
                     val
                 };
                 auth_token = Some(String::from(token));
-                info!("TCP4: Found Authorization token: {}...", &token[..token.len().min(20)]);
+                debug!("TCP4: Found Authorization token: {}...", &token[..token.len().min(20)]);
             }
         } else if lower.starts_with("message-type:") {
             let value = line.splitn(2, ':').nth(1).map(|v| v.trim());
@@ -712,7 +712,7 @@ fn parse_http_response(data: &[u8]) -> Option<HttpPostResponse> {
         debug!("TCP4 HTTP body: {} bytes, hex: {:02x?}", body.len(), &body[..body.len().min(80)]);
     }
     
-    info!("TCP4 HTTP POST completed: {} bytes body, msg_type={:?}", body.len(), msg_type);
+    debug!("TCP4 HTTP POST completed: {} bytes body, msg_type={:?}", body.len(), msg_type);
     Some(HttpPostResponse {
         body,
         auth_token,
@@ -963,7 +963,7 @@ pub fn tcp4_http_get(url: &str) -> Option<Vec<u8>> {
             // Check HTTP status
             if let Ok(headers_str) = core::str::from_utf8(&response_buf[..header_end]) {
                 if let Some(first_line) = headers_str.lines().next() {
-                    info!("TCP4 HTTP GET response: {}", first_line);
+                    debug!("TCP4 HTTP GET response: {}", first_line);
                     // Check for non-200 status
                     if !first_line.contains("200") {
                         error!("TCP4: GET failed with status: {}", first_line);
@@ -972,7 +972,7 @@ pub fn tcp4_http_get(url: &str) -> Option<Vec<u8>> {
                 }
             }
             let body = response_buf[header_end..].to_vec();
-            info!("TCP4 HTTP GET completed: {} bytes", body.len());
+            debug!("TCP4 HTTP GET completed: {} bytes", body.len());
             Some(body)
         } else {
             error!("TCP4: GET response has no HTTP headers");

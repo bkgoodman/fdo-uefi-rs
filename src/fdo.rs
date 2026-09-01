@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::vec;
 use alloc::format;
-use log::{info, error, warn};
+use log::{info, error, warn, debug};
 use sha2::{Sha256, Digest};
 use hmac::{Hmac, Mac, digest::KeyInit as HmacKeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, aead::AeadMutInPlace};
@@ -151,17 +151,17 @@ fn build_a256gcm_protected_headers() -> Vec<u8> {
 pub fn cose_encrypt0_a256gcm(key: &[u8], nonce: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, FdoError> {
     // Build protected headers once - used in both message and AAD
     let protected_bytes = build_a256gcm_protected_headers();
-    info!("COSE: protected_bytes ({} bytes): {:02x?}", protected_bytes.len(), &protected_bytes);
+    debug!("COSE: protected_bytes ({} bytes): {:02x?}", protected_bytes.len(), &protected_bytes);
     
     // Build Enc_structure for AAD
     let cose_aad = build_cose_enc_structure(&protected_bytes, &[]);
-    info!("COSE: AAD ({} bytes): {:02x?}", cose_aad.len(), &cose_aad);
-    info!("COSE: key ({} bytes): {:02x?}", key.len(), &key[..key.len().min(16)]);
-    info!("COSE: plaintext ({} bytes): {:02x?}", plaintext.len(), &plaintext);
+    debug!("COSE: AAD ({} bytes): {:02x?}", cose_aad.len(), &cose_aad);
+    debug!("COSE: key ({} bytes): {:02x?}", key.len(), &key[..key.len().min(16)]);
+    debug!("COSE: plaintext ({} bytes): {:02x?}", plaintext.len(), &plaintext);
     
     // Encrypt with AES-256-GCM
     let ciphertext = aes256_gcm_encrypt(key, nonce, plaintext, &cose_aad)?;
-    info!("COSE: ciphertext ({} bytes): {:02x?}", ciphertext.len(), &ciphertext);
+    debug!("COSE: ciphertext ({} bytes): {:02x?}", ciphertext.len(), &ciphertext);
     
     // Build COSE_Encrypt0: tag(16, [protected_bstr, {5: iv}, ciphertext])
     let mut enc = CborEncoder::new();
@@ -174,7 +174,7 @@ pub fn cose_encrypt0_a256gcm(key: &[u8], nonce: &[u8], plaintext: &[u8]) -> Resu
     enc.bytes(&ciphertext);
     
     let result = enc.into_bytes();
-    info!("COSE: final message ({} bytes): {:02x?}", result.len(), &result);
+    debug!("COSE: final message ({} bytes): {:02x?}", result.len(), &result);
     Ok(result)
 }
 
@@ -1474,7 +1474,7 @@ pub struct OwnerSvcInfo {
 /// Parse TO2.OwnerSvcInfo20 message (type 89)
 /// Format: [is_more_service_info, is_done, service_info_array] or null (no service info)
 pub fn parse_owner_svc_info(data: &[u8]) -> Result<OwnerSvcInfo, FdoError> {
-    info!("Parsing OwnerSvcInfo: {} bytes, hex: {:02x?}", data.len(), &data[..data.len().min(32)]);
+    debug!("Parsing OwnerSvcInfo: {} bytes, hex: {:02x?}", data.len(), &data[..data.len().min(32)]);
     
     // Handle null response - means no service info, we're done
     if data.len() == 1 && data[0] == 0xf6 {
@@ -1515,7 +1515,7 @@ pub fn parse_service_info_array(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, F
     
     let mut dec = CborDecoder::new(data);
     let arr_len = dec.read_array_header()?;
-    info!("ServiceInfo array has {} entries", arr_len);
+    debug!("ServiceInfo array has {} entries", arr_len);
     
     let mut entries = Vec::new();
     for i in 0..arr_len {
@@ -1530,7 +1530,7 @@ pub fn parse_service_info_array(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, F
         let key = dec.read_text()?;
         let value = dec.read_bytes()?;
         
-        info!("  ServiceInfo[{}]: key='{}', value={} bytes", i, key, value.len());
+        debug!("  ServiceInfo[{}]: key='{}', value={} bytes", i, key, value.len());
         entries.push((key, value));
     }
     
@@ -1602,12 +1602,12 @@ pub fn perform_to2_hello(owner_url: &str, guid: &[u8; 16]) -> Result<(To2HelloDe
         info!("  Session token received");
     }
     if !response.is_empty() {
-        info!("  CBOR: {:02x?}", &response[..response.len().min(32)]);
+        debug!("  CBOR: {:02x?}", &response[..response.len().min(32)]);
     }
     
     // Parse HelloDeviceAck20
     let ack = parse_to2_hello_device_ack(&response)?;
-    info!("  Nonce: {:02x?}", ack.nonce_to2_prove_dv);
+    debug!("  Nonce: {:02x?}", ack.nonce_to2_prove_dv);
     
     // Return raw response for hash_prev2 computation
     Ok((ack, auth_token, response))
@@ -1620,13 +1620,13 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     
     info!("=== Starting TO2 Protocol ===");
     info!("Owner URL: {}", owner_url);
-    info!("GUID: {:02x?}", guid);
+    debug!("GUID: {:02x?}", guid);
     
     // Step 1: HelloDeviceProbe -> HelloDeviceAck20
     let (ack, session_token, hello_ack_raw) = perform_to2_hello(owner_url, guid)?;
     
     info!("TO2 Step 1 complete: HelloDeviceProbe -> HelloDeviceAck20");
-    info!("  Nonce: {:02x?}", ack.nonce_to2_prove_dv);
+    debug!("  Nonce: {:02x?}", ack.nonce_to2_prove_dv);
     info!("  KexSuite: {}", ack.kex_suite);
     info!("  CipherSuite: {}", ack.cipher_suite);
     if session_token.is_some() {
@@ -1673,7 +1673,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     
     // Compute hash_prev2 (SHA-256 of HelloDeviceAck response)
     let hash_prev2 = sha256(&hello_ack_raw);
-    info!("  hash_prev2: {:02x?}", &hash_prev2[..16]);
+    debug!("  hash_prev2: {:02x?}", &hash_prev2[..16]);
     
     info!("TO2: Building COSE signature for ProveDevice20...");
     
@@ -1704,18 +1704,18 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
         info!("  FDO 1.x voucher detected - using empty AAD");
         Vec::new()
     };
-    info!("  external_aad: {:02x?}", &external_aad);
+    debug!("  external_aad: {:02x?}", &external_aad);
     
     // Build the Sig_structure for signing
     let sig_structure = build_cose_sig_structure(&protected, &external_aad, &payload);
     info!("  Sig_structure: {} bytes", sig_structure.len());
-    info!("  Sig_structure CBOR: {:02x?}", &sig_structure[..sig_structure.len().min(64)]);
-    info!("  Protected header: {:02x?}", &protected);
-    info!("  Payload: {:02x?}", &payload[..payload.len().min(48)]);
+    debug!("  Sig_structure CBOR: {:02x?}", &sig_structure[..sig_structure.len().min(64)]);
+    debug!("  Protected header: {:02x?}", &protected);
+    debug!("  Payload: {:02x?}", &payload[..payload.len().min(48)]);
     
     // Hash the Sig_structure with SHA-256
     let sig_hash = sha256(&sig_structure);
-    info!("  Sig_structure hash: {:02x?}", &sig_hash);
+    debug!("  Sig_structure hash: {:02x?}", &sig_hash);
     
     // Sign with TPM DAK using the persistent handle from DCTPM.DeviceKeyHandle.
     // Per securing-fdo-in-tpm.bs spec: "The client does not need to know how
@@ -1724,13 +1724,13 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     let signature = tpm::tpm_sign_with_persistent(device_key_handle, &sig_hash)
         .ok_or_else(|| FdoError::CryptoError(String::from("TPM signing failed")))?;
     info!("  TPM signature: {} bytes", signature.len());
-    info!("  Signature r: {:02x?}", &signature[..32]);
-    info!("  Signature s: {:02x?}", &signature[32..64]);
+    debug!("  Signature r: {:02x?}", &signature[..32]);
+    debug!("  Signature s: {:02x?}", &signature[32..64]);
     
     // Build the final ProveDevice20 message using the same payload bytes we signed
     let prove_device = build_to2_prove_device_from_parts(&protected, &payload, &signature);
     info!("  ProveDevice20: {} bytes", prove_device.len());
-    info!("  ProveDevice20 CBOR: {:02x?}", &prove_device[..prove_device.len().min(32)]);
+    debug!("  ProveDevice20 CBOR: {:02x?}", &prove_device[..prove_device.len().min(32)]);
     
     let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_PROVE_DEVICE);
     let resp = http_post_with_session(&url, &prove_device, MSG_TO2_PROVE_DEVICE, session_token.as_deref())
@@ -1739,12 +1739,12 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     
     info!("  Response: {} bytes", response.len());
     if !response.is_empty() {
-        info!("  CBOR: {:02x?}", &response[..response.len().min(32)]);
+        debug!("  CBOR: {:02x?}", &response[..response.len().min(32)]);
     }
     
     info!("TO2 Step 2 complete: ProveDevice20 -> ProveOVHdr20");
     info!("  Received ProveOVHdr20: {} bytes", response.len());
-    info!("  ProveOVHdr20 first bytes: {:02x?}", &response[..response.len().min(16)]);
+    debug!("  ProveOVHdr20 first bytes: {:02x?}", &response[..response.len().min(16)]);
     
     // Check for error response (5-element array starting with error code)
     if response.len() > 2 && response[0] == 0x85 {
@@ -1768,8 +1768,8 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     info!("  OV header: {} bytes", prove_ov.ov_header.len());
     info!("  Num OV entries: {}", prove_ov.num_ov_entries);
     info!("  xB (server ECDH): {} bytes", prove_ov.xb_key_exchange.len());
-    info!("  xB preview: {:02x?}", &prove_ov.xb_key_exchange[..prove_ov.xb_key_exchange.len().min(32)]);
-    info!("  nonce_to2_prove_ov: {:02x?}", prove_ov.nonce_to2_prove_ov);
+    debug!("  xB preview: {:02x?}", &prove_ov.xb_key_exchange[..prove_ov.xb_key_exchange.len().min(32)]);
+    debug!("  nonce_to2_prove_ov: {:02x?}", prove_ov.nonce_to2_prove_ov);
     
     // Recreate the ECDH key for ECDH_ZGen.
     // We flushed the original ECDH transient handle before DAK signing.
@@ -1791,19 +1791,19 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     // Parse random bytes from xB (server's key exchange parameter)
     let xb_rand = parse_kex_random(&prove_ov.xb_key_exchange)
         .ok_or_else(|| FdoError::CborError(String::from("Failed to parse xB random bytes")))?;
-    info!("  xB random: {} bytes, {:02x?}", xb_rand.len(), &xb_rand);
+    debug!("  xB random: {} bytes, {:02x?}", xb_rand.len(), &xb_rand);
     
     // Parse random bytes from xA (our key exchange parameter)
     let xa_rand = parse_kex_random(&xa_public_key)
         .ok_or_else(|| FdoError::CborError(String::from("Failed to parse xA random bytes")))?;
-    info!("  xA random: {} bytes, {:02x?}", xa_rand.len(), &xa_rand);
+    debug!("  xA random: {} bytes, {:02x?}", xa_rand.len(), &xa_rand);
     
     // FDO shared secret = ECDH_x || xB.Rand || xA.Rand (per go-fdo kex/ecdh.go:300)
     let mut shared_secret = ecdh_result;
     shared_secret.extend_from_slice(&xb_rand);
     shared_secret.extend_from_slice(&xa_rand);
     info!("  Full shared secret: {} bytes", shared_secret.len());
-    info!("  Shared secret preview: {:02x?}", &shared_secret[..shared_secret.len().min(16)]);
+    debug!("  Shared secret preview: {:02x?}", &shared_secret[..shared_secret.len().min(16)]);
     
     // Clean up TPM key handle
     tpm::tpm_flush_context(ecdh_key2.handle);
@@ -1812,7 +1812,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     info!("TO2: Deriving session keys...");
     let session_keys = derive_session_keys(&shared_secret);
     info!("  SEK (Session Encryption Key): {} bytes", session_keys.sek.len());
-    info!("  SEK preview: {:02x?}", &session_keys.sek[..session_keys.sek.len().min(8)]);
+    debug!("  SEK preview: {:02x?}", &session_keys.sek[..session_keys.sek.len().min(8)]);
     
     // Step 3: Fetch OV entries (GetOVNextEntry20 is NOT encrypted)
     info!("TO2 Step 3: Fetching {} OV entries...", prove_ov.num_ov_entries);
@@ -1840,7 +1840,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     // UEFI HTTP client has ~1KB response buffer limit, negotiate MTU down
     info!("TO2 Step 4: Sending DeviceSvcInfoRdy20 (encrypted)...");
     let device_svc_info_rdy = build_device_svc_info_rdy(Some(1300)); // Must exceed BMO chunk+overhead (~1064)
-    info!("  Plaintext: {} bytes, hex: {:02x?}", device_svc_info_rdy.len(), &device_svc_info_rdy);
+    debug!("  Plaintext: {} bytes, hex: {:02x?}", device_svc_info_rdy.len(), &device_svc_info_rdy);
     
     // Generate nonce for encryption (12 bytes for AES-GCM)
     let nonce: [u8; 12] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c]; // TODO: real random
@@ -1863,7 +1863,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     // Parse SetupDevice20: [nonce_to2_setup_dv, replacement_guid, replacement_rv_info, max_device_svc_info_sz]
     let setup_device = parse_setup_device(&setup_device_plain)?;
     info!("TO2 Step 4 complete: SetupDevice20 received");
-    info!("  nonce_to2_setup_dv: {:02x?}", &setup_device.nonce_to2_setup_dv[..8]);
+    debug!("  nonce_to2_setup_dv: {:02x?}", &setup_device.nonce_to2_setup_dv[..8]);
     info!("  max_device_svc_info_sz: {}", setup_device.max_device_svc_info_sz);
     
     // Step 5: ServiceInfo exchange loop (DeviceSvcInfo/OwnerSvcInfo)
@@ -1882,7 +1882,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     
     while !is_done {
         round += 1;
-        info!("  ServiceInfo round {}", round);
+        debug!("  ServiceInfo round {}", round);
         
         // Build DeviceSvcInfo (msg 88): [is_more, service_info_array]
         // Round 1: send devmod info
@@ -1904,7 +1904,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
         };
         
         let device_svc_info = build_device_svc_info(false, &svc_info); // is_more = false
-        info!("    DeviceSvcInfo plaintext: {} bytes", device_svc_info.len());
+        debug!("    DeviceSvcInfo plaintext: {} bytes", device_svc_info.len());
         
         // Encrypt and send
         let nonce: [u8; 12] = [round, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
@@ -1917,11 +1917,11 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
         
         // Decrypt OwnerSvcInfo (msg 89)
         let owner_svc_info_plain = cose_decrypt0_a256gcm(&session_keys.sek, &response)?;
-        info!("    OwnerSvcInfo plaintext: {} bytes", owner_svc_info_plain.len());
+        debug!("    OwnerSvcInfo plaintext: {} bytes", owner_svc_info_plain.len());
         
         // Parse OwnerSvcInfo: [is_done, is_more, service_info_array]
         let owner_svc = parse_owner_svc_info(&owner_svc_info_plain)?;
-        info!("    is_done={}, is_more={}, svc_info_len={}", 
+        debug!("    is_done={}, is_more={}, svc_info_len={}", 
               owner_svc.is_done, owner_svc.is_more, owner_svc.service_info.len());
         
         // Process ServiceInfo entries from owner
@@ -1931,13 +1931,13 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
                     for (key, value) in entries {
                         // Check if this is a BMO message
                         if key.starts_with("fdo.bmo:") {
-                            info!("    Processing BMO message: {}", key);
+                            debug!("    Processing BMO message: {}", key);
                             if let Some((resp_key, resp_value)) = process_bmo_message(&mut bmo_session, &key, &value) {
-                                info!("    BMO response: {} ({} bytes)", resp_key, resp_value.len());
+                                debug!("    BMO response: {} ({} bytes)", resp_key, resp_value.len());
                                 bmo_responses.push((resp_key, resp_value));
                             }
                         } else {
-                            info!("    Ignoring non-BMO ServiceInfo: {}", key);
+                            debug!("    Ignoring non-BMO ServiceInfo: {}", key);
                         }
                     }
                 }
@@ -1948,6 +1948,21 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
         }
         
         is_done = owner_svc.is_done;
+        
+        // ONE progress line per round. Everything else in this loop is debug —
+        // a BMO transfer runs ~50 rounds and console I/O is the dominant cost
+        // of a run, so per-round detail is measured in minutes of wall clock.
+        if bmo_session.bytes_received > 0 {
+            let pct = bmo_session.begin.as_ref()
+                .filter(|b| b.total_size > 0)
+                .map(|b| (bmo_session.bytes_received * 100 / b.total_size) as u32);
+            match pct {
+                Some(p) => info!("  Round {}: BMO {} bytes ({}%)", round, bmo_session.bytes_received, p),
+                None => info!("  Round {}: BMO {} bytes", round, bmo_session.bytes_received),
+            }
+        } else {
+            info!("  Round {}", round);
+        }
         
         // Safety limit to prevent infinite loops
         if round >= 100 {
@@ -1991,7 +2006,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     // Parse DoneAck: [nonce_to2_prove_dv] - echo of our original nonce
     let done_ack = parse_to2_done_ack(&done_ack_plain)?;
     info!("TO2 Step 6 complete: DoneAck received");
-    info!("  nonce_to2_prove_dv: {:02x?}", &done_ack.nonce[..8]);
+    debug!("  nonce_to2_prove_dv: {:02x?}", &done_ack.nonce[..8]);
     
     info!("=== TO2 Protocol Complete! ===");
     
@@ -2041,11 +2056,11 @@ pub fn perform_to1_hello(rv_url: &str, guid: &[u8; 16]) -> Result<To1HelloRvAck,
         .ok_or_else(|| FdoError::HttpError(String::from("HTTP POST failed")))?;
     
     info!("  Response: {} bytes", response.len());
-    info!("  CBOR: {:02x?}", &response[..response.len().min(32)]);
+    debug!("  CBOR: {:02x?}", &response[..response.len().min(32)]);
     
     // Parse HelloRVAck
     let ack = parse_to1_hello_rv_ack(&response)?;
-    info!("  Nonce4: {:02x?}", ack.nonce4);
+    debug!("  Nonce4: {:02x?}", ack.nonce4);
     
     Ok(ack)
 }
@@ -2068,7 +2083,7 @@ fn perform_to1_prove(rv_url: &str, guid: &[u8; 16], nonce4: &[u8; 16]) -> Result
     
     info!("  Response: {} bytes", response.len());
     if !response.is_empty() {
-        info!("  CBOR: {:02x?}", &response[..response.len().min(32)]);
+        debug!("  CBOR: {:02x?}", &response[..response.len().min(32)]);
     }
     
     // Parse RVRedirect
@@ -2083,15 +2098,15 @@ fn perform_to1_prove(rv_url: &str, guid: &[u8; 16], nonce4: &[u8; 16]) -> Result
 pub fn perform_to1(rv_url: &str, guid: &[u8; 16]) -> Result<To1RvRedirect, FdoError> {
     info!("=== Starting TO1 Protocol ===");
     info!("RV URL: {}", rv_url);
-    info!("GUID: {:02x?}", guid);
+    debug!("GUID: {:02x?}", guid);
     
     // Step 1: HelloRV -> HelloRVAck
     let ack = perform_to1_hello(rv_url, guid)?;
     
     info!("TO1 Step 1 complete: HelloRV -> HelloRVAck");
-    info!("  Nonce4: {:02x?}", ack.nonce4);
+    debug!("  Nonce4: {:02x?}", ack.nonce4);
     info!("  SigType: {}", ack.sig_type);
-    info!("  CapabilityFlags: {:02x?}", ack.capability_flags);
+    debug!("  CapabilityFlags: {:02x?}", ack.capability_flags);
     
     // Step 2: ProveToRV -> RVRedirect
     warn!("Note: ProveToRV using placeholder signature (no device key)");
@@ -2114,18 +2129,18 @@ pub fn test_fdo_messages() {
         0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10
     ];
     
-    info!("Test GUID: {:02x?}", guid);
+    debug!("Test GUID: {:02x?}", guid);
     
     // Build TO1.HelloRV
     let hello_rv = build_to1_hello_rv(&guid);
     info!("TO1.HelloRV (type 30): {} bytes", hello_rv.len());
-    info!("  CBOR: {:02x?}", hello_rv);
+    debug!("  CBOR: {:02x?}", hello_rv);
     
     // Build TO2.HelloDeviceProbe
     let sugar: [u8; 16] = [0xaa; 16]; // Random entropy
     let hello_probe = build_to2_hello_device_probe(&guid, &sugar);
     info!("TO2.HelloDeviceProbe (type 80): {} bytes", hello_probe.len());
-    info!("  CBOR: {:02x?}", hello_probe);
+    debug!("  CBOR: {:02x?}", hello_probe);
     
     info!("FDO message test complete!");
 }

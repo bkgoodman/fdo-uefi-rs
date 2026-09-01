@@ -54,7 +54,7 @@ pub fn http_post_with_session(url: &str, body: &[u8], msg_type: u8, auth_token: 
         // (DHCP only runs after finding an HTTP NIC handle, which didn't exist).
         ensure_network_configured();
 
-        log::info!("Using TCP4 HTTP transport");
+        log::debug!("Using TCP4 HTTP transport");
         return crate::tcp4_http::tcp4_http_post(url, body, msg_type, auth_token);
     }
 
@@ -106,7 +106,7 @@ fn ensure_network_configured() {
     if let Ok(ip4_handles) = boot::locate_handle_buffer(boot::SearchType::ByProtocol(
         &Ip4Config2::GUID
     )) {
-        log::info!("TCP4: Found {} IP4Config2 handle(s), checking link state...", ip4_handles.len());
+        log::debug!("TCP4: Found {} IP4Config2 handle(s), checking link state...", ip4_handles.len());
 
         // Build list of SNP handles with media_present for link detection
         use uefi::proto::network::snp::SimpleNetwork;
@@ -132,7 +132,7 @@ fn ensure_network_configured() {
                         let has_link = mode.media_present_supported.into()
                             && bool::from(mode.media_present);
                         let mac6: [u8; 6] = [mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]];
-                        log::info!("TCP4: SNP {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} media_present={}",
+                        log::debug!("TCP4: SNP {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} media_present={}",
                             mac6[0], mac6[1], mac6[2], mac6[3], mac6[4], mac6[5], has_link);
                         if has_link {
                             macs_with_link.push(mac6);
@@ -151,21 +151,21 @@ fn ensure_network_configured() {
 
                     // Check if this NIC has link by matching MAC to SNP results
                     let has_link = snp_link_macs.iter().any(|m| *m == mac6);
-                    log::info!("TCP4: IP4Config2 #{}: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
+                    log::debug!("TCP4: IP4Config2 #{}: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
                         idx, mac6[0], mac6[1], mac6[2], mac6[3], mac6[4], mac6[5], has_link);
 
                     if !has_link {
-                        log::info!("TCP4: IP4Config2 #{}: skipping DHCP (no link)", idx);
+                        log::debug!("TCP4: IP4Config2 #{}: skipping DHCP (no link)", idx);
                         continue;
                     }
 
                     // This NIC has link — try DHCP
-                    log::info!("TCP4: IP4Config2 #{}: attempting DHCP (link detected)...", idx);
+                    log::debug!("TCP4: IP4Config2 #{}: attempting DHCP (link detected)...", idx);
                     match ip4cfg.ifup() {
                         Ok(()) => {
-                            log::info!("TCP4: DHCP succeeded on handle #{}", idx);
+                            log::debug!("TCP4: DHCP succeeded on handle #{}", idx);
                             if let Ok(info2) = ip4cfg.get_interface_info() {
-                                log::info!("TCP4: DHCP IP={}, Mask={}", info2.station_addr, info2.subnet_mask);
+                                log::debug!("TCP4: DHCP IP={}, Mask={}", info2.station_addr, info2.subnet_mask);
                             }
                             DHCP_SUCCEEDED.store(true, AtomicOrdering::Relaxed);
                             break;
@@ -208,7 +208,7 @@ pub fn http_get(url: &str) -> Option<alloc::vec::Vec<u8>> {
     #[cfg(feature = "tcp4-http")]
     {
         ensure_network_configured();
-        log::info!("Using TCP4 HTTP transport for GET");
+        log::debug!("Using TCP4 HTTP transport for GET");
         return crate::tcp4_http::tcp4_http_get(url);
     }
 

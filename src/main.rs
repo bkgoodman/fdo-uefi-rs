@@ -54,6 +54,10 @@ struct FdoOptions {
     force_di: bool,
     /// Pin the chainload LoadImage source (buffer vs ESP file)
     load_mode: chainload::LoadMode,
+    /// Enable the pre-StartImage network teardown (diagnostic; off by default)
+    teardown: bool,
+    /// Re-enable the per-round transport logging suppressed by default
+    verbose: bool,
 }
 
 /// Well-known FDO manufacturing server DNS names (per fdo-appnote-device-mfg-info.bs)
@@ -77,7 +81,9 @@ fn parse_args() -> FdoOptions {
         watchdog_test: None,
         chainload_file: None,
         force_di: false,
-        load_mode: chainload::LoadMode::Auto,
+        load_mode: chainload::LoadMode::Buffer,
+        teardown: false,
+        verbose: false,
     };
 
     let loaded_image = match boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()) {
@@ -146,15 +152,23 @@ fn parse_args() -> FdoOptions {
                 info!("CLI: Watchdog test mode — will arm {}s watchdog and exit", secs);
                 opts.watchdog_test = Some(secs);
             }
+            "-v" | "-verbose" => {
+                opts.verbose = true;
+                i += 1;
+            }
+            "-teardown" => {
+                info!("CLI: Will tear down NICs before StartImage (diagnostic)");
+                opts.teardown = true;
+                i += 1;
+            }
             "-load-mode" => {
                 if i + 1 < tokens.len() {
                     opts.load_mode = match tokens[i + 1] {
-                        "buffer" => chainload::LoadMode::BufferOnly,
-                        "file" => chainload::LoadMode::FileOnly,
-                        "auto" => chainload::LoadMode::Auto,
+                        "buffer" => chainload::LoadMode::Buffer,
+                        "file" => chainload::LoadMode::File,
                         other => {
-                            error!("CLI: unknown -load-mode '{}' (use buffer|file|auto)", other);
-                            chainload::LoadMode::Auto
+                            error!("CLI: unknown -load-mode '{}' (use buffer|file)", other);
+                            chainload::LoadMode::Buffer
                         }
                     };
                     info!("CLI: Chainload load mode = {:?}", opts.load_mode);
@@ -189,9 +203,15 @@ fn parse_args() -> FdoOptions {
                 info!("              e.g. -rv http://fdo-server.local:8080");
                 info!("  -watchdog [s] Arm watchdog for [s] seconds (default 30) and exit");
                 info!("              Tests firmware watchdog reboot without running FDO");
-                info!("  -load-mode <m>  Chainload source: buffer|file|auto (default auto)");
-                info!("              buffer = LoadImage from memory, no fallback");
-                info!("              file   = LoadImage from ESP temp file, no fallback");
+                info!("  -v          Verbose: per-round transport logging (NIC");
+                info!("              enumeration, TCP4 setup, HTTP headers, hex dumps)");
+                info!("              Off by default — console output is slow");
+                info!("  -teardown   Disconnect NICs before StartImage (diagnostic)");
+                info!("              Off by default: not needed on tested firmware");
+                info!("  -load-mode <m>  Chainload source: buffer|file (default buffer)");
+                info!("              buffer = LoadImage from memory (production)");
+                info!("              file   = write to ESP + LoadImage from file");
+                info!("                       (diagnostic only; no auto-fallback)");
                 info!("  -force-di   Run DI even if TPM already holds credentials");
                 info!("              Use when re-provisioning against a new server");
                 info!("  -chainload <path>  Chainload a PE straight off the ESP and exit");
@@ -257,6 +277,13 @@ fn load_file_from_esp(path: &str) -> Option<Vec<u8>> {
 fn main() -> Status {
     uefi::helpers::init().unwrap();
     
+    // Writing to the UEFI console is extremely slow — a full run takes 5-10
+    // minutes on-screen versus ~19s redirected to a file. Suppress the
+    // per-round transport chatter (NIC enumeration, TCP4 setup, HTTP headers,
+    // hex dumps) by default and leave one progress line per HTTP round.
+    // `-v` puts it all back.
+    log::set_max_level(log::LevelFilter::Info);
+    
     // Set a global watchdog timer — if anything hangs or crashes into a loop,
     // the firmware will automatically reboot after this timeout.
     // This is a safety net to avoid needing a physical hard-reset.
@@ -275,6 +302,12 @@ fn main() -> Status {
     // Apply the chainload source override to every chainload site (control
     // test, BMO, and RV firmware) so a single flag pins the behaviour.
     chainload::set_load_mode(opts.load_mode);
+    chainload::set_teardown(opts.teardown);
+    
+    if opts.verbose {
+        log::set_max_level(log::LevelFilter::Trace);
+        info!("Verbose logging enabled (-v)");
+    }
     
     // Watchdog test mode: just arm the watchdog and exit immediately.
     // Usage: fdo-uefi.efi -watchdog 30

@@ -4,7 +4,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use log::{info, warn, error};
+use log::{info, warn, error, debug};
 use uefi::boot;
 use uefi::proto::tcg::v2::Tcg;
 
@@ -628,7 +628,7 @@ pub fn tpm_ecdh_compute_secret(key_handle: u32, peer_x: &[u8], peer_y: &[u8]) ->
 /// For P-256: 2+32+2+32+2+16 = 86 bytes
 pub fn tpm_ecdh_derive(key_handle: u32, peer_key_fdo: &[u8]) -> Option<Vec<u8>> {
     info!("TPM ECDH: parsing peer key, {} bytes", peer_key_fdo.len());
-    info!("TPM ECDH: first 16 bytes: {:02x?}", &peer_key_fdo[..peer_key_fdo.len().min(16)]);
+    debug!("TPM ECDH: first 16 bytes: {:02x?}", &peer_key_fdo[..peer_key_fdo.len().min(16)]);
     
     // FDO ECDH format: [2-byte xLen][x][2-byte yLen][y][2-byte randLen][rand]
     if peer_key_fdo.len() < 6 {
@@ -663,8 +663,8 @@ pub fn tpm_ecdh_derive(key_handle: u32, peer_key_fdo: &[u8]) -> Option<Vec<u8>> 
     
     let peer_y = &peer_key_fdo[pos..pos + y_len];
     
-    info!("TPM ECDH: peer X ({} bytes): {:02x?}", peer_x.len(), &peer_x[..peer_x.len().min(8)]);
-    info!("TPM ECDH: peer Y ({} bytes): {:02x?}", peer_y.len(), &peer_y[..peer_y.len().min(8)]);
+    debug!("TPM ECDH: peer X ({} bytes): {:02x?}", peer_x.len(), &peer_x[..peer_x.len().min(8)]);
+    debug!("TPM ECDH: peer Y ({} bytes): {:02x?}", peer_y.len(), &peer_y[..peer_y.len().min(8)]);
     
     tpm_ecdh_compute_secret(key_handle, peer_x, peer_y)
 }
@@ -1105,7 +1105,7 @@ pub fn read_fdo_credentials() -> Option<FdoCredentials> {
             return None;
         }
     };
-    info!("DCTPM NV data: {} bytes, first 16: {:02x?}", data.len(), &data[..data.len().min(16)]);
+    debug!("DCTPM NV data: {} bytes, first 16: {:02x?}", data.len(), &data[..data.len().min(16)]);
     
     if data.is_empty() {
         warn!("DCTPM NV data is empty");
@@ -1154,7 +1154,7 @@ pub fn read_fdo_credentials() -> Option<FdoCredentials> {
         }
         let mut guid = [0u8; 16];
         guid.copy_from_slice(guid_bytes);
-        info!("DCTPM: GUID: {:02x?}", guid);
+        debug!("DCTPM: GUID: {:02x?}", guid);
         
         // Skip items 5-7 (RvInfo, PubKeyHash, KeyType)
         for idx in 5..8 {
@@ -1213,7 +1213,7 @@ pub fn read_fdo_credentials() -> Option<FdoCredentials> {
                     }
                     let mut g = [0u8; 16];
                     g.copy_from_slice(guid_bytes);
-                    info!("DCTPM: GUID: {:02x?}", g);
+                    debug!("DCTPM: GUID: {:02x?}", g);
                     guid = Some(g);
                 }
                 8 => {
@@ -1665,7 +1665,7 @@ pub fn test_tpm() {
                         info!("Checking persistent handle 0x{:08x}...", handle);
                         match tpm_read_public(handle) {
                             Some((x, y)) => {
-                                info!("  Found key at 0x{:08x}: X={:02x?}", handle, &x[..x.len().min(8)]);
+                                debug!("  Found key at 0x{:08x}: X={:02x?}", handle, &x[..x.len().min(8)]);
                             }
                             None => {
                                 info!("  Handle 0x{:08x} not found", handle);
@@ -1945,7 +1945,7 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
     
     // Step 2: Compute HMAC using the key (same TCG2 session — handle is still valid)
     let hmac_cmd = build_hmac_cmd(hmac_handle, data);
-    info!("TPM: HMAC command: {} bytes, header+auth: {:02x?}", hmac_cmd.len(), &hmac_cmd[..hmac_cmd.len().min(30)]);
+    debug!("TPM: HMAC command: {} bytes, header+auth: {:02x?}", hmac_cmd.len(), &hmac_cmd[..hmac_cmd.len().min(30)]);
     
     let mut hmac_value = None;
     for attempt in 0..5 {
@@ -1965,7 +1965,7 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
             continue;
         }
         
-        info!("TPM: HMAC response first 14: {:02x?}", &hmac_response[..14]);
+        debug!("TPM: HMAC response first 14: {:02x?}", &hmac_response[..14]);
         hmac_value = parse_hmac_response(&hmac_response);
         break;
     }
@@ -2115,7 +2115,7 @@ pub fn tpm_hmac(key_handle: u32, data: &[u8]) -> Option<Vec<u8>> {
     };
     
     let cmd = build_hmac_cmd(key_handle, data);
-    info!("TPM: HMAC command: {} bytes, first 20: {:02x?}", cmd.len(), &cmd[..cmd.len().min(20)]);
+    debug!("TPM: HMAC command: {} bytes, first 20: {:02x?}", cmd.len(), &cmd[..cmd.len().min(20)]);
     let mut response = vec![0u8; 256];
     
     let result = tcg.submit_command(&cmd, &mut response);
@@ -2124,7 +2124,7 @@ pub fn tpm_hmac(key_handle: u32, data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     
-    info!("TPM: HMAC response first 14: {:02x?}", &response[..14]);
+    debug!("TPM: HMAC response first 14: {:02x?}", &response[..14]);
     parse_hmac_response(&response)
 }
 

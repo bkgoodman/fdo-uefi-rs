@@ -44,22 +44,22 @@ fn start_snp_interface() -> Option<uefi::Handle> {
         }
     };
     
-    info!("Found {} SNP handle(s), starting interface...", snp_handles.len());
+    debug!("Found {} SNP handle(s), starting interface...", snp_handles.len());
     
     for handle in snp_handles.iter() {
         if let Ok(snp) = boot::open_protocol_exclusive::<SimpleNetwork>(*handle) {
-            info!("SNP mode: {:?}", snp.mode());
+            debug!("SNP mode: {:?}", snp.mode());
             
             // Try to start the interface
             match snp.start() {
-                Ok(_) => info!("SNP started successfully"),
+                Ok(_) => debug!("SNP started successfully"),
                 Err(e) => debug!("SNP start: {:?} (may already be started)", e),
             }
             
             // Initialize the interface
             match snp.initialize(0, 0) {
                 Ok(_) => {
-                    info!("SNP initialized successfully");
+                    debug!("SNP initialized successfully");
                     return Some(*handle);
                 }
                 Err(e) => {
@@ -75,14 +75,14 @@ fn start_snp_interface() -> Option<uefi::Handle> {
 
 /// Connect network controller to load IP/HTTP stack
 fn connect_network_controller(handle: uefi::Handle) -> bool {
-    info!("Connecting network controller recursively...");
+    debug!("Connecting network controller recursively...");
     
     // Connect all drivers to this controller recursively
     // This should trigger IP4Dxe, TcpDxe, HttpDxe to bind
     let empty_list: &[Option<uefi::Handle>] = &[];
     match boot::connect_controller(handle, empty_list, None, true) {
         Ok(_) => {
-            info!("Network controller connected successfully");
+            debug!("Network controller connected successfully");
             true
         }
         Err(e) => {
@@ -134,7 +134,7 @@ fn find_http_nic() -> Option<uefi::Handle> {
     if let Ok(ip4_handles) = boot::locate_handle_buffer(boot::SearchType::ByProtocol(
         &Ip4Config2::GUID
     )) {
-        info!("Found {} IP4Config2 handle(s)", ip4_handles.len());
+        debug!("Found {} IP4Config2 handle(s)", ip4_handles.len());
     } else {
         warn!("No IP4Config2 handles after connect");
     }
@@ -142,7 +142,7 @@ fn find_http_nic() -> Option<uefi::Handle> {
     // Check for TCP4 Service Binding Protocol
     let tcp4_sb_guid = uefi::guid!("00720665-67eb-4a99-baf7-d3c33a1c7cc9");
     match boot::locate_handle_buffer(boot::SearchType::ByProtocol(&tcp4_sb_guid)) {
-        Ok(handles) => info!("Found {} TCP4 ServiceBinding handle(s)", handles.len()),
+        Ok(handles) => debug!("Found {} TCP4 ServiceBinding handle(s)", handles.len()),
         Err(_) => warn!("No TCP4 ServiceBinding handles found"),
     }
     
@@ -151,11 +151,11 @@ fn find_http_nic() -> Option<uefi::Handle> {
         &HttpBinding::GUID
     )) {
         Ok(handles) => {
-            info!("Found {} HTTP-capable NIC(s)", handles.len());
+            debug!("Found {} HTTP-capable NIC(s)", handles.len());
             handles.first().copied()
         }
         Err(_) => {
-            warn!("No HTTP handles found after connect");
+            debug!("No HTTP handles found after connect");
             None
         }
     }
@@ -169,15 +169,15 @@ pub fn configure_network(nic_handle: uefi::Handle) -> bool {
         return true;
     }
     
-    info!("Configuring network via DHCP (first time)...");
+    debug!("Configuring network via DHCP (first time)...");
     
     match Ip4Config2::new(nic_handle) {
         Ok(mut ip4cfg) => {
             match ip4cfg.ifup() {
                 Ok(()) => {
-                    info!("Network configured successfully");
+                    debug!("Network configured successfully");
                     if let Ok(info) = ip4cfg.get_interface_info() {
-                        info!("IP Address: {}", info.station_addr);
+                        debug!("IP Address: {}", info.station_addr);
                     }
                     NETWORK_CONFIGURED.store(true, Ordering::Relaxed);
                     true
@@ -204,7 +204,7 @@ pub fn http_get(url: &str) -> Option<Vec<u8>> {
         warn!("Network configuration failed, trying HTTP anyway...");
     }
     
-    info!("Using NIC handle for HTTP...");
+    debug!("Using NIC handle for HTTP...");
     
     // Create HTTP helper
     let mut http = match HttpHelper::new(nic_handle) {
@@ -221,7 +221,7 @@ pub fn http_get(url: &str) -> Option<Vec<u8>> {
         return None;
     }
     
-    info!("Sending GET request to: {}", url);
+    debug!("Sending GET request to: {}", url);
     
     // Send GET request
     if let Err(e) = http.request_get(url) {
@@ -232,7 +232,7 @@ pub fn http_get(url: &str) -> Option<Vec<u8>> {
     // Get response
     match http.response_first(true) {
         Ok(response) => {
-            info!("HTTP Status: {:?}", response.status);
+            debug!("HTTP Status: {:?}", response.status);
             
             let mut body = response.body;
             
@@ -243,13 +243,13 @@ pub fn http_get(url: &str) -> Option<Vec<u8>> {
                         if chunk.is_empty() {
                             break;
                         }
-                        info!("Received {} more bytes", chunk.len());
+                        debug!("Received {} more bytes", chunk.len());
                     }
                     Err(_) => break,
                 }
             }
             
-            info!("Total body size: {} bytes", body.len());
+            debug!("Total body size: {} bytes", body.len());
             Some(body)
         }
         Err(e) => {
@@ -285,7 +285,7 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     let nic_handle = match find_http_nic() {
         Some(h) => h,
         None => {
-            warn!("No HTTP protocol available");
+            debug!("No HTTP protocol available");
             return None;
         }
     };
@@ -527,7 +527,7 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
                         value
                     };
                     auth_header = Some(String::from(token));
-                    info!("Found Authorization token: {}...", &token[..token.len().min(20)]);
+                    debug!("Found Authorization token: {}...", &token[..token.len().min(20)]);
                 } else if name.eq_ignore_ascii_case("Message-Type") {
                     if let Ok(mt) = value.trim().parse::<u8>() {
                         msg_type_header = Some(mt);
@@ -561,7 +561,7 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
         warn!("Failed to destroy HTTP child handle: {:?}", e);
     }
     
-    info!("HTTP POST completed: {} bytes body, msg_type={:?}", body.len(), msg_type_header);
+    debug!("HTTP POST completed: {} bytes body, msg_type={:?}", body.len(), msg_type_header);
     Some(HttpPostResponse {
         body,
         auth_token: auth_header,

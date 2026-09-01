@@ -290,3 +290,119 @@ have fixed it. Remaining candidates, in order:
 - [ ] `LOAD_MODE` in `chainload.rs` is a `static mut` accessed through `unsafe`.
   Fine for single-threaded UEFI boot services, but a `Cell`/`OnceCell` or an
   explicit parameter threaded through `chainload_image()` would be cleaner.
+
+## Teardown Necessity Test (2026-09-01)
+
+Added `-no-teardown` to skip `teardown_network()` before `StartImage`, so we can
+find out whether the mitigation added in 405ef3b is load-bearing or pure risk.
+
+```
+fdo-uefi.efi -no-teardown -load-mode buffer -di http://192.168.200.30:8080 -rv http://192.168.200.30:8080
+```
+
+- Chainload still succeeds -> teardown is unnecessary. Remove it, and with it
+  the disconnect/reconnect cycle and the class of bug where the session loses
+  networking entirely.
+- Chainload crashes -> teardown is load-bearing and the DHCP-timer theory behind
+  it is confirmed. Keep it, and record the evidence here.
+
+### Tech debt
+
+- [ ] `SKIP_TEARDOWN` in `chainload.rs` is another `static mut` behind `unsafe`,
+  same pattern as `LOAD_MODE`. If both survive, fold them into a single
+  `ChainloadConfig` struct passed into `chainload_image()` rather than two
+  mutable globals.
+
+## Console Verbosity Reduction (2026-09-01)
+
+Console I/O dominates runtime: a full run is 5-10 minutes on screen versus ~19s
+redirected to a file. Reduced default log volume by ~62% of lines / ~72% of
+characters, measured against a captured 362-line run.
+
+- [x] Default log level pinned to `Info` in `main()` before arg parsing.
+- [x] `-v` / `-verbose` raises it to `Trace` to restore everything.
+- [x] Demoted to `debug!`: per-round NIC enumeration and link probing
+  (`http_api.rs`), TCP4 ServiceBinding selection / configure / connect
+  (`tcp4_http.rs`), HTTP header and body dumps (`http.rs`), and the
+  `SNP mode: {...}` dump (a single ~2.6 KB line).
+- [x] Demoted all `info!` lines whose payload is a `{:02x?}` hex dump in
+  `fdo.rs` and `tpm.rs` (42 sites).
+- [x] Kept exactly one progress line per HTTP round:
+  `TCP4 HTTP POST to <url> (N bytes)`.
+
+### Security note
+
+The suppressed output included the AES session key (`COSE: key`) and the derived
+SEK preview, printed to console on every encrypted round. These are now `debug!`.
+
+- [ ] Consider removing the key material dumps entirely rather than leaving them
+  behind `-v`. Printing session keys is a bad default even in a debug build.
+
+## Load Mode: buffer is now the default and there is no fallback (2026-09-01)
+
+Removed `LoadMode::Auto`. `chainload_image()` loads from memory
+(`LoadImageSource::FromBuffer`) and fails loudly if that does not work.
+
+Rationale — the fallback was never justified:
+
+- No firmware we have tested needs it. OVMF/QEMU worked with buffer loads
+  (the original committed behaviour), and the K800 was confirmed with
+  `-load-mode buffer`, which has no fallback to hide behind.
+- The file path was introduced to chase the "AMI does not relocate FromBuffer"
+  theory, which hardware testing disproved.
+- It has real costs: requires a writable ESP, writes the payload to disk, leaves
+  `\EFI\BOOT\temp_bmo.efi` behind, and makes the logs ambiguous about which
+  mechanism actually ran.
+
+`-load-mode file` is retained purely as a diagnostic escape hatch, and now logs
+a warning that it is writing the payload to the ESP.
+
+- [ ] If `-load-mode file` goes unused for a while, delete `load_via_temp_file()`
+  and the flag outright (~100 lines).
+
+## ServiceInfo/BMO Round Logging Collapsed (2026-09-01)
+
+The BMO transfer loop was the dominant console cost: ~11 INFO lines per
+ServiceInfo round, and a 51 KB payload takes ~54 rounds (~590 lines).
+
+Now exactly ONE line per round, emitted at the end of the round with progress:
+
+```
+  Round 22: BMO 19266 bytes (37%)
+```
+
+Demoted to `debug!`: `ServiceInfo round N` header, DeviceSvcInfo/OwnerSvcInfo
+plaintext sizes, `is_done/is_more/svc_info_len`, ServiceInfo array entry dumps,
+`Processing BMO message`, and in `bmo.rs` the per-chunk decode/receive lines plus
+the image-begin field-by-field dump.
+
+Also demoted `tcp4_http.rs` "TCP4 HTTP POST to ..." — during ServiceInfo it
+duplicated the round line, and both the DI and TO1/TO2 layers already announce
+each protocol message themselves.
+
+Percentage is only shown when the server sent a `total_size` in image-begin.
+
+## Network Teardown Now OFF by Default (2026-09-01)
+
+`-no-teardown` replaced by `-teardown` (inverted): the teardown is off unless
+explicitly requested.
+
+Evidence it was never needed:
+
+- Confirmed working on K800 hardware with the teardown disabled.
+- The original crash was deterministic and always landed on 0xA0000 (the VGA
+  window). A stray IP4/DHCP timer callback would land somewhere different each
+  time; a fixed address indicates deliberate arithmetic, not a race. The
+  timer theory the teardown was built on never fit the evidence.
+
+Consequences:
+
+- No disconnect means no reconnect, so the 6 "NIC #n reconnected" lines are gone
+  from a normal run. `reconnect_network()` is now a no-op unless `-teardown`.
+- When `-teardown` IS used, reconnect still runs and now emits a single summary
+  line (`Reconnected 6/6 NIC(s)`) rather than one per NIC. It is not for our
+  benefit — we exit straight after a chainload — but to avoid leaving the UEFI
+  session with SNP uninstalled.
+
+- [ ] If `-teardown` goes unused, delete `teardown_network()` /
+  `reconnect_network()` and the flag (~70 lines).

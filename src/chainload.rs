@@ -7,7 +7,7 @@
 // This module implements UEFI LoadImage/StartImage to chain-load
 // EFI binaries received via BMO FSIM.
 
-use log::{info, warn, error};
+use log::{info, warn, error, debug};
 use uefi::prelude::*;
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::{File, FileAttribute, FileMode};
@@ -16,21 +16,46 @@ use uefi::boot::LoadImageSource;
 use uefi::CString16;
 
 /// Which `LoadImage` source to use when chainloading.
+///
+/// There is deliberately **no automatic fallback**. Loading from memory is the
+/// only production behaviour: the protocol hands us bytes over the wire, and
+/// `FromBuffer` needs no writable ESP and leaves nothing on disk. Falling back
+/// to a file silently would mean writing the payload to the ESP without the
+/// operator asking for it, and would make the logs ambiguous about which
+/// mechanism actually ran.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LoadMode {
-    /// Buffer first, fall back to a temp file on the ESP (default)
-    Auto,
-    /// Memory buffer only — fail rather than fall back. Use to prove whether
-    /// the firmware accepts `LoadImageSource::FromBuffer`.
-    BufferOnly,
-    /// ESP temp file only — fail rather than fall back. Use to prove whether
-    /// the firmware accepts `LoadImageSource::FromDevicePath`.
-    FileOnly,
+    /// Memory buffer (`LoadImageSource::FromBuffer`). The default and the only
+    /// mode production should ever use.
+    Buffer,
+    /// Write to an ESP temp file and load via `FromDevicePath`.
+    ///
+    /// Diagnostic escape hatch only, for firmware that turns out to reject
+    /// buffer loads. No firmware we have tested needs this: OVMF/QEMU and the
+    /// OnLogic K800 both load from memory successfully.
+    File,
 }
 
 /// Selected load mode. Plain static rather than an atomic: this is a UEFI
 /// single-threaded boot-services environment, set once from `main` before use.
-static mut LOAD_MODE: LoadMode = LoadMode::Auto;
+static mut LOAD_MODE: LoadMode = LoadMode::Buffer;
+
+/// Whether to tear the network stack down before `StartImage`.
+///
+/// **Off by default.** The teardown was added in 405ef3b to stop IP4/DHCP timer
+/// events firing during `StartImage`, on the theory that they could dereference
+/// stale pointers and cause a wild jump. That theory did not survive scrutiny:
+/// the original crash was perfectly deterministic and always landed on the same
+/// address (0xA0000), which indicates deliberate arithmetic, not a race — a
+/// stray timer callback would land somewhere different each time. Chainloading
+/// with the teardown disabled was then confirmed working on K800 hardware.
+///
+/// The teardown is not free. It disconnects every driver from every NIC, which
+/// uninstalls SNP itself, and if we do not reconnect afterwards the rest of the
+/// UEFI session has no network at all.
+///
+/// `-teardown` re-enables it for diagnosis.
+static mut DO_TEARDOWN: bool = false;
 
 /// Override the chainload source. Call before `chainload_image()`.
 pub fn set_load_mode(mode: LoadMode) {
@@ -39,6 +64,15 @@ pub fn set_load_mode(mode: LoadMode) {
 
 fn load_mode() -> LoadMode {
     unsafe { LOAD_MODE }
+}
+
+/// Enable the pre-StartImage network teardown. Call before `chainload_image()`.
+pub fn set_teardown(enable: bool) {
+    unsafe { DO_TEARDOWN = enable; }
+}
+
+fn do_teardown() -> bool {
+    unsafe { DO_TEARDOWN }
 }
 
 /// Load an image directly from a memory buffer (`LoadImageSource::FromBuffer`).
@@ -173,66 +207,42 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
         }
     }
 
-    // Select the LoadImage source.
-    //
-    // FromBuffer is what we actually want in production: the protocol hands us
-    // bytes over the wire (BMO chunks, or an image extracted from a COSE
-    // envelope), and loading them directly needs no writable ESP and leaves no
-    // temp file behind. The file path is a fallback for firmware that refuses
-    // buffer loads.
+    // Load the image. Memory buffer is the default and the only production
+    // path; there is no automatic fallback (see LoadMode).
     //
     // An earlier comment here claimed AMI firmware (OnLogic k800) does not
     // apply PE relocations for FromBuffer loads. That is contradicted by our
     // own history: commit 7a0038e ("BMO Chain loading works on K800")
     // chainloaded successfully on that exact machine, and every committed
     // version of this file up to 405ef3b used FromBuffer as the primary path —
-    // FromDevicePath did not exist in the tree at all.
+    // FromDevicePath did not exist in the tree at all. Confirmed again on K800
+    // hardware with `-load-mode buffer`, which has no fallback to hide behind.
     //
     // The relocation story also does not hold up: gnu-efi images are built with
     // ImageBase=0x0 and an EMPTY PE base relocation directory by design, and
     // self-relocate at runtime from .rela/.dynamic in crt0. There are no PE
     // relocations for firmware to apply under EITHER source.
-    //
-    // Use `-load-mode` to pin a single source with no fallback when you need a
-    // deterministic answer about which one the firmware accepts.
-    let mode = load_mode();
-    info!("Chainload: Load mode = {:?}", mode);
-
-    let image_handle = match mode {
-        LoadMode::BufferOnly => {
-            info!("Chainload: Loading from MEMORY BUFFER (no fallback)...");
+    let image_handle = match load_mode() {
+        LoadMode::Buffer => {
+            info!("Chainload: Loading from memory buffer...");
             match load_from_buffer(image_data) {
                 Ok(h) => { info!("Chainload: Memory buffer load succeeded"); h }
                 Err(e) => {
-                    error!("Chainload: Memory buffer load FAILED: {:?} (no fallback)", e.status());
+                    error!("Chainload: Memory buffer load FAILED: {:?}", e.status());
+                    error!("Chainload: No fallback. If this firmware genuinely cannot");
+                    error!("Chainload: load from memory, retry with -load-mode file.");
                     return Err(e);
                 }
             }
         }
-        LoadMode::FileOnly => {
-            info!("Chainload: Loading from ESP TEMP FILE (no fallback)...");
+        LoadMode::File => {
+            warn!("Chainload: -load-mode file — writing payload to the ESP.");
+            warn!("Chainload: This is a diagnostic mode, not for production.");
             match load_via_temp_file(image_data) {
                 Ok(h) => { info!("Chainload: File load succeeded"); h }
                 Err(e) => {
-                    error!("Chainload: File load FAILED: {:?} (no fallback)", e.status());
+                    error!("Chainload: File load FAILED: {:?}", e.status());
                     return Err(e);
-                }
-            }
-        }
-        LoadMode::Auto => {
-            // Buffer first — this is the historically working order.
-            info!("Chainload: Trying memory buffer load first...");
-            match load_from_buffer(image_data) {
-                Ok(h) => { info!("Chainload: Memory buffer load succeeded"); h }
-                Err(e) => {
-                    warn!("Chainload: Buffer load failed ({:?}), falling back to temp file...", e.status());
-                    match load_via_temp_file(image_data) {
-                        Ok(h) => { info!("Chainload: File load succeeded"); h }
-                        Err(e2) => {
-                            error!("Chainload: Both buffer and file load failed: {:?}", e2.status());
-                            return Err(e2);
-                        }
-                    }
                 }
             }
         }
@@ -250,7 +260,12 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
     // StartImage, they can dereference stale pointers and cause wild jumps
     // (e.g., #UD at 0xA0000). Disconnecting the network controller cancels
     // all driver-managed events before we transfer control.
-    let torn_down_nics = teardown_network();
+    let torn_down_nics = if do_teardown() {
+        warn!("Chainload: -teardown — disconnecting NICs before StartImage");
+        teardown_network()
+    } else {
+        alloc::vec::Vec::new()
+    };
 
     // Tighten watchdog before StartImage — if the chainloaded image crashes
     // into a hang (instead of a clean #UD fault), firmware will auto-reboot
@@ -270,11 +285,13 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
     // 60s window we armed for StartImage.
     let _ = uefi::boot::set_watchdog_timer(crate::WATCHDOG_TIMEOUT_SECS, 0x10000, None);
 
-    // Put the network stack back. teardown_network() disconnects ALL drivers
-    // from every NIC, which uninstalls SNP itself — so if we simply return, the
-    // rest of this UEFI session has no network at all, and any later run of
-    // this app in the same shell session reports "No SNP handles found".
-    // Teardown is only safe if we never come back; since we did, undo it.
+    // Only relevant when -teardown was used; otherwise this is a no-op because
+    // we never disconnected anything.
+    //
+    // We exit right after a chainload returns and never use the network again,
+    // so this is not for our benefit — it is to avoid leaving the rest of the
+    // UEFI session (the shell, a later run of this app) with no NICs, which is
+    // what teardown_network() would otherwise do.
     reconnect_network(&torn_down_nics);
 
     match start_result {
@@ -352,15 +369,18 @@ fn reconnect_network(handles: &[Handle]) {
         return;
     }
 
-    info!("Chainload: Reconnecting {} network controller(s) after StartImage...", handles.len());
-
     let empty_list: &[Option<Handle>] = &[];
+    let mut failed = 0;
     for (idx, &handle) in handles.iter().enumerate() {
         match uefi::boot::connect_controller(handle, empty_list, None, true) {
-            Ok(_) => info!("Chainload: NIC #{} reconnected", idx),
-            Err(e) => warn!("Chainload: NIC #{} reconnect failed: {:?}", idx, e.status()),
+            Ok(_) => debug!("Chainload: NIC #{} reconnected", idx),
+            Err(e) => {
+                failed += 1;
+                warn!("Chainload: NIC #{} reconnect failed: {:?}", idx, e.status());
+            }
         }
     }
+    info!("Chainload: Reconnected {}/{} NIC(s) after StartImage", handles.len() - failed, handles.len());
 }
 
 /// Load image by writing to a temp file and loading via FromDevicePath.

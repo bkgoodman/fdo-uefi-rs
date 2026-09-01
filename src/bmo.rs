@@ -7,7 +7,7 @@
 // This module implements the device-side handling of the fdo.bmo Service Info Module
 // for receiving and booting firmware images during FDO TO2 onboarding.
 
-use log::{info, warn, error};
+use log::{info, warn, error, debug};
 use alloc::vec::Vec;
 use alloc::string::{String, ToString};
 use sha2::{Sha256, Digest};
@@ -141,20 +141,20 @@ pub fn parse_service_info_kv(data: &[u8]) -> Option<(String, Vec<u8>)> {
 /// Parse BMO image-begin message body
 /// Format: CBOR map with integer keys
 pub fn parse_bmo_image_begin(data: &[u8]) -> Option<BmoImageBegin> {
-    info!("BMO: Parsing image-begin ({} bytes)", data.len());
+    debug!("BMO: Parsing image-begin ({} bytes)", data.len());
     
     let mut dec = CborDecoder::new(data);
     let mut begin = BmoImageBegin::default();
     
     // Read map header
     let map_len = dec.read_map_header().ok()?;
-    info!("BMO: image-begin has {} map entries", map_len);
+    debug!("BMO: image-begin has {} map entries", map_len);
     
     for i in 0..map_len {
         // Read key (can be positive or negative integer)
         let key = match dec.read_int() {
             Ok(k) => {
-                info!("BMO: map entry {} key = {}", i, k);
+                debug!("BMO: map entry {} key = {}", i, k);
                 k
             }
             Err(e) => {
@@ -168,39 +168,39 @@ pub fn parse_bmo_image_begin(data: &[u8]) -> Option<BmoImageBegin> {
             0 => {
                 // total_size
                 begin.total_size = dec.read_uint().ok()? as u64;
-                info!("BMO: total_size = {}", begin.total_size);
+                debug!("BMO: total_size = {}", begin.total_size);
             }
             1 => {
                 // hash_alg
                 begin.hash_alg = Some(dec.read_text().ok()?);
-                info!("BMO: hash_alg = {:?}", begin.hash_alg);
+                debug!("BMO: hash_alg = {:?}", begin.hash_alg);
             }
             3 => {
                 // require_ack
                 begin.require_ack = dec.read_bool().ok()?;
-                info!("BMO: require_ack = {}", begin.require_ack);
+                debug!("BMO: require_ack = {}", begin.require_ack);
             }
             
             // BMO-specific fields (negative keys)
             -1 => {
                 // image_type (required)
                 begin.image_type = Some(dec.read_text().ok()?);
-                info!("BMO: image_type = {:?}", begin.image_type);
+                debug!("BMO: image_type = {:?}", begin.image_type);
             }
             -2 => {
                 // boot_args
                 begin.boot_args = Some(dec.read_text().ok()?);
-                info!("BMO: boot_args = {:?}", begin.boot_args);
+                debug!("BMO: boot_args = {:?}", begin.boot_args);
             }
             -3 => {
                 // name
                 begin.name = Some(dec.read_text().ok()?);
-                info!("BMO: name = {:?}", begin.name);
+                debug!("BMO: name = {:?}", begin.name);
             }
             -4 => {
                 // expected_hash
                 begin.expected_hash = Some(dec.read_bytes().ok()?);
-                info!("BMO: expected_hash = {} bytes", begin.expected_hash.as_ref().map(|h| h.len()).unwrap_or(0));
+                debug!("BMO: expected_hash = {} bytes", begin.expected_hash.as_ref().map(|h| h.len()).unwrap_or(0));
             }
             -5 => {
                 // hash_alg (FSIM-specific, overrides generic)
@@ -209,12 +209,12 @@ pub fn parse_bmo_image_begin(data: &[u8]) -> Option<BmoImageBegin> {
             -6 => {
                 // delivery_mode
                 begin.delivery_mode = dec.read_uint().ok()? as u8;
-                info!("BMO: delivery_mode = {}", begin.delivery_mode);
+                debug!("BMO: delivery_mode = {}", begin.delivery_mode);
             }
             -7 => {
                 // url (for mode 1)
                 begin.url = Some(dec.read_text().ok()?);
-                info!("BMO: url = {:?}", begin.url);
+                debug!("BMO: url = {:?}", begin.url);
             }
             -8 => {
                 // tls_ca
@@ -223,7 +223,7 @@ pub fn parse_bmo_image_begin(data: &[u8]) -> Option<BmoImageBegin> {
             -9 => {
                 // meta_url (for mode 2)
                 begin.meta_url = Some(dec.read_text().ok()?);
-                info!("BMO: meta_url = {:?}", begin.meta_url);
+                debug!("BMO: meta_url = {:?}", begin.meta_url);
             }
             -10 => {
                 // signer_key
@@ -300,7 +300,7 @@ pub fn process_bmo_message(
     key: &str,
     value: &[u8],
 ) -> Option<(String, Vec<u8>)> {
-    info!("BMO: Processing message key='{}', value={} bytes", key, value.len());
+    debug!("BMO: Processing message key='{}', value={} bytes", key, value.len());
     
     match key {
         BMO_KEY_IMAGE_BEGIN => {
@@ -345,7 +345,7 @@ pub fn process_bmo_message(
                 // CBOR major type 2 (byte string) — decode inner bytes
                 match CborDecoder::new(value).read_bytes() {
                     Ok(inner) => {
-                        info!("BMO: Decoded CBOR bstr chunk: {} -> {} bytes", value.len(), inner.len());
+                        debug!("BMO: Decoded CBOR bstr chunk: {} -> {} bytes", value.len(), inner.len());
                         inner
                     }
                     Err(_) => {
@@ -361,7 +361,7 @@ pub fn process_bmo_message(
             session.chunks_received += 1;
             session.bytes_received += chunk_data.len() as u64;
             
-            info!("BMO: Received chunk {}, {} bytes (total: {} bytes)", 
+            debug!("BMO: Received chunk {}, {} bytes (total: {} bytes)", 
                   session.chunks_received, chunk_data.len(), session.bytes_received);
             
             None
@@ -401,8 +401,8 @@ pub fn process_bmo_message(
                 let computed_bytes = computed.as_slice();
                 
                 info!("BMO: SHA256 verification:");
-                info!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
-                info!("  Computed: {:02x?}", &computed_bytes[..16]);
+                debug!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
+                debug!("  Computed: {:02x?}", &computed_bytes[..16]);
                 
                 if computed_bytes != expected_hash.as_slice() {
                     error!("BMO: SHA256 MISMATCH! Image data is CORRUPTED.");
@@ -433,7 +433,7 @@ pub fn process_bmo_message(
         }
         
         _ => {
-            info!("BMO: Unknown key '{}', ignoring", key);
+            debug!("BMO: Unknown key '{}', ignoring", key);
             None
         }
     }
@@ -453,7 +453,7 @@ fn parse_image_end_hash(data: &[u8]) -> Option<Vec<u8>> {
     let map_len = match dec.read_map_header() {
         Ok(n) => n,
         Err(_) => {
-            info!("BMO: image-end is not a CBOR map, no hash available");
+            debug!("BMO: image-end is not a CBOR map, no hash available");
             return None;
         }
     };
@@ -468,7 +468,7 @@ fn parse_image_end_hash(data: &[u8]) -> Option<Vec<u8>> {
             // Key 1 = hash value (byte string)
             match dec.read_bytes() {
                 Ok(hash) => {
-                    info!("BMO: Found SHA256 hash in image-end ({} bytes)", hash.len());
+                    debug!("BMO: Found SHA256 hash in image-end ({} bytes)", hash.len());
                     return Some(hash);
                 }
                 Err(_) => {
