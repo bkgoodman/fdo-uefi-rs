@@ -406,3 +406,112 @@ Consequences:
 
 - [ ] If `-teardown` goes unused, delete `teardown_network()` /
   `reconnect_network()` and the flag (~70 lines).
+
+## Three-Stage Chain Test (2026-09-01)
+
+Stage 1 (RV firmware delivery) confirmed working on K800 with the hello payload.
+Next: full chain, where each stage is a genuinely separate binary.
+
+| Stage | Build | Size | Role |
+|-------|-------|------|------|
+| 1 | `--no-default-features --features uefi-http,tcp4-http,rv-firmware` | 182272 | On ESP. Reads DCTPM, downloads + verifies COSE, chainloads Stage 2 |
+| 2 | `--no-default-features --features uefi-http,tcp4-http,fdo-installer` | 230912 | Delivered via COSE. Runs TO1/TO2 + BMO, chainloads Stage 3 |
+| 3 | `test-keys/payload_image.efi` | 51374 | Hello-world EFI app |
+
+Stage 1 deliberately excludes `fdo-installer`, and Stage 2 deliberately excludes
+`rv-firmware` — otherwise Stage 2 would run the firmware check again and
+re-download itself in a loop.
+
+Signed with `fdo-meta-tool platform sign -rev 2` (go-fdo-meta-tool). The Python
+`tools/sign_firmware.py` in efi-fdo-bmo needs `cbor2`, which is not installed and
+there is no pip on this host.
+
+### Anti-rollback consequence
+
+The TPM counter at NV 0x01D10002 ratchets on every successful verification. It
+was at 1 after the hello-payload test; Stage 2 is rev 2, so after this test the
+counter becomes 2 and **the rev-1 hello payload can no longer be delivered via
+Stage 1**. Re-sign it at a higher rev if it is needed again.
+
+### Known issues
+
+- [ ] `fdo-meta-tool platform verify` fails on its own output for images this
+  size: "byte array exceeds max size: 230986". A decoder limit in the tool, not
+  a bad payload — structure and FWImageHash verified independently. Worth fixing
+  so the tool can validate what it produces.
+- [ ] Stage 2 is chainloaded with **no command-line arguments**, so it must get
+  the owner URL from the DCTPM rather than `-rv`. Untested: every successful
+  TO1/TO2 run so far passed `-rv` explicitly.
+- [x] FIXED: the TCP4 receive loops were capped at a fixed round count (500 for
+  GET, 50 for POST). That caps a transfer at roughly rounds*fragment_size and
+  would silently truncate anything large — a real Linux UKI is hundreds of MB,
+  which the old GET cap could not have carried. Both loops now terminate on
+  Content-Length or on the peer going quiet, with `MAX_RESPONSE_BYTES`
+  (512 MB) as a memory-exhaustion sanity bound rather than an expected limit.
+
+
+## Anti-Rollback Semantics — clarification (2026-09-01)
+
+Recording this because it was nearly mis-filed as a bug.
+
+Current behaviour is already correct for a chainload-from-RAM design:
+
+- The counter is set to the DELIVERED revision, not blindly incremented:
+  `update_firmware_rev_counter(payload.firmware_rev)` ratchets to
+  `max(current, delivered)`.
+- The gate is `delivered_rev >= max(persisted_counter, RVMinFirmwareRev)`.
+  Re-delivering the same rev passes; only a LOWER rev is refused, which is
+  exactly the downgrade attack the counter exists to stop.
+
+So "rev 1 can no longer be delivered after rev 2" is the intended security
+property, not a regression.
+
+### Not implemented, and deliberately so
+
+Skipping the download when `RVMinFirmwareRev` is not newer than what we already
+have would be a valid optimisation for a FLASH-update design: no point fetching
+a rev we already hold. It does NOT apply here. We never persist the image — we
+chainload it out of RAM every boot — so skipping the download would leave us
+with nothing to execute.
+
+- [ ] Revisit if a flash-resident Stage 2 is ever introduced.
+
+## RV Info in DCTPM — verified (2026-09-01)
+
+Question: does DI provision enough into the TPM that a chainloaded Stage 2 (which
+gets no command line) can find the owner? **Yes.**
+
+Decoded from the server's msg/11 DISetCredentials response for the 14:49 DI:
+
+```
+[2,  c0a8c81e]                                          owner IP 192.168.200.30
+[3,  0x1f90]                                            port 8080
+[16, "/signed_payload.cose"]                            RVFirmwarePath
+[17, "http://192.168.200.30:9080/signed_payload.cose"]  RVFirmwareURL
+[18, 0x01]                                              RVMinFirmwareRev
+```
+
+`build_dctpm()` stores RVInfo at DCTPM index 5, and `parse_rv_info_at()` handles
+tags 2/3 (IP + port) and DNS, so `read_fdo_rv_info()` reconstructs
+`http://192.168.200.30:8080`. No `-rv` needed — this is the production path.
+
+Caveat: past logs are ambiguous about whether the URL came from CLI or TPM,
+because `-rv` was always passed. The distinguishing log line is
+`Using CLI-provided RV/Owner URL` vs `Using RV URL from device credential`.
+
+## -force-di must skip the RV firmware check (2026-09-01)
+
+The firmware URL and min revision live in the DCTPM written at DI time, and the
+RV firmware check runs BEFORE the credential check. So `-force-di` against a
+device with an existing DCTPM would:
+
+1. Run the firmware check using the OLD credential
+2. Download and chainload whatever the PREVIOUS DI pointed at
+3. Exit on return — never reaching DI at all
+
+Fixed: `-force-di` now skips the RV firmware check. Re-provisioning happens
+first; the new firmware config takes effect on the next boot.
+
+- [ ] Stage 1 is now built as `rv-firmware,di` (the README's "self-provisioning
+  firmware stub", recommended OEM config) so it can re-provision itself. A pure
+  `rv-firmware` Stage 1 cannot, and would need a separate DI binary deployed.

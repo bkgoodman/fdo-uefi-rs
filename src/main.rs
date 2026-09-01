@@ -364,8 +364,17 @@ fn main() -> Status {
     // In combined binary mode, check for firmware updates first.
     // If a newer image is available, chainload it.
     // If no update (same version or server unreachable), fall through to normal onboarding.
+    //
+    // Skipped entirely under -force-di. The firmware URL and minimum revision
+    // come from the DCTPM written at DI time, so running the check before a
+    // re-provision would act on the OLD credential — fetching whatever the
+    // previous DI pointed at and chainloading it, which exits before DI ever
+    // runs. Re-provisioning has to happen first; the new firmware config takes
+    // effect on the next boot.
     #[cfg(feature = "rv-firmware")]
-    {
+    if opts.force_di {
+        info!("Skipping RV firmware check (-force-di: re-provisioning first)");
+    } else {
         info!("Checking for RV-based firmware update...");
         match rv_firmware::check_and_deliver() {
             rv_firmware::DeliveryResult::Chainloaded => {

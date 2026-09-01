@@ -15,6 +15,15 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use log::{info, warn, error, debug};
+
+/// Sanity bound on a single HTTP response body.
+///
+/// This is deliberately generous: a real BMO/firmware payload can be a Linux
+/// UKI of hundreds of megabytes. It exists only to stop a runaway or hostile
+/// server exhausting memory, not to express an expected maximum. Transfers
+/// terminate on Content-Length or on the peer going quiet, never on a
+/// fixed iteration count.
+const MAX_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
 use uefi::boot;
 use uefi_raw::protocol::network::tcp4::{
     Tcp4Protocol, Tcp4ConfigData, Tcp4AccessPoint, Tcp4Option,
@@ -528,8 +537,17 @@ pub fn tcp4_http_post(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
         let mut response_buf = vec![0u8; 65536];
         let mut total_received = 0usize;
         
-        // Read in a loop until we have complete HTTP response
-        for _round in 0..50 {
+        // Read until the response is complete. Termination is driven by
+        // Content-Length or by the peer going quiet — NOT by a fixed round
+        // count, which would silently truncate a large response.
+        // MAX_RESPONSE_BYTES is a sanity bound, not an expected limit.
+        let mut _round = 0usize;
+        loop {
+            _round += 1;
+            if total_received > MAX_RESPONSE_BYTES {
+                error!("TCP4: Response exceeded {} bytes, aborting", MAX_RESPONSE_BYTES);
+                break;
+            }
             let rx_event = match create_event() {
                 Some(e) => e,
                 None => break,
@@ -850,11 +868,23 @@ pub fn tcp4_http_get(url: &str) -> Option<Vec<u8>> {
             return None;
         }
 
-        // Receive response — firmware images can be large, start with 1MB
+        // Receive response — firmware images can be large, start with 1MB.
+        //
+        // The loop is bounded by Content-Length and by the peer going quiet,
+        // NOT by a fixed round count. A round count caps the transfer at
+        // (rounds * fragment_size), which for a real payload — a Linux UKI can
+        // be hundreds of MB — would silently truncate the download and surface
+        // as a confusing COSE parse error.
         let mut response_buf = vec![0u8; 1024 * 1024];
         let mut total_received = 0usize;
 
-        for _round in 0..500 {
+        let mut _round = 0usize;
+        loop {
+            _round += 1;
+            if total_received > MAX_RESPONSE_BYTES {
+                error!("TCP4: Download exceeded {} bytes, aborting", MAX_RESPONSE_BYTES);
+                break;
+            }
             let rx_event = match create_event() {
                 Some(e) => e,
                 None => break,
