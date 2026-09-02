@@ -305,21 +305,68 @@ pub fn process_bmo_message(
     match key {
         BMO_KEY_IMAGE_BEGIN => {
             // Parse the image-begin message
-            if let Some(begin) = parse_bmo_image_begin(value) {
+            if let Some(mut begin) = parse_bmo_image_begin(value) {
                 info!("BMO: Received image-begin");
                 info!("  image_type: {:?}", begin.image_type);
                 info!("  delivery_mode: {}", begin.delivery_mode);
                 info!("  total_size: {}", begin.total_size);
                 info!("  require_ack: {}", begin.require_ack);
                 
-                // Store begin info
-                session.begin = Some(begin);
-                session.state = BmoState::AwaitingData;
-                session.image_buffer.clear();
-                session.chunks_received = 0;
-                session.bytes_received = 0;
+                // Handle delivery mode
+                match begin.delivery_mode {
+                    BMO_DELIVERY_INLINE => {
+                        // Mode 0: Chunked transfer over FDO channel
+                        info!("BMO: Using inline delivery mode (chunked)");
+                        session.begin = Some(begin);
+                        session.state = BmoState::AwaitingData;
+                        session.image_buffer.clear();
+                        session.chunks_received = 0;
+                        session.bytes_received = 0;
+                    }
+                    BMO_DELIVERY_URL => {
+                        // Mode 1: Device fetches from URL
+                        info!("BMO: Using URL delivery mode");
+                        if let Some(url) = &begin.url {
+                            info!("BMO: Fetching image from URL: {}", url);
+                            match process_bmo_url_delivery(session, &mut begin) {
+                                Ok(()) => {
+                                    info!("BMO: URL fetch successful, {} bytes received", session.image_buffer.len());
+                                    session.begin = Some(begin);
+                                    session.state = BmoState::Complete;
+                                    // Send success result immediately
+                                    let result = build_bmo_image_result(BMO_STATUS_SUCCESS, Some("Image fetched from URL"));
+                                    return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                                }
+                                Err(error_code) => {
+                                    error!("BMO: URL fetch failed with error code {}", error_code);
+                                    session.state = BmoState::Error;
+                                    let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("URL fetch failed"));
+                                    return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                                }
+                            }
+                        } else {
+                            error!("BMO: URL delivery mode requested but no URL provided");
+                            session.state = BmoState::Error;
+                            let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("URL delivery mode but no URL"));
+                            return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                        }
+                    }
+                    BMO_DELIVERY_META_URL => {
+                        // Mode 2: Device fetches signed meta-payload
+                        error!("BMO: Meta-URL delivery mode not yet supported");
+                        session.state = BmoState::Error;
+                        let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("Meta-URL mode not supported"));
+                        return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                    }
+                    _ => {
+                        error!("BMO: Unknown delivery mode: {}", begin.delivery_mode);
+                        session.state = BmoState::Error;
+                        let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("Unknown delivery mode"));
+                        return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                    }
+                }
                 
-                // If require_ack, send ack response
+                // If require_ack, send ack response (for inline mode only)
                 if session.begin.as_ref().map(|b| b.require_ack).unwrap_or(false) {
                     let ack = build_bmo_image_ack(true, None, None);
                     return Some((BMO_KEY_IMAGE_ACK.to_string(), ack));
@@ -437,6 +484,70 @@ pub fn process_bmo_message(
             None
         }
     }
+}
+
+/// Process BMO URL delivery mode (delivery_mode = 1)
+/// Fetches the image from the provided URL and stores it in the session buffer.
+/// Returns Ok(()) on success, or Err(error_code) on failure.
+fn process_bmo_url_delivery(session: &mut BmoSession, begin: &mut BmoImageBegin) -> Result<(), u8> {
+    let url = match &begin.url {
+        Some(u) => u,
+        None => {
+            error!("BMO: URL delivery requested but no URL provided");
+            return Err(BMO_ERROR_URL_FETCH_FAILED);
+        }
+    };
+    
+    info!("BMO: Fetching image from URL: {}", url);
+    
+    // Fetch the image from the URL
+    let image_data = match crate::http_api::http_get(url) {
+        Some(data) => {
+            info!("BMO: Downloaded {} bytes from URL", data.len());
+            data
+        }
+        None => {
+            error!("BMO: HTTP GET failed for URL: {}", url);
+            return Err(BMO_ERROR_URL_FETCH_FAILED);
+        }
+    };
+    
+    // Check size limits if specified
+    if begin.total_size > 0 && image_data.len() as u64 != begin.total_size {
+        error!("BMO: Size mismatch! Expected {}, got {}", 
+               begin.total_size, image_data.len());
+        return Err(BMO_ERROR_SIZE_EXCEEDED);
+    }
+    
+    // Verify hash if provided
+    if let Some(expected_hash) = &begin.expected_hash {
+        let mut hasher = Sha256::new();
+        hasher.update(&image_data);
+        let computed = hasher.finalize();
+        let computed_bytes = computed.as_slice();
+        
+        info!("BMO: SHA256 verification (URL mode):");
+        debug!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
+        debug!("  Computed: {:02x?}", &computed_bytes[..16]);
+        
+        if computed_bytes != expected_hash.as_slice() {
+            error!("BMO: SHA256 MISMATCH! Downloaded image is CORRUPTED.");
+            error!("BMO: REFUSING to chainload — data integrity check FAILED.");
+            return Err(BMO_ERROR_HASH_MISMATCH);
+        }
+        info!("BMO: SHA256 verified OK");
+    } else {
+        warn!("BMO: No expected hash provided for URL delivery — cannot verify integrity");
+        warn!("BMO: Proceeding without hash verification (server should provide hash)");
+    }
+    
+    // Store the image data in the session buffer
+    session.image_buffer = image_data;
+    session.bytes_received = session.image_buffer.len() as u64;
+    
+    info!("BMO: Image ready for boot ({} bytes, integrity verified)", session.image_buffer.len());
+    
+    Ok(())
 }
 
 /// Parse the SHA256 hash from an image-end message.

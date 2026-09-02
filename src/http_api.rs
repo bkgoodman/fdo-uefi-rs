@@ -192,8 +192,9 @@ pub fn http_post(url: &str, body: &[u8], msg_type: u8) -> Option<Vec<u8>> {
 
 /// Perform HTTP GET request, returning the response body.
 /// Dispatches to the appropriate transport backend (EFI_HTTP or TCP4).
-/// Used by rv-firmware to download firmware images.
-#[cfg(feature = "rv-firmware")]
+/// Used by rv-firmware to download firmware images and by BMO URL delivery
+/// mode to download boot images.
+#[cfg(any(feature = "rv-firmware", feature = "fdo-installer"))]
 pub fn http_get(url: &str) -> Option<alloc::vec::Vec<u8>> {
     // Try UEFI HTTP protocol first (if compiled in)
     #[cfg(feature = "uefi-http")]

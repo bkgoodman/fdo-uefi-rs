@@ -416,19 +416,40 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     };
     
     debug!("Sending POST request...");
+    // Mark the token pending so a driver that completes asynchronously can be
+    // told apart from one that has already finished.
+    tx_token.status = uefi::Status::NOT_READY;
     let status = unsafe { ((*proto_ptr).request)(proto_ptr, &mut tx_token) };
     if status != uefi::Status::SUCCESS {
         error!("HTTP POST request failed: {:?}", status);
         return None;
     }
-    
-    // Poll until complete
-    for _ in 0..300 {
-        let poll_status = unsafe { ((*proto_ptr).poll)(proto_ptr) };
-        if poll_status != uefi::Status::SUCCESS && poll_status != uefi::Status::NOT_READY {
-            break;
+
+    // OVMF completes Request() synchronously, exactly as the Response() path
+    // below assumes, so a SUCCESS return means the request is already out and
+    // there is nothing to wait for.
+    //
+    // This loop used to run a fixed 300 iterations with a 10ms stall, breaking
+    // only if poll() reported an *error*. Since poll() normally returns
+    // SUCCESS/NOT_READY, it ran to completion every time and burned a flat 3
+    // seconds on every HTTP request in the client — TO1, TO2 and ServiceInfo
+    // alike, regardless of payload size.
+    if tx_token.status == uefi::Status::NOT_READY {
+        for i in 0..3000 {
+            let poll_status = unsafe { ((*proto_ptr).poll)(proto_ptr) };
+            if tx_token.status == uefi::Status::SUCCESS {
+                debug!("Request completed after {} polls", i);
+                break;
+            }
+            if tx_token.status != uefi::Status::NOT_READY {
+                error!("HTTP POST request failed asynchronously: {:?}", tx_token.status);
+                return None;
+            }
+            if poll_status != uefi::Status::SUCCESS && poll_status != uefi::Status::NOT_READY {
+                break;
+            }
+            boot::stall(core::time::Duration::from_millis(1));
         }
-        boot::stall(core::time::Duration::from_millis(10));
     }
     debug!("Request sent");
     
@@ -443,7 +464,9 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     // We need at least space for Authorization header
     let mut rx_headers: [HttpHeader; 16] = unsafe { core::mem::zeroed() };
     
-    let mut rx_body = vec![0u8; 32768]; // 32KB to handle 14KB MTU + COSE overhead
+    // Must exceed the ServiceInfo MTU advertised in fdo.rs (65535) plus COSE and
+    // HTTP framing; the drain loop below will not collect more than this.
+    let mut rx_body = vec![0u8; 131072]; // 128KB
     let mut rx_msg = HttpMessage {
         data: HttpRequestOrResponse { response: &mut response_data },
         header_count: rx_headers.len(),
@@ -493,12 +516,12 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     
     let body_len = rx_msg.body_length;
     let header_count = rx_msg.header_count;
-    debug!("Response received: {} bytes, {} headers", body_len, header_count);
-    rx_body.truncate(body_len);
+    debug!("First response call: {} body bytes, {} headers", body_len, header_count);
     
     // Extract Authorization and Message-Type headers from UEFI HTTP headers
     let mut auth_header: Option<String> = None;
     let mut msg_type_header: Option<u8> = None;
+    let mut content_length: Option<usize> = None;
     let header_ptr = rx_msg.header;
     debug!("Header ptr: {:p}, count: {}", header_ptr, header_count);
     if !header_ptr.is_null() && header_count > 0 {
@@ -519,6 +542,9 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
                     core::str::from_utf8_unchecked(core::slice::from_raw_parts(hdr.field_value, len))
                 };
                 debug!("  Header: {} = {}", name, &value[..value.len().min(60)]);
+                if name.eq_ignore_ascii_case("Content-Length") {
+                    content_length = value.trim().parse::<usize>().ok();
+                }
                 if name.eq_ignore_ascii_case("Authorization") {
                     // Strip "Bearer " prefix if present
                     let token = if value.starts_with("Bearer ") {
@@ -537,6 +563,154 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
         }
     }
     
+    // A single EFI_HTTP_PROTOCOL.Response() call only delivers the body bytes that
+    // have arrived so far — for anything past the first segment or two that is a
+    // fraction of the whole. Keep calling Response() until Content-Length bytes
+    // have been collected. Subsequent calls must pass Data.Response = NULL and no
+    // header array, which tells the driver "body continuation only".
+    //
+    // Note: this relies on the driver reporting Content-Length in the header array.
+    // When firmware instead returns raw HTTP inside the body (the fallback path
+    // below), no length is available and we take a single read as-is.
+    // 64 spins plus ~50k * 100us gives roughly a 5s ceiling on waiting for any
+    // single segment, independent of how large the body is.
+    const MAX_DRAIN_IDLE: u32 = 50_000;
+    let mut total = body_len;
+    let mut drain_calls = 0u32;
+    let mut idle_waits = 0u32;
+    if let Some(cl) = content_length {
+        let mut idle = 0;
+        while total < cl && total < rx_body.len() {
+            let want = core::cmp::min(rx_body.len() - total, cl - total);
+
+            // OVMF reports BodyLength as the amount we asked for, not the amount
+            // it wrote, so its count cannot be used to advance our offset. Stamp
+            // the pending region with a sentinel first; whatever still holds the
+            // sentinel afterwards was never written. A trailing run shorter than
+            // the pattern width is treated as filled, so a false reading needs 4
+            // consecutive sentinel bytes at the exact boundary (~2^-32) and would
+            // be caught by the GCM tag rather than passing silently.
+            const RX_SENTINEL: u8 = 0xA5;
+            for b in &mut rx_body[total..total + want] {
+                *b = RX_SENTINEL;
+            }
+            let mut more_msg = HttpMessage {
+                data: HttpRequestOrResponse { response: core::ptr::null_mut() },
+                header_count: 0,
+                header: core::ptr::null_mut(),
+                body_length: want,
+                body: unsafe { rx_body.as_mut_ptr().add(total) }.cast::<c_void>(),
+            };
+            let mut more_token = HttpToken {
+                event: core::ptr::null_mut(),
+                status: uefi::Status::SUCCESS,
+                message: &mut more_msg,
+            };
+
+            drain_calls += 1;
+            // Response() returning SUCCESS means the read was *queued*, not that
+            // the body arrived — completion is signalled through the token. Only
+            // ever have one token outstanding: previously we measured straight
+            // away and, seeing nothing, queued another, leaving abandoned tokens
+            // holding pointers into regions we had already advanced past. A late
+            // token then wrote its segment at a stale offset, which corrupted the
+            // body intermittently and passed the length check.
+            more_token.status = uefi::Status::NOT_READY;
+            let st = unsafe { ((*proto_ptr).response)(proto_ptr, &mut more_token) };
+            if st != uefi::Status::SUCCESS && st != uefi::Status::NOT_READY {
+                error!("HTTP rx drain: Response() failed at {}/{} bytes (status {:?})",
+                       total, cl, st);
+                break;
+            }
+
+            // Drive the stack until this token completes. Poll() is safe here
+            // because the token it can complete is the one we just queued.
+            let mut waited = 0u32;
+            while more_token.status == uefi::Status::NOT_READY {
+                unsafe { ((*proto_ptr).poll)(proto_ptr) };
+                if more_token.status != uefi::Status::NOT_READY {
+                    break;
+                }
+                waited += 1;
+                if waited > MAX_DRAIN_IDLE {
+                    break;
+                }
+                boot::stall(core::time::Duration::from_micros(100));
+            }
+            idle_waits += waited;
+
+            // body_length is only meaningful once the token has completed; the
+            // earlier "driver lies" reading came from sampling it while the read
+            // was still queued, when it still held the size we asked for.
+            let got = more_msg.body_length;
+
+            // Cross-check against the sentinel, which cannot be trusted on its
+            // own: a written segment whose final byte happens to equal the
+            // sentinel makes the trailing run over-count, so this is a
+            // diagnostic only, never the source of truth.
+            let mut run = 0usize;
+            while run < want && rx_body[total + want - 1 - run] == RX_SENTINEL {
+                run += 1;
+            }
+            let sentinel_got = want - run;
+            if sentinel_got != got && drain_calls <= 6 {
+                debug!("  drain: token reports {}, sentinel suggests {}", got, sentinel_got);
+            }
+            if got > want {
+                // The driver wrote past the buffer size we advertised, which means
+                // it has already scribbled over the heap. Say so loudly rather
+                // than letting it surface later as a fault inside firmware.
+                error!("HTTP rx drain: driver overran buffer — wrote {}, cap was {}", got, want);
+                return None;
+            }
+            if got == 0 {
+                // Nothing ready yet. Drive the stack with poll() and retry. The
+                // previous 10ms stall per empty call cost ~2.2s per 64KB body,
+                // since ~46 calls are needed and roughly half come back empty.
+                // Spin first, then back off in 100us steps, bounded by a total
+                // wait budget (~5s) instead of an iteration count that scaled
+                // with body size and truncated large responses.
+                idle += 1;
+                idle_waits += 1;
+                if idle > MAX_DRAIN_IDLE {
+                    error!("HTTP rx drain: stalled at {}/{} bytes after {} empty polls",
+                           total, cl, idle);
+                    break;
+                }
+                // Do not call Http->Poll() here: doing so between Response()
+                // calls consumes the pending segments instead of buffering them,
+                // and the drain then never sees a single byte.
+                boot::stall(core::time::Duration::from_micros(100));
+                continue;
+            }
+            idle = 0;
+            if drain_calls <= 6 {
+                info!("  drain call {}: asked {} at off {}, got {}", drain_calls, want, total, got);
+            }
+            total += got;
+        }
+
+        if total == cl {
+            debug!("HTTP rx complete: {} bytes in {} call(s)", total,
+                   if total == body_len { 1 } else { 2 });
+        } else {
+            error!("HTTP rx SHORT READ: got {} bytes, Content-Length {} (missing {})",
+                   total, cl, cl.saturating_sub(total));
+        }
+    } else {
+        debug!("HTTP rx: {} bytes, no Content-Length header", total);
+    }
+    info!("HTTP rx cost: {} bytes | first call {} | Content-Length {:?} | {} drain calls | {} idle waits",
+          total, body_len, content_length, drain_calls, idle_waits);
+    if drain_calls > 0 && total > body_len + 8 && body_len >= 8 {
+        // If the driver restarted the body instead of continuing, the COSE prefix
+        // seen at offset 0 will reappear at the drain boundary.
+        info!("  boundary: head {:02x?} | at off {} {:02x?} | tail {:02x?}",
+              &rx_body[..8], body_len, &rx_body[body_len..body_len + 8],
+              &rx_body[total - 8..total]);
+    }
+    rx_body.truncate(total);
+
     // Fallback: try parsing headers from body (some UEFI implementations return raw HTTP)
     let body = if auth_header.is_none() {
         if let Some(pos) = find_header_end(&rx_body) {
@@ -557,6 +731,27 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     
     // Clean up: destroy HTTP child handle to avoid resource leak
     // This is critical - without it, we run out of handles after ~80 requests
+    //
+    // The raw HTTP protocol above was opened EXCLUSIVE on the child handle, and
+    // DestroyChild returns ACCESS_DENIED while any protocol on that child is
+    // still open. Close it first, otherwise every request leaks a child handle
+    // and its underlying TCP instance.
+    {
+        let st = uefi::table::system_table_raw().expect("no system table");
+        let bs = unsafe { (*st.as_ptr()).boot_services };
+        let status = unsafe {
+            ((*bs).close_protocol)(
+                child_handle.as_ptr(),
+                &RawHttpProtocol::GUID,
+                boot::image_handle().as_ptr(),
+                core::ptr::null_mut(),
+            )
+        };
+        if status != uefi::Status::SUCCESS {
+            warn!("Failed to close HTTP protocol on child: {:?}", status);
+        }
+    }
+
     if let Err(e) = binding.destroy_child(child_handle) {
         warn!("Failed to destroy HTTP child handle: {:?}", e);
     }

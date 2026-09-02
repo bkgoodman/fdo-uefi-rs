@@ -561,8 +561,14 @@ pub fn tcp4_http_post(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
                 fragment: Tcp4FragmentData,
             }
             
+            // Grow rather than stop. Breaking out here would end the read with a
+            // partial body while still looking like a clean completion — the same
+            // failure mode as a short read, just moved one layer down. The GET
+            // path below already grows for this reason.
+            if response_buf.len() - total_received == 0 {
+                response_buf.resize(response_buf.len() + 64 * 1024, 0);
+            }
             let remaining = response_buf.len() - total_received;
-            if remaining == 0 { break; }
             
             let mut rx_data = RxDataWithFragment {
                 urgent: Boolean::FALSE,
@@ -739,9 +745,10 @@ fn parse_http_response(data: &[u8]) -> Option<HttpPostResponse> {
 }
 
 /// Perform an HTTP GET via TCP4 protocol
-/// Used by rv-firmware to download firmware images from RV URLs.
+/// Used by rv-firmware to download firmware images from RV URLs, and by BMO
+/// URL delivery mode to download boot images.
 /// Tries all available TCP4 ServiceBinding handles to find one that connects.
-#[cfg(feature = "rv-firmware")]
+#[cfg(any(feature = "rv-firmware", feature = "fdo-installer"))]
 pub fn tcp4_http_get(url: &str) -> Option<Vec<u8>> {
     let (ip, port, path) = parse_url(url)?;
     let hostname = url.split('/').nth(2).unwrap_or("localhost");

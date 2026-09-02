@@ -569,7 +569,10 @@ impl<'a> CborDecoder<'a> {
         
         let len = self.decode_additional(additional)? as usize;
         if self.pos + len > self.data.len() {
-            return Err(FdoError::CborError(String::from("bstr length exceeds data")));
+            return Err(FdoError::CborError(format!(
+                "bstr length exceeds data: declared {} at pos {}, only {} available",
+                len, self.pos, self.data.len() - self.pos
+            )));
         }
         
         let bytes = self.data[self.pos..self.pos + len].to_vec();
@@ -1839,7 +1842,12 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     // Step 4: DeviceSvcInfoRdy20 (ENCRYPTED - type 86)
     // UEFI HTTP client has ~1KB response buffer limit, negotiate MTU down
     info!("TO2 Step 4: Sending DeviceSvcInfoRdy20 (encrypted)...");
-    let device_svc_info_rdy = build_device_svc_info_rdy(Some(1300)); // Must exceed BMO chunk+overhead (~1064)
+    // Owner sizes its BMO chunks to fill this MTU, so this value alone sets the
+    // round-trip count for an image transfer: 1300 needs ~23k rounds for a 27MB
+    // UKI, 65535 needs ~420. 65535 is the protocol ceiling (the field is a
+    // uint16). Must stay under the http.rs rx_body buffer with room for COSE +
+    // HTTP overhead, and requires the Response() drain loop in http.rs.
+    let device_svc_info_rdy = build_device_svc_info_rdy(Some(65535));
     debug!("  Plaintext: {} bytes, hex: {:02x?}", device_svc_info_rdy.len(), &device_svc_info_rdy);
     
     // Generate nonce for encryption (12 bytes for AES-GCM)
@@ -1878,11 +1886,20 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     let mut bmo_responses: Vec<(String, Vec<u8>)> = Vec::new();
     
     let mut is_done = false;
-    let mut round = 0u8;
+    // u32, not u8: a 27MB image at a 64KB MTU needs ~420 rounds, and the round
+    // counter also feeds the GCM nonce below, so it must not wrap.
+    let mut round = 0u32;
     
     while !is_done {
         round += 1;
         debug!("  ServiceInfo round {}", round);
+
+        // Completing a round is proof we are not hung, so refresh the watchdog.
+        // A full image transfer takes far longer than the watchdog interval
+        // (~420 rounds at ~3s each vs a 900s timer), and without this the
+        // firmware reboots mid-transfer. A round that genuinely stalls still
+        // trips the timer and reboots as intended.
+        let _ = uefi::boot::set_watchdog_timer(crate::WATCHDOG_TIMEOUT_SECS, 0x10000, None);
         
         // Build DeviceSvcInfo (msg 88): [is_more, service_info_array]
         // Round 1: send devmod info
@@ -1906,8 +1923,14 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
         let device_svc_info = build_device_svc_info(false, &svc_info); // is_more = false
         debug!("    DeviceSvcInfo plaintext: {} bytes", device_svc_info.len());
         
-        // Encrypt and send
-        let nonce: [u8; 12] = [round, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
+        // Encrypt and send.
+        // The nonce must never repeat for a given session key — AES-GCM loses all
+        // integrity guarantees on nonce reuse. Carry the full round counter so it
+        // stays unique for the life of the session rather than wrapping every 256
+        // rounds as a single-byte counter would.
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&round.to_be_bytes());
+        nonce[4..].copy_from_slice(&[0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c]);
         let encrypted_msg = cose_encrypt0_a256gcm(&session_keys.sek, &nonce, &device_svc_info)?;
         
         let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_DEVICE_SVC_INFO);
@@ -1964,9 +1987,13 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
             info!("  Round {}", round);
         }
         
-        // Safety limit to prevent infinite loops
-        if round >= 100 {
-            warn!("ServiceInfo exchange exceeded 100 rounds, forcing done");
+        // Safety limit to prevent infinite loops. Must exceed the rounds a real
+        // image transfer needs: bytes / (MTU - overhead), i.e. ~420 for a 27MB
+        // UKI at a 64KB MTU, and proportionally more if the owner negotiates a
+        // smaller MTU. Kept far above that so it only trips on a genuine stall.
+        const MAX_SERVICE_INFO_ROUNDS: u32 = 100_000;
+        if round >= MAX_SERVICE_INFO_ROUNDS {
+            warn!("ServiceInfo exchange exceeded {} rounds, forcing done", MAX_SERVICE_INFO_ROUNDS);
             break;
         }
     }
