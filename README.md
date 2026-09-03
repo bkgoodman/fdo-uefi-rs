@@ -750,6 +750,73 @@ fdo-server -debug server -http 0.0.0.0:8080 -db /tmp/fdo.db -rv-bypass \
 #    (same QEMU command as DI test, using swtpm-ctrl socket)
 ```
 
+### Ubuntu UKI End-to-End Test
+
+Tests the full pipeline: FDO TO2 -> BMO inline transfer -> chainload UKI -> Linux boot.
+
+#### Prerequisites (pe2)
+
+- Ubuntu mini-ISO artifacts extracted to `/tmp/ubuntu-vmlinuz` and `/tmp/ubuntu-initrd`
+- `ukify` installed (`apt install systemd-ukify`)
+- `init-tpm.sh` run once to create device credentials
+
+#### Step 1: Build UKI
+
+```bash
+ssh pe2
+ukify build \
+  --linux /tmp/ubuntu-vmlinuz \
+  --initrd /tmp/ubuntu-initrd \
+  --cmdline 'console=ttyS0 ip=dhcp' \
+  --output /tmp/ubuntu-installer-full.efi
+
+# Copy to server directory
+cp /tmp/ubuntu-installer-full.efi /tmp/fdo-firmware-server/ubuntu-installer.efi
+```
+
+#### Step 2: Run Test
+
+```bash
+cd ~/bkgvm && bash start4.sh
+```
+
+The `start4.sh` script:
+1. Restores FDO database with matching owner key
+2. Starts swtpm with saved TPM state
+3. Imports voucher and starts FDO server with `-bmo` flag
+4. Boots QEMU with the FDO UEFI client
+
+#### Expected Output
+
+```
+TO2 Step 1 complete: HelloDeviceProbe -> HelloDeviceAck20
+TO2 Step 2 complete: ProveDevice20 -> ProveOVHdr20
+TO2 Step 3: Fetching 2 OV entries...
+TO2 Step 4 complete: SetupDevice20 received
+TO2 Step 5: ServiceInfo exchange...
+  Round 170: BMO 10927144 / 109031424 bytes (10%)
+  ...
+  Round 1670: BMO 109031424 / 109031424 bytes (100%)
+BMO: Transfer complete!
+BMO: Image ready for boot (109031424 bytes, integrity verified)
+TO2 Step 6 complete: DoneAck received
+=== TO2 Protocol Complete! ===
+Chainloading BMO image (109031424 bytes)...
+Linux version 7.0.0-14-generic ...
+```
+
+#### Architecture
+
+Three-stage FDO onboarding:
+1. **Stage 1 (UEFI client)**: fdo-uefi-rs runs FDO TO2, receives UKI via BMO inline delivery
+2. **Stage 2 (Installer)**: Ubuntu kernel+initrd boots with embedded go-fdo client
+3. **Stage 3 (OS)**: Installed system completes FDO onboarding (future)
+
+#### Two-Script Approach
+
+- **init-tpm.sh** (run once): Creates device credential and voucher via quick-di
+- **start4.sh** (run many times): Tests FDO protocol with the same credential
+
 ## Project Structure
 
 ```text

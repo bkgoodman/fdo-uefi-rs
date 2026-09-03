@@ -317,9 +317,13 @@ pub fn process_bmo_message(
                     BMO_DELIVERY_INLINE => {
                         // Mode 0: Chunked transfer over FDO channel
                         debug!("BMO: Using inline delivery mode (chunked)");
-                        session.begin = Some(begin);
                         session.state = BmoState::AwaitingData;
                         session.image_buffer.clear();
+                        // Pre-allocate if total_size known to avoid repeated reallocation
+                        if begin.total_size > 0 {
+                            session.image_buffer.reserve(begin.total_size as usize);
+                        }
+                        session.begin = Some(begin);
                         session.chunks_received = 0;
                         session.bytes_received = 0;
                     }
