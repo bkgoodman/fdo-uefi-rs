@@ -217,5 +217,46 @@ End-to-end verified flow (2026-09-03):
 UKI built with `ukify` from Ubuntu mini-ISO kernel + full initrd + custom init
 (replaces casper scripts that expected squashfs on CD-ROM).
 
-Stage 2 (not yet implemented): go-fdo-endpoint client runs inside Linux to
-receive configuration (autoinstall.yaml, ISO payload) from orchestrator via FSIMs.
+## Stage 2: go-fdo-endpoint (In Progress)
+
+After Stage 1 chainloads the UKI into Linux, Stage 2 runs a second FDO TO2
+using the **same TPM credentials** against the **same onboarding server**, but
+with a different client (go-fdo-endpoint) that advertises different FSIMs.
+
+### How It Works
+
+- Stage 1 client (fdo-uefi-rs) advertises `fdo.bmo` → server sends the UKI
+- Stage 2 client (go-fdo-endpoint) advertises `fdo.payload` + `fdo.sysconfig`
+  → server sends configuration files, certificates, installer payloads
+- Server uses `-reuse-cred` so the same device can onboard multiple times
+- TPM credentials (DCTPM at NV 0x01D10001) are shared: UEFI client wrote them
+  via TCG2 protocol, Linux client reads them via `/dev/tpmrm0`
+
+### go-fdo-endpoint Architecture
+
+YAML-driven handler system maps FSIM data to local shell commands:
+
+- **sysconfig handlers**: `hostname` → `hostnamectl set-hostname {value}`
+- **payload handlers**: MIME type → command, e.g.:
+  - `application/x-autoinstall` → `autoinstall apply {filename}`
+  - `application/x-cloud-init` → `cloud-init init --file {filename}`
+- **Variable modifiers**: `{value:lower:safe}` for sanitization/validation
+- **fdo_sys module**: Legacy Java server compat (CSR, file, exec)
+
+### Stage 2 Flow
+
+1. Linux boots from UKI (Stage 1 complete)
+2. Custom init: mount filesystems, start udevd, configure DHCP
+3. go-fdo-endpoint reads credentials from TPM (`/dev/tpmrm0`)
+4. TO1 → discover owner server (or use hardcoded RV from credential)
+5. TO2 → authenticate, exchange ServiceInfo
+6. Server sends `fdo.sysconfig` params (hostname, timezone, etc.)
+7. Server sends `fdo.payload` files (autoinstall.yaml, certs, ISO, etc.)
+8. go-fdo-endpoint runs configured handler commands for each
+9. System proceeds with OS installation / configuration
+
+### Components in Initrd
+
+- `/usr/local/bin/fdo-endpoint` — go-fdo-endpoint static binary
+- `/etc/fdo/config_generic.yaml` — handler configuration
+- Custom `/init` script that runs go-fdo-endpoint after networking
