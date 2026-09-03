@@ -10,7 +10,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::time::Duration;
-use log::{info, error, warn};
+use log::{debug, info, error, warn};
 use uefi::prelude::*;
 use uefi::boot;
 use uefi::proto::loaded_image::LoadedImage;
@@ -111,7 +111,7 @@ fn parse_args() -> FdoOptions {
     if args_str.is_empty() {
         return opts;
     }
-    info!("Command line: {}", args_str);
+    debug!("Command line: {}", args_str);
 
     // Split on whitespace and parse flags
     // Note: first token is typically the EFI app path itself, skip it
@@ -122,7 +122,7 @@ fn parse_args() -> FdoOptions {
             "-di" => {
                 if i + 1 < tokens.len() {
                     opts.di_url = Some(String::from(tokens[i + 1]));
-                    info!("CLI: DI server URL = {}", tokens[i + 1]);
+                    debug!("CLI: DI server URL = {}", tokens[i + 1]);
                     i += 2;
                 } else {
                     warn!("CLI: -di requires a URL argument");
@@ -132,7 +132,7 @@ fn parse_args() -> FdoOptions {
             "-rv" => {
                 if i + 1 < tokens.len() {
                     opts.rv_url = Some(String::from(tokens[i + 1]));
-                    info!("CLI: RV/Owner URL = {}", tokens[i + 1]);
+                    debug!("CLI: RV/Owner URL = {}", tokens[i + 1]);
                     i += 2;
                 } else {
                     warn!("CLI: -rv requires a URL argument");
@@ -149,7 +149,7 @@ fn parse_args() -> FdoOptions {
                     i += 1;
                     30
                 };
-                info!("CLI: Watchdog test mode — will arm {}s watchdog and exit", secs);
+                debug!("CLI: Watchdog test mode — will arm {}s watchdog and exit", secs);
                 opts.watchdog_test = Some(secs);
             }
             "-v" | "-verbose" => {
@@ -157,7 +157,7 @@ fn parse_args() -> FdoOptions {
                 i += 1;
             }
             "-teardown" => {
-                info!("CLI: Will tear down NICs before StartImage (diagnostic)");
+                debug!("CLI: Will tear down NICs before StartImage (diagnostic)");
                 opts.teardown = true;
                 i += 1;
             }
@@ -171,7 +171,7 @@ fn parse_args() -> FdoOptions {
                             chainload::LoadMode::Buffer
                         }
                     };
-                    info!("CLI: Chainload load mode = {:?}", opts.load_mode);
+                    debug!("CLI: Chainload load mode = {:?}", opts.load_mode);
                     i += 2;
                 } else {
                     error!("CLI: -load-mode requires buffer|file|auto");
@@ -179,14 +179,14 @@ fn parse_args() -> FdoOptions {
                 }
             }
             "-force-di" => {
-                info!("CLI: Force DI — will re-provision even if TPM credentials exist");
+                debug!("CLI: Force DI — will re-provision even if TPM credentials exist");
                 opts.force_di = true;
                 i += 1;
             }
             "-chainload" => {
                 if i + 1 < tokens.len() {
                     let path = String::from(tokens[i + 1]);
-                    info!("CLI: Chainload control test — will load {} directly", path);
+                    debug!("CLI: Chainload control test — will load {} directly", path);
                     opts.chainload_file = Some(path);
                     i += 2;
                 } else {
@@ -229,7 +229,7 @@ fn parse_args() -> FdoOptions {
                 i += 1;
             }
             _ => {
-                info!("CLI: ignoring unknown argument: {}", tokens[i]);
+                debug!("CLI: ignoring unknown argument: {}", tokens[i]);
                 i += 1;
             }
         }
@@ -306,7 +306,7 @@ fn main() -> Status {
     
     if opts.verbose {
         log::set_max_level(log::LevelFilter::Trace);
-        info!("Verbose logging enabled (-v)");
+        debug!("Verbose logging enabled (-v)");
     }
     
     // Watchdog test mode: just arm the watchdog and exit immediately.
@@ -411,9 +411,9 @@ fn main() -> Status {
         match existing {
             Some(creds) => {
                 // Credentials exist - run TO1/TO2 onboarding
-                info!("Device GUID found: {:02x?}", creds.guid);
-                info!("DeviceKeyHandle: 0x{:08x}", creds.device_key_handle);
-                info!("HMACKeyHandle: 0x{:08x}", creds.hmac_key_handle);
+                debug!("Device GUID found: {:02x?}", creds.guid);
+                debug!("DeviceKeyHandle: 0x{:08x}", creds.device_key_handle);
+                debug!("HMACKeyHandle: 0x{:08x}", creds.hmac_key_handle);
                 #[cfg(feature = "fdo-installer")]
                 run_onboarding(&creds, &opts);
                 #[cfg(not(feature = "fdo-installer"))]
@@ -470,12 +470,12 @@ fn main() -> Status {
 fn run_onboarding(creds: &tpm::FdoCredentials, opts: &FdoOptions) {
     // RV URL priority: 1) CLI -rv flag, 2) parsed from TPM credential, 3) error
     let owner_url = if let Some(ref url) = opts.rv_url {
-        info!("Using CLI-provided RV/Owner URL");
+        debug!("Using CLI-provided RV/Owner URL");
         url.clone()
     } else {
         match tpm::read_fdo_rv_info() {
             Some(url) => {
-                info!("Using RV URL from device credential");
+                debug!("Using RV URL from device credential");
                 url
             }
             None => {
@@ -486,7 +486,7 @@ fn run_onboarding(creds: &tpm::FdoCredentials, opts: &FdoOptions) {
             }
         }
     };
-    info!("Owner/RV URL: {}", owner_url);
+    debug!("Owner/RV URL: {}", owner_url);
     
     // Run TO1 protocol
     info!("");

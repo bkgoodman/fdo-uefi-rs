@@ -121,7 +121,7 @@ pub fn validate_efi_image(image_data: &[u8]) -> bool {
         return false;
     }
 
-    info!("Valid PE/COFF EFI image detected");
+    debug!("Valid PE/COFF EFI image detected");
     true
 }
 
@@ -135,7 +135,7 @@ pub fn validate_efi_image(image_data: &[u8]) -> bool {
 /// Returns Ok(()) if the image was successfully started and returned,
 /// or an error if loading/starting failed.
 pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
-    info!("Chainload: Loading {} byte image from memory...", image_data.len());
+    debug!("Chainload: Loading {} byte image from memory...", image_data.len());
 
     // Validate the image first
     if !validate_efi_image(image_data) {
@@ -176,12 +176,12 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
             0
         };
         
-        info!("Chainload: PE header at offset 0x{:x}", pe_off);
-        info!("Chainload: AddressOfEntryPoint=0x{:x}, ImageBase=0x{:x}, SizeOfImage=0x{:x}", entry, image_base, size_of_image);
-        info!("Chainload: First 16 bytes: {:02x?}", &image_data[..16]);
+        debug!("Chainload: PE header at offset 0x{:x}", pe_off);
+        debug!("Chainload: AddressOfEntryPoint=0x{:x}, ImageBase=0x{:x}, SizeOfImage=0x{:x}", entry, image_base, size_of_image);
+        debug!("Chainload: First 16 bytes: {:02x?}", &image_data[..16]);
         let mid = image_data.len() / 2;
-        info!("Chainload: Mid bytes @{}: {:02x?}", mid, &image_data[mid..core::cmp::min(mid+16, image_data.len())]);
-        info!("Chainload: Last 16 bytes: {:02x?}", &image_data[image_data.len()-16..]);
+        debug!("Chainload: Mid bytes @{}: {:02x?}", mid, &image_data[mid..core::cmp::min(mid+16, image_data.len())]);
+        debug!("Chainload: Last 16 bytes: {:02x?}", &image_data[image_data.len()-16..]);
 
         // Simple integrity checksum: sum of all bytes + XOR of all bytes
         let mut sum: u64 = 0;
@@ -190,7 +190,7 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
             sum = sum.wrapping_add(b as u64);
             xor ^= b;
         }
-        info!("Chainload: Integrity: len={} sum=0x{:x} xor=0x{:02x}", image_data.len(), sum, xor);
+        debug!("Chainload: Integrity: len={} sum=0x{:x} xor=0x{:02x}", image_data.len(), sum, xor);
         
         // Safety checks — HALT if anything looks wrong
         if entry == 0 {
@@ -224,9 +224,9 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
     // relocations for firmware to apply under EITHER source.
     let image_handle = match load_mode() {
         LoadMode::Buffer => {
-            info!("Chainload: Loading from memory buffer...");
+            debug!("Chainload: Loading from memory buffer...");
             match load_from_buffer(image_data) {
-                Ok(h) => { info!("Chainload: Memory buffer load succeeded"); h }
+                Ok(h) => { debug!("Chainload: Memory buffer load succeeded"); h }
                 Err(e) => {
                     error!("Chainload: Memory buffer load FAILED: {:?}", e.status());
                     error!("Chainload: No fallback. If this firmware genuinely cannot");
@@ -239,7 +239,7 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
             warn!("Chainload: -load-mode file — writing payload to the ESP.");
             warn!("Chainload: This is a diagnostic mode, not for production.");
             match load_via_temp_file(image_data) {
-                Ok(h) => { info!("Chainload: File load succeeded"); h }
+                Ok(h) => { debug!("Chainload: File load succeeded"); h }
                 Err(e) => {
                     error!("Chainload: File load FAILED: {:?}", e.status());
                     return Err(e);
@@ -251,7 +251,7 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
     // Get info about loaded image
     if let Ok(loaded_image) = uefi::boot::open_protocol_exclusive::<LoadedImage>(image_handle) {
         let (base, size) = loaded_image.info();
-        info!("Chainload: Image loaded at {:p}, size={}", base, size);
+        debug!("Chainload: Image loaded at {:p}, size={}", base, size);
     }
 
     // Tear down network stack before chainload.
@@ -271,12 +271,12 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
     // into a hang (instead of a clean #UD fault), firmware will auto-reboot
     // after this timeout. Saves a trip to the lab for a hard reset.
     match uefi::boot::set_watchdog_timer(60, 0x10001, None) {
-        Ok(_) => info!("Chainload: Watchdog tightened to 60s for StartImage"),
+        Ok(_) => debug!("Chainload: Watchdog tightened to 60s for StartImage"),
         Err(_) => warn!("Chainload: Could not set watchdog (continuing anyway)"),
     }
 
     // Start the image
-    info!("Chainload: Starting image...");
+    debug!("Chainload: Starting image...");
     
     let start_result = uefi::boot::start_image(image_handle);
     
@@ -296,7 +296,7 @@ pub fn chainload_image(image_data: &[u8]) -> uefi::Result<()> {
 
     match start_result {
         Ok(()) => {
-            info!("Chainload: Image returned successfully");
+            debug!("Chainload: Image returned successfully");
             Ok(())
         }
         Err(e) => {
@@ -327,7 +327,7 @@ fn teardown_network() -> alloc::vec::Vec<Handle> {
     use uefi::proto::network::snp::SimpleNetwork;
     use uefi::Identify;
 
-    info!("Chainload: Tearing down network stack before StartImage...");
+    debug!("Chainload: Tearing down network stack before StartImage...");
 
     // Find all SNP handles
     let snp_handles = match uefi::boot::locate_handle_buffer(
@@ -335,18 +335,18 @@ fn teardown_network() -> alloc::vec::Vec<Handle> {
     ) {
         Ok(h) => h,
         Err(_) => {
-            info!("Chainload: No SNP handles found, nothing to tear down");
+            debug!("Chainload: No SNP handles found, nothing to tear down");
             return alloc::vec::Vec::new();
         }
     };
 
-    info!("Chainload: Disconnecting {} network controller(s)...", snp_handles.len());
+    debug!("Chainload: Disconnecting {} network controller(s)...", snp_handles.len());
 
     for (idx, &handle) in snp_handles.iter().enumerate() {
         // DisconnectController with NULL driver handle disconnects ALL drivers
         // from this controller, which tears down IP4, TCP4, ARP, DHCP, etc.
         match uefi::boot::disconnect_controller(handle, None, None) {
-            Ok(_) => info!("Chainload: NIC #{} disconnected", idx),
+            Ok(_) => debug!("Chainload: NIC #{} disconnected", idx),
             Err(e) => {
                 // NOT_FOUND just means no drivers were connected — that's fine
                 if e.status() != uefi::Status::NOT_FOUND {
@@ -356,7 +356,7 @@ fn teardown_network() -> alloc::vec::Vec<Handle> {
         }
     }
 
-    info!("Chainload: Network teardown complete");
+    debug!("Chainload: Network teardown complete");
     snp_handles.iter().copied().collect()
 }
 
@@ -380,7 +380,7 @@ fn reconnect_network(handles: &[Handle]) {
             }
         }
     }
-    info!("Chainload: Reconnected {}/{} NIC(s) after StartImage", handles.len() - failed, handles.len());
+    debug!("Chainload: Reconnected {}/{} NIC(s) after StartImage", handles.len() - failed, handles.len());
 }
 
 /// Load image by writing to a temp file and loading via FromDevicePath.
@@ -392,7 +392,7 @@ fn reconnect_network(handles: &[Handle]) {
 fn load_via_temp_file(image_data: &[u8]) -> uefi::Result<Handle> {
     use uefi::proto::device_path::DevicePath;
     
-    info!("Chainload: Writing {} bytes to temp file...", image_data.len());
+    debug!("Chainload: Writing {} bytes to temp file...", image_data.len());
     
     // Get the loaded image protocol to find our device
     let loaded_image = uefi::boot::open_protocol_exclusive::<LoadedImage>(
@@ -401,7 +401,7 @@ fn load_via_temp_file(image_data: &[u8]) -> uefi::Result<Handle> {
     
     let device_handle = loaded_image.device()
         .ok_or(uefi::Status::NOT_FOUND)?;
-    info!("Chainload: Parent device handle: {:?}", device_handle);
+    debug!("Chainload: Parent device handle: {:?}", device_handle);
     
     // Get file system from parent's device
     let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(device_handle)?;
@@ -433,7 +433,7 @@ fn load_via_temp_file(image_data: &[u8]) -> uefi::Result<Handle> {
     // Drop LoadedImage too — we're done with it
     drop(loaded_image);
     
-    info!("Chainload: Written to \\EFI\\BOOT\\temp_bmo.efi, constructing device path...");
+    debug!("Chainload: Written to \\EFI\\BOOT\\temp_bmo.efi, constructing device path...");
     
     // Build a full device path: device_path + FilePath("\EFI\BOOT\temp_bmo.efi") + End
     // This is what makes LoadImage apply proper PE relocations.
@@ -454,7 +454,7 @@ fn load_via_temp_file(image_data: &[u8]) -> uefi::Result<Handle> {
         dev_path_prefix.extend_from_slice(node_bytes);
     }
     
-    info!("Chainload: Device path prefix: {} bytes", dev_path_prefix.len());
+    debug!("Chainload: Device path prefix: {} bytes", dev_path_prefix.len());
     // Drop the protocol reference before calling load_image
     drop(dev_path);
     
@@ -484,7 +484,7 @@ fn load_via_temp_file(image_data: &[u8]) -> uefi::Result<Handle> {
     full_path.push(0xFF);
     full_path.extend_from_slice(&4u16.to_le_bytes());
     
-    info!("Chainload: Full device path: {} bytes (loading via FromDevicePath)", full_path.len());
+    debug!("Chainload: Full device path: {} bytes (loading via FromDevicePath)", full_path.len());
     
     // Interpret the raw bytes as a DevicePath
     let constructed_dp: &DevicePath = <&DevicePath>::try_from(full_path.as_slice())
@@ -504,14 +504,14 @@ fn load_via_temp_file(image_data: &[u8]) -> uefi::Result<Handle> {
 
 /// Test chainload functionality with a simple test image
 pub fn test_chainload() {
-    info!("=== Chainload Test ===");
-    info!("Note: This test only validates PE header checking.");
-    info!("Actual chainload requires a valid EFI binary.");
+    debug!("=== Chainload Test ===");
+    debug!("Note: This test only validates PE header checking.");
+    debug!("Actual chainload requires a valid EFI binary.");
     
     // Test with invalid data
     let invalid_data = [0u8; 100];
     if !validate_efi_image(&invalid_data) {
-        info!("Correctly rejected invalid image");
+        debug!("Correctly rejected invalid image");
     }
     
     // Test with fake MZ header but no PE
@@ -520,8 +520,8 @@ pub fn test_chainload() {
     fake_mz[1] = b'Z';
     fake_mz[0x3C] = 0x40; // PE offset = 0x40
     if !validate_efi_image(&fake_mz) {
-        info!("Correctly rejected MZ without PE signature");
+        debug!("Correctly rejected MZ without PE signature");
     }
     
-    info!("Chainload validation tests passed");
+    debug!("Chainload validation tests passed");
 }

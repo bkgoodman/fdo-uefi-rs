@@ -301,7 +301,7 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
         warn!("Network configuration failed, trying HTTP anyway...");
     }
     
-    info!("HTTP POST to: {} (body: {} bytes)", url, body.len());
+    debug!("HTTP POST to: {} (body: {} bytes)", url, body.len());
     debug!("Body hex: {:02x?}", &body[..body.len().min(32)]);
     
     // Get HTTP Service Binding and create child
@@ -695,7 +695,7 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
             }
             idle = 0;
             if drain_calls <= 6 {
-                info!("  drain call {}: asked {} at off {}, got {}", drain_calls, want, total, got);
+                debug!("  drain call {}: asked {} at off {}, got {}", drain_calls, want, total, got);
             }
             total += got;
         }
@@ -710,12 +710,12 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     } else {
         debug!("HTTP rx: {} bytes, no Content-Length header", total);
     }
-    info!("HTTP rx cost: {} bytes | first call {} | Content-Length {:?} | {} drain calls | {} idle waits",
+    debug!("HTTP rx cost: {} bytes | first call {} | Content-Length {:?} | {} drain calls | {} idle waits",
           total, body_len, content_length, drain_calls, idle_waits);
     if drain_calls > 0 && total > body_len + 8 && body_len >= 8 {
         // If the driver restarted the body instead of continuing, the COSE prefix
         // seen at offset 0 will reappear at the drain boundary.
-        info!("  boundary: head {:02x?} | at off {} {:02x?} | tail {:02x?}",
+        debug!("  boundary: head {:02x?} | at off {} {:02x?} | tail {:02x?}",
               &rx_body[..8], body_len, &rx_body[body_len..body_len + 8],
               &rx_body[total - 8..total]);
     }
@@ -789,26 +789,26 @@ fn extract_authorization_header(headers: &[u8]) -> Option<String> {
 
 /// Test HTTP functionality
 pub fn test_http() {
-    info!("Looking for HTTP-capable NICs...");
+    debug!("Looking for HTTP-capable NICs...");
     
     match find_http_nic() {
         Some(handle) => {
-            info!("Found HTTP NIC: {:?}", handle);
+            debug!("Found HTTP NIC: {:?}", handle);
             
-            info!("Attempting HTTP GET: {}", TEST_URL);
+            debug!("Attempting HTTP GET: {}", TEST_URL);
             match http_get(TEST_URL) {
                 Some(body) => {
-                    info!("HTTP GET succeeded!");
-                    info!("Body length: {} bytes", body.len());
+                    debug!("HTTP GET succeeded!");
+                    debug!("Body length: {} bytes", body.len());
                     
                     // Try to print as string if it looks like text
                     if body.len() < 256 && body.iter().all(|&b| b.is_ascii()) {
                         if let Ok(text) = core::str::from_utf8(&body) {
-                            info!("Body text: {}", text);
+                            debug!("Body text: {}", text);
                         }
                     } else {
                         let preview: Vec<u8> = body.iter().take(64).cloned().collect();
-                        info!("Body preview: {:02x?}", preview);
+                        debug!("Body preview: {:02x?}", preview);
                     }
                 }
                 None => {

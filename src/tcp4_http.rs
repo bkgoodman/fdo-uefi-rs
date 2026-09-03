@@ -757,7 +757,7 @@ pub fn tcp4_http_get(url: &str) -> Option<Vec<u8>> {
     let (ip, port, path) = parse_url(url)?;
     let hostname = url.split('/').nth(2).unwrap_or("localhost");
 
-    info!("TCP4 HTTP GET {}.{}.{}.{}:{}{}", ip[0], ip[1], ip[2], ip[3], port, path);
+    debug!("TCP4 HTTP GET {}.{}.{}.{}:{}{}", ip[0], ip[1], ip[2], ip[3], port, path);
 
     let sb_handles = find_tcp4_service_bindings();
     if sb_handles.is_empty() {

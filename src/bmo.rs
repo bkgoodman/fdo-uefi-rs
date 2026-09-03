@@ -306,17 +306,17 @@ pub fn process_bmo_message(
         BMO_KEY_IMAGE_BEGIN => {
             // Parse the image-begin message
             if let Some(mut begin) = parse_bmo_image_begin(value) {
-                info!("BMO: Received image-begin");
-                info!("  image_type: {:?}", begin.image_type);
-                info!("  delivery_mode: {}", begin.delivery_mode);
-                info!("  total_size: {}", begin.total_size);
-                info!("  require_ack: {}", begin.require_ack);
+                debug!("BMO: Received image-begin");
+                debug!("  image_type: {:?}", begin.image_type);
+                debug!("  delivery_mode: {}", begin.delivery_mode);
+                debug!("  total_size: {}", begin.total_size);
+                debug!("  require_ack: {}", begin.require_ack);
                 
                 // Handle delivery mode
                 match begin.delivery_mode {
                     BMO_DELIVERY_INLINE => {
                         // Mode 0: Chunked transfer over FDO channel
-                        info!("BMO: Using inline delivery mode (chunked)");
+                        debug!("BMO: Using inline delivery mode (chunked)");
                         session.begin = Some(begin);
                         session.state = BmoState::AwaitingData;
                         session.image_buffer.clear();
@@ -325,12 +325,12 @@ pub fn process_bmo_message(
                     }
                     BMO_DELIVERY_URL => {
                         // Mode 1: Device fetches from URL
-                        info!("BMO: Using URL delivery mode");
+                        debug!("BMO: Using URL delivery mode");
                         if let Some(url) = &begin.url {
-                            info!("BMO: Fetching image from URL: {}", url);
+                            debug!("BMO: Fetching image from URL: {}", url);
                             match process_bmo_url_delivery(session, &mut begin) {
                                 Ok(()) => {
-                                    info!("BMO: URL fetch successful, {} bytes received", session.image_buffer.len());
+                                    debug!("BMO: URL fetch successful, {} bytes received", session.image_buffer.len());
                                     session.begin = Some(begin);
                                     session.state = BmoState::Complete;
                                     // Send success result immediately
@@ -423,8 +423,8 @@ pub fn process_bmo_message(
             }
             
             info!("BMO: Transfer complete!");
-            info!("  Total chunks: {}", session.chunks_received);
-            info!("  Total bytes: {}", session.bytes_received);
+            debug!("  Total chunks: {}", session.chunks_received);
+            debug!("  Total bytes: {}", session.bytes_received);
             
             // Verify size if specified
             if let Some(ref begin) = session.begin {
@@ -447,7 +447,7 @@ pub fn process_bmo_message(
                 let computed = hasher.finalize();
                 let computed_bytes = computed.as_slice();
                 
-                info!("BMO: SHA256 verification:");
+                debug!("BMO: SHA256 verification:");
                 debug!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
                 debug!("  Computed: {:02x?}", &computed_bytes[..16]);
                 
@@ -458,7 +458,7 @@ pub fn process_bmo_message(
                     let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("SHA256 hash mismatch"));
                     return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
                 }
-                info!("BMO: SHA256 verified OK");
+                debug!("BMO: SHA256 verified OK");
             } else {
                 warn!("BMO: No SHA256 hash in image-end message — cannot verify integrity");
                 warn!("BMO: Proceeding without hash verification (server should send hash)");
@@ -474,7 +474,7 @@ pub fn process_bmo_message(
         
         BMO_KEY_SET => {
             // BIOS parameter setting
-            info!("BMO: Received set message ({} bytes)", value.len());
+            debug!("BMO: Received set message ({} bytes)", value.len());
             // TODO: Parse and handle BIOS parameters
             None
         }
@@ -498,12 +498,12 @@ fn process_bmo_url_delivery(session: &mut BmoSession, begin: &mut BmoImageBegin)
         }
     };
     
-    info!("BMO: Fetching image from URL: {}", url);
+    debug!("BMO: Fetching image from URL: {}", url);
     
     // Fetch the image from the URL
     let image_data = match crate::http_api::http_get(url) {
         Some(data) => {
-            info!("BMO: Downloaded {} bytes from URL", data.len());
+            debug!("BMO: Downloaded {} bytes from URL", data.len());
             data
         }
         None => {
@@ -526,7 +526,7 @@ fn process_bmo_url_delivery(session: &mut BmoSession, begin: &mut BmoImageBegin)
         let computed = hasher.finalize();
         let computed_bytes = computed.as_slice();
         
-        info!("BMO: SHA256 verification (URL mode):");
+        debug!("BMO: SHA256 verification (URL mode):");
         debug!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
         debug!("  Computed: {:02x?}", &computed_bytes[..16]);
         
@@ -535,7 +535,7 @@ fn process_bmo_url_delivery(session: &mut BmoSession, begin: &mut BmoImageBegin)
             error!("BMO: REFUSING to chainload — data integrity check FAILED.");
             return Err(BMO_ERROR_HASH_MISMATCH);
         }
-        info!("BMO: SHA256 verified OK");
+        debug!("BMO: SHA256 verified OK");
     } else {
         warn!("BMO: No expected hash provided for URL delivery — cannot verify integrity");
         warn!("BMO: Proceeding without hash verification (server should provide hash)");
@@ -601,18 +601,18 @@ fn parse_image_end_hash(data: &[u8]) -> Option<Vec<u8>> {
 /// Test BMO state machine with mock data
 /// This can be called to verify BMO handling without a real server
 pub fn test_bmo_handling() {
-    info!("=== BMO Test: Starting mock BMO message test ===");
+    debug!("=== BMO Test: Starting mock BMO message test ===");
     
     let mut session = BmoSession::new();
     
     // Simulate fdo.bmo:active
-    info!("Test 1: Processing fdo.bmo:active");
+    debug!("Test 1: Processing fdo.bmo:active");
     let active_value = alloc::vec![0xf5]; // CBOR true
     let result = process_bmo_message(&mut session, "fdo.bmo:active", &active_value);
-    info!("  Result: {:?}", result.is_some());
+    debug!("  Result: {:?}", result.is_some());
     
     // Simulate fdo.bmo:image-begin with inline delivery
-    info!("Test 2: Processing fdo.bmo:image-begin");
+    debug!("Test 2: Processing fdo.bmo:image-begin");
     let mut begin_msg = Vec::new();
     // CBOR map: {-1: "application/x-uefi-image", -6: 0, 0: 100}
     // Key 0 = total_size (generic chunking), Key -1 = image_type, Key -6 = delivery_mode
@@ -626,26 +626,26 @@ pub fn test_bmo_handling() {
     begin_msg.push(0x64); // 100 bytes
     
     let result = process_bmo_message(&mut session, BMO_KEY_IMAGE_BEGIN, &begin_msg);
-    info!("  Result: {:?}", result.is_some());
-    info!("  State: {:?}", session.state);
+    debug!("  Result: {:?}", result.is_some());
+    debug!("  State: {:?}", session.state);
     
     // Simulate image data chunks
-    info!("Test 3: Processing fdo.bmo:image-data chunks");
+    debug!("Test 3: Processing fdo.bmo:image-data chunks");
     let chunk_data: Vec<u8> = (0u8..50).collect();
     let result = process_bmo_message(&mut session, "fdo.bmo:image-data-0", &chunk_data);
-    info!("  Chunk 0 result: {:?}, bytes_received: {}", result.is_some(), session.bytes_received);
+    debug!("  Chunk 0 result: {:?}, bytes_received: {}", result.is_some(), session.bytes_received);
     
     let chunk_data: Vec<u8> = (50u8..100).collect();
     let result = process_bmo_message(&mut session, "fdo.bmo:image-data-1", &chunk_data);
-    info!("  Chunk 1 result: {:?}, bytes_received: {}", result.is_some(), session.bytes_received);
+    debug!("  Chunk 1 result: {:?}, bytes_received: {}", result.is_some(), session.bytes_received);
     
     // Simulate image-end
-    info!("Test 4: Processing fdo.bmo:image-end");
+    debug!("Test 4: Processing fdo.bmo:image-end");
     let end_msg = alloc::vec![0xf6]; // CBOR null
     let result = process_bmo_message(&mut session, BMO_KEY_IMAGE_END, &end_msg);
-    info!("  Result: {:?}", result.is_some());
-    info!("  Final state: {:?}", session.state);
-    info!("  Image buffer size: {} bytes", session.image_buffer.len());
+    debug!("  Result: {:?}", result.is_some());
+    debug!("  Final state: {:?}", session.state);
+    debug!("  Image buffer size: {} bytes", session.image_buffer.len());
     
-    info!("=== BMO Test: Complete ===");
+    debug!("=== BMO Test: Complete ===");
 }

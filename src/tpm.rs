@@ -585,7 +585,7 @@ pub fn tpm_create_ecdh_key() -> Option<TpmEcdhKeyPair> {
     let cmd = build_create_primary_ecdh_cmd();
     let mut response = vec![0u8; 1024];
     
-    info!("TPM: Creating ECDH key...");
+    debug!("TPM: Creating ECDH key...");
     let result = tcg.submit_command(&cmd, &mut response);
     
     if result.is_err() {
@@ -594,9 +594,9 @@ pub fn tpm_create_ecdh_key() -> Option<TpmEcdhKeyPair> {
     }
     
     let key_pair = parse_create_primary_response(&response)?;
-    info!("TPM: ECDH key created, handle=0x{:08x}", key_pair.handle);
-    info!("TPM: Public X: {} bytes", key_pair.public_x.len());
-    info!("TPM: Public Y: {} bytes", key_pair.public_y.len());
+    debug!("TPM: ECDH key created, handle=0x{:08x}", key_pair.handle);
+    debug!("TPM: Public X: {} bytes", key_pair.public_x.len());
+    debug!("TPM: Public Y: {} bytes", key_pair.public_y.len());
     
     Some(key_pair)
 }
@@ -609,7 +609,7 @@ pub fn tpm_ecdh_compute_secret(key_handle: u32, peer_x: &[u8], peer_y: &[u8]) ->
     let cmd = build_ecdh_zgen_cmd(key_handle, peer_x, peer_y);
     let mut response = vec![0u8; 512];
     
-    info!("TPM: Computing ECDH shared secret...");
+    debug!("TPM: Computing ECDH shared secret...");
     let result = tcg.submit_command(&cmd, &mut response);
     
     if result.is_err() {
@@ -618,7 +618,7 @@ pub fn tpm_ecdh_compute_secret(key_handle: u32, peer_x: &[u8], peer_y: &[u8]) ->
     }
     
     let secret = parse_ecdh_zgen_response(&response)?;
-    info!("TPM: Shared secret computed: {} bytes", secret.len());
+    debug!("TPM: Shared secret computed: {} bytes", secret.len());
     
     Some(secret)
 }
@@ -627,7 +627,7 @@ pub fn tpm_ecdh_compute_secret(key_handle: u32, peer_x: &[u8], peer_y: &[u8]) ->
 /// FDO ECDH format: [2-byte xLen][x][2-byte yLen][y][2-byte randLen][rand]
 /// For P-256: 2+32+2+32+2+16 = 86 bytes
 pub fn tpm_ecdh_derive(key_handle: u32, peer_key_fdo: &[u8]) -> Option<Vec<u8>> {
-    info!("TPM ECDH: parsing peer key, {} bytes", peer_key_fdo.len());
+    debug!("TPM ECDH: parsing peer key, {} bytes", peer_key_fdo.len());
     debug!("TPM ECDH: first 16 bytes: {:02x?}", &peer_key_fdo[..peer_key_fdo.len().min(16)]);
     
     // FDO ECDH format: [2-byte xLen][x][2-byte yLen][y][2-byte randLen][rand]
@@ -641,7 +641,7 @@ pub fn tpm_ecdh_derive(key_handle: u32, peer_key_fdo: &[u8]) -> Option<Vec<u8>> 
     // Read x length (big-endian u16)
     let x_len = ((peer_key_fdo[pos] as usize) << 8) | (peer_key_fdo[pos + 1] as usize);
     pos += 2;
-    info!("TPM ECDH: x_len = {}", x_len);
+    debug!("TPM ECDH: x_len = {}", x_len);
     
     if peer_key_fdo.len() < pos + x_len + 4 {
         warn!("Peer key too short for x coordinate");
@@ -654,7 +654,7 @@ pub fn tpm_ecdh_derive(key_handle: u32, peer_key_fdo: &[u8]) -> Option<Vec<u8>> 
     // Read y length (big-endian u16)
     let y_len = ((peer_key_fdo[pos] as usize) << 8) | (peer_key_fdo[pos + 1] as usize);
     pos += 2;
-    info!("TPM ECDH: y_len = {}", y_len);
+    debug!("TPM ECDH: y_len = {}", y_len);
     
     if peer_key_fdo.len() < pos + y_len {
         warn!("Peer key too short for y coordinate");
@@ -676,7 +676,7 @@ pub fn tpm_flush_context(handle: u32) {
             let cmd = build_flush_context_cmd(handle);
             let mut response = vec![0u8; 32];
             let _ = tcg.submit_command(&cmd, &mut response);
-            info!("TPM: Flushed handle 0x{:08x}", handle);
+            debug!("TPM: Flushed handle 0x{:08x}", handle);
         }
     }
 }
@@ -699,7 +699,7 @@ pub fn tpm_read_public(handle: u32) -> Option<(Vec<u8>, Vec<u8>)> {
     pack_u32(&mut cmd[10..14], handle);
     
     let mut response = vec![0u8; 512];
-    info!("TPM: ReadPublic on handle 0x{:08x}...", handle);
+    debug!("TPM: ReadPublic on handle 0x{:08x}...", handle);
     if tcg.submit_command(&cmd, &mut response).is_err() {
         warn!("TPM: ReadPublic submit failed for 0x{:08x}", handle);
         return None;
@@ -770,7 +770,7 @@ pub fn tpm_read_public(handle: u32) -> Option<(Vec<u8>, Vec<u8>)> {
     if pos + y_size > pub_start + pub_size { return None; }
     let y = response[pos..pos+y_size].to_vec();
     
-    info!("TPM: ReadPublic 0x{:08x}: x={} bytes, y={} bytes", handle, x.len(), y.len());
+    debug!("TPM: ReadPublic 0x{:08x}: x={} bytes, y={} bytes", handle, x.len(), y.len());
     Some((x, y))
 }
 
@@ -834,7 +834,7 @@ pub fn tpm_sign_with_persistent(persistent_handle: u32, digest: &[u8; 32]) -> Op
     let mut response = vec![0u8; 512];
     for attempt in 0..5 {
         response = vec![0u8; 512];
-        info!("TPM: Signing with persistent handle 0x{:08x} (attempt {})...", persistent_handle, attempt);
+        debug!("TPM: Signing with persistent handle 0x{:08x} (attempt {})...", persistent_handle, attempt);
         let result = tcg.submit_command(&cmd, &mut response);
         
         if result.is_err() {
@@ -845,7 +845,7 @@ pub fn tpm_sign_with_persistent(persistent_handle: u32, digest: &[u8; 32]) -> Op
         
         let rc = unpack_u32(&response[6..10]);
         if rc == 0x922 {
-            info!("TPM2_Sign got TPM_RC_RETRY (0x922), retrying... (attempt {})", attempt);
+            debug!("TPM2_Sign got TPM_RC_RETRY (0x922), retrying... (attempt {})", attempt);
             boot::stall(core::time::Duration::from_millis(200));
             continue;
         }
@@ -863,7 +863,7 @@ pub fn tpm_sign_with_persistent(persistent_handle: u32, digest: &[u8; 32]) -> Op
     }
     
     let (r, s) = parse_sign_response(&response)?;
-    info!("TPM: Signature obtained: r={} bytes, s={} bytes", r.len(), s.len());
+    debug!("TPM: Signature obtained: r={} bytes, s={} bytes", r.len(), s.len());
     
     // Pad r and s to 32 bytes each (P-256 signature)
     let mut r_padded = [0u8; 32];
@@ -879,7 +879,7 @@ pub fn tpm_sign_with_persistent(persistent_handle: u32, digest: &[u8; 32]) -> Op
     
     // Low-S normalization: if s > N/2, replace s with N - s
     if compare_bytes(&s_padded, &P256_HALF_ORDER) == core::cmp::Ordering::Greater {
-        info!("TPM: Applying low-S normalization");
+        debug!("TPM: Applying low-S normalization");
         s_padded = subtract_bytes(&P256_ORDER, &s_padded);
     }
     
@@ -892,7 +892,7 @@ pub fn tpm_sign_with_persistent(persistent_handle: u32, digest: &[u8; 32]) -> Op
 
 /// Read data from TPM NV index
 pub fn tpm_nv_read(nv_index: u32) -> Option<Vec<u8>> {
-    info!("tpm_nv_read: reading index 0x{:08x}", nv_index);
+    debug!("tpm_nv_read: reading index 0x{:08x}", nv_index);
     // Get TCG2 protocol
     let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
@@ -909,14 +909,14 @@ pub fn tpm_nv_read(nv_index: u32) -> Option<Vec<u8>> {
     }
     
     let rc = unpack_u32(&response[6..10]);
-    info!("NV_ReadPublic response: rc=0x{:08x} for index 0x{:08x}", rc, nv_index);
+    debug!("NV_ReadPublic response: rc=0x{:08x} for index 0x{:08x}", rc, nv_index);
     if rc != 0 {
-        info!("NV index 0x{:08x} does not exist (rc=0x{:08x})", nv_index, rc);
+        debug!("NV index 0x{:08x} does not exist (rc=0x{:08x})", nv_index, rc);
         return None;
     }
     
     let data_size = parse_nv_read_public_response(&response)?;
-    info!("NV index 0x{:08x} size: {} bytes", nv_index, data_size);
+    debug!("NV index 0x{:08x} size: {} bytes", nv_index, data_size);
     
     // Now read the actual data
     let read_cmd = build_nv_read_cmd(nv_index, data_size, 0);
@@ -1097,11 +1097,11 @@ fn read_cbor_bstr<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
 ///   0: Magic, 1: Active, 2: Version, 3: DeviceInfo, 4: GUID,
 ///   5: RvInfo, 6: PubKeyHash, 7: KeyType, 8: DeviceKeyHandle, 9: HMACKeyHandle
 pub fn read_fdo_credentials() -> Option<FdoCredentials> {
-    info!("Checking TPM NV for DCTPM at index 0x{:08x}...", FDO_NV_INDEX_ALT);
+    debug!("Checking TPM NV for DCTPM at index 0x{:08x}...", FDO_NV_INDEX_ALT);
     let data = match tpm_nv_read(FDO_NV_INDEX_ALT) {
         Some(d) => d,
         None => {
-            info!("No DCTPM found in NV (index 0x{:08x} not defined or empty)", FDO_NV_INDEX_ALT);
+            debug!("No DCTPM found in NV (index 0x{:08x} not defined or empty)", FDO_NV_INDEX_ALT);
             return None;
         }
     };
@@ -1132,7 +1132,7 @@ pub fn read_fdo_credentials() -> Option<FdoCredentials> {
     
     if major == 4 {
         // CBOR array — fields at fixed indices
-        info!("DCTPM: CBOR array with {} items", num_items);
+        debug!("DCTPM: CBOR array with {} items", num_items);
         if num_items < 10 {
             warn!("DCTPM: array needs >= 10 items (has {}), missing key handles", num_items);
             return None;
@@ -1166,16 +1166,16 @@ pub fn read_fdo_credentials() -> Option<FdoCredentials> {
         
         // Item 8: DeviceKeyHandle (uint32)
         let device_key_handle = read_cbor_uint(&data, &mut pos)?;
-        info!("DCTPM: DeviceKeyHandle: 0x{:08x}", device_key_handle);
+        debug!("DCTPM: DeviceKeyHandle: 0x{:08x}", device_key_handle);
         
         // Item 9: HMACKeyHandle (uint32)
         let hmac_key_handle = read_cbor_uint(&data, &mut pos)?;
-        info!("DCTPM: HMACKeyHandle: 0x{:08x}", hmac_key_handle);
+        debug!("DCTPM: HMACKeyHandle: 0x{:08x}", hmac_key_handle);
         
         return Some(FdoCredentials { guid, device_key_handle, hmac_key_handle });
     } else if major == 5 {
         // CBOR map — find keys 4, 8, 9
-        info!("DCTPM: CBOR map with {} pairs", num_items);
+        debug!("DCTPM: CBOR map with {} pairs", num_items);
         let mut guid: Option<[u8; 16]> = None;
         let mut device_key_handle: Option<u32> = None;
         let mut hmac_key_handle: Option<u32> = None;
@@ -1219,13 +1219,13 @@ pub fn read_fdo_credentials() -> Option<FdoCredentials> {
                 8 => {
                     // DeviceKeyHandle (uint32)
                     let h = read_cbor_uint(&data, &mut pos)?;
-                    info!("DCTPM: DeviceKeyHandle: 0x{:08x}", h);
+                    debug!("DCTPM: DeviceKeyHandle: 0x{:08x}", h);
                     device_key_handle = Some(h);
                 }
                 9 => {
                     // HMACKeyHandle (uint32)
                     let h = read_cbor_uint(&data, &mut pos)?;
-                    info!("DCTPM: HMACKeyHandle: 0x{:08x}", h);
+                    debug!("DCTPM: HMACKeyHandle: 0x{:08x}", h);
                     hmac_key_handle = Some(h);
                 }
                 _ => {
@@ -1287,11 +1287,11 @@ pub fn read_fdo_rv_info() -> Option<alloc::string::String> {
     let data = match tpm_nv_read(FDO_NV_INDEX_ALT) {
         Some(d) => d,
         None => {
-            info!("RV: No DCTPM found in NV");
+            debug!("RV: No DCTPM found in NV");
             return None;
         }
     };
-    info!("RV: DCTPM data: {} bytes", data.len());
+    debug!("RV: DCTPM data: {} bytes", data.len());
 
     if data.is_empty() {
         return None;
@@ -1317,7 +1317,7 @@ pub fn read_fdo_rv_info() -> Option<alloc::string::String> {
 
     if major == 4 {
         // CBOR array — RvInfo is at index 5
-        info!("RV: CBOR array with {} items", num_items);
+        debug!("RV: CBOR array with {} items", num_items);
         if num_items < 6 {
             warn!("RV: array too short for RvInfo at index 5");
             return None;
@@ -1333,7 +1333,7 @@ pub fn read_fdo_rv_info() -> Option<alloc::string::String> {
         return parse_rv_info_at(&data, &mut pos);
     } else if major == 5 {
         // CBOR map — find key 5
-        info!("RV: CBOR map with {} pairs", num_items);
+        debug!("RV: CBOR map with {} pairs", num_items);
         for _ in 0..num_items {
             if pos >= data.len() {
                 break;
@@ -1390,7 +1390,7 @@ fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::Strin
     let (rv_data, mut inner_pos) = if outer_major == 2 {
         // bstr-wrapped: read the byte string, then parse its contents
         let bstr = read_cbor_bstr(data, pos)?;
-        info!("RV: RvInfo is bstr-wrapped ({} bytes), unwrapping...", bstr.len());
+        debug!("RV: RvInfo is bstr-wrapped ({} bytes), unwrapping...", bstr.len());
         (bstr.to_vec(), 0usize)
     } else {
         // Direct array — copy and use from current position
@@ -1409,7 +1409,7 @@ fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::Strin
     // Update pos to point past the bstr (for bstr case, already done by read_cbor_bstr)
     // For the direct case, we'll update pos at the end via inner_pos.
     let pos = &mut inner_pos;
-    info!("RV: RvInfo has {} directive(s)", outer_len);
+    debug!("RV: RvInfo has {} directive(s)", outer_len);
 
     for dir_idx in 0..outer_len {
         // Each directive is an array of RvInstructions
@@ -1464,7 +1464,7 @@ fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::Strin
 
             // Read value (byte string — CBOR-encoded content)
             let value_bytes = read_cbor_bstr(rv_ref, pos);
-            info!("RV: instruction var_id={}, value={:?}", var_id,
+            debug!("RV: instruction var_id={}, value={:?}", var_id,
                   value_bytes.as_ref().map(|v| &v[..core::cmp::min(v.len(), 20)]));
 
             // Skip any extra fields beyond the first 2
@@ -1481,7 +1481,7 @@ fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::Strin
                 RV_DNS => {
                     // Value is CBOR text string
                     if let Some(s) = decode_cbor_text(&value_bytes) {
-                        info!("RV: DNS = {}", s);
+                        debug!("RV: DNS = {}", s);
                         dns_name = Some(s);
                     }
                 }
@@ -1493,27 +1493,27 @@ fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::Strin
                         let mut ip = [0u8; 4];
                         if ip_bytes.len() == 4 {
                             ip.copy_from_slice(&ip_bytes);
-                            info!("RV: IP = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                            debug!("RV: IP = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
                             ip_addr = Some(ip);
                         } else if ip_bytes.len() == 16 {
                             // IPv4-mapped IPv6: last 4 bytes are IPv4
                             ip.copy_from_slice(&ip_bytes[12..16]);
-                            info!("RV: IP (v4-mapped) = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                            debug!("RV: IP (v4-mapped) = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
                             ip_addr = Some(ip);
                         } else if ip_bytes.len() == 5 {
                             // Family byte + IPv4
                             ip.copy_from_slice(&ip_bytes[1..5]);
-                            info!("RV: IP = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                            debug!("RV: IP = {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
                             ip_addr = Some(ip);
                         } else {
-                            info!("RV: IP address has unexpected length {}", ip_bytes.len());
+                            debug!("RV: IP address has unexpected length {}", ip_bytes.len());
                         }
                     }
                 }
                 RV_DEV_PORT => {
                     // Value is CBOR uint16
                     if let Some(p) = decode_cbor_uint(&value_bytes) {
-                        info!("RV: DevPort = {}", p);
+                        debug!("RV: DevPort = {}", p);
                         port = p as u16;
                     }
                 }
@@ -1523,7 +1523,7 @@ fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::Strin
                         match p as u8 {
                             RV_PROT_HTTP => scheme = "http",
                             RV_PROT_HTTPS => scheme = "https",
-                            other => info!("RV: unsupported protocol {}", other),
+                            other => debug!("RV: unsupported protocol {}", other),
                         }
                     }
                 }
@@ -1536,12 +1536,12 @@ fn parse_rv_info_at(data: &[u8], pos: &mut usize) -> Option<alloc::string::Strin
         // Build URL from parsed directive
         if let Some(ref dns) = dns_name {
             let url = format!("{}://{}:{}", scheme, dns, port);
-            info!("RV: Resolved URL: {}", url);
+            debug!("RV: Resolved URL: {}", url);
             return Some(url);
         }
         if let Some(ip) = ip_addr {
             let url = format!("{}://{}.{}.{}.{}:{}", scheme, ip[0], ip[1], ip[2], ip[3], port);
-            info!("RV: Resolved URL: {}", url);
+            debug!("RV: Resolved URL: {}", url);
             return Some(url);
         }
     }
@@ -1638,20 +1638,20 @@ pub fn tpm_is_present() -> bool {
 
 /// Test TPM functionality
 pub fn test_tpm() {
-    info!("Looking for TCG2 protocol...");
+    debug!("Looking for TCG2 protocol...");
     
     match boot::get_handle_for_protocol::<Tcg>() {
         Ok(handle) => {
-            info!("TCG2 protocol found!");
+            debug!("TCG2 protocol found!");
             
             match boot::open_protocol_exclusive::<Tcg>(handle) {
                 Ok(mut tcg) => {
                     // Get capability
                     match tcg.get_capability() {
                         Ok(cap) => {
-                            info!("TPM Manufacturer ID: 0x{:08x}", cap.manufacturer_id);
-                            info!("Max command size: {}", cap.max_command_size);
-                            info!("Max response size: {}", cap.max_response_size);
+                            debug!("TPM Manufacturer ID: 0x{:08x}", cap.manufacturer_id);
+                            debug!("Max command size: {}", cap.max_command_size);
+                            debug!("Max response size: {}", cap.max_response_size);
                         }
                         Err(e) => {
                             warn!("get_capability failed: {:?}", e);
@@ -1662,13 +1662,13 @@ pub fn test_tpm() {
                     // quick-di uses 0x81020002 for DAK and 0x81020003 for HMAC
                     // But cert key might be at different handle
                     for handle in [0x81020001u32, 0x81020002, 0x81020003, 0x81020004, 0x81000001] {
-                        info!("Checking persistent handle 0x{:08x}...", handle);
+                        debug!("Checking persistent handle 0x{:08x}...", handle);
                         match tpm_read_public(handle) {
                             Some((x, y)) => {
                                 debug!("  Found key at 0x{:08x}: X={:02x?}", handle, &x[..x.len().min(8)]);
                             }
                             None => {
-                                info!("  Handle 0x{:08x} not found", handle);
+                                debug!("  Handle 0x{:08x} not found", handle);
                             }
                         }
                     }
@@ -1712,13 +1712,13 @@ pub struct TpmSigningKey {
 /// transient handle isn't flushed by the UEFI resource manager.
 /// If a stale key exists at persistent_handle, it is evicted first.
 pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmSigningKey> {
-    info!("TPM: tpm_create_and_persist_signing_key(0x{:08x})", persistent_handle);
+    debug!("TPM: tpm_create_and_persist_signing_key(0x{:08x})", persistent_handle);
     let tcg_handle = match boot::get_handle_for_protocol::<Tcg>() {
-        Ok(h) => { info!("TPM: got TCG handle"); h }
+        Ok(h) => { debug!("TPM: got TCG handle"); h }
         Err(e) => { error!("TPM: get_handle_for_protocol failed: {:?}", e); return None; }
     };
     let mut tcg = match boot::open_protocol_exclusive::<Tcg>(tcg_handle) {
-        Ok(t) => { info!("TPM: opened TCG protocol"); t }
+        Ok(t) => { debug!("TPM: opened TCG protocol"); t }
         Err(e) => { error!("TPM: open_protocol_exclusive failed: {:?}", e); return None; }
     };
     
@@ -1728,9 +1728,9 @@ pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmS
     if tcg.submit_command(&evict_cmd, &mut evict_resp).is_ok() {
         let rc = unpack_u32(&evict_resp[6..10]);
         if rc == 0 {
-            info!("TPM: Evicted stale key at 0x{:08x}", persistent_handle);
+            debug!("TPM: Evicted stale key at 0x{:08x}", persistent_handle);
         } else {
-            info!("TPM: No stale key at 0x{:08x} (rc=0x{:08x})", persistent_handle, rc);
+            debug!("TPM: No stale key at 0x{:08x} (rc=0x{:08x})", persistent_handle, rc);
         }
     }
     
@@ -1738,7 +1738,7 @@ pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmS
     let cmd = build_create_primary_signing_cmd();
     let mut response = vec![0u8; 1024];
     
-    info!("TPM: Creating signing key ({} byte cmd)...", cmd.len());
+    debug!("TPM: Creating signing key ({} byte cmd)...", cmd.len());
     let result = tcg.submit_command(&cmd, &mut response);
     
     if result.is_err() {
@@ -1752,7 +1752,7 @@ pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmS
     }
     
     let rc = unpack_u32(&response[6..10]);
-    info!("TPM2_CreatePrimary response: rc=0x{:08x}, resp_len={}", rc, unpack_u32(&response[2..6]));
+    debug!("TPM2_CreatePrimary response: rc=0x{:08x}, resp_len={}", rc, unpack_u32(&response[2..6]));
     if rc != 0 {
         warn!("TPM2_CreatePrimary error code: 0x{:08x}", rc);
         return None;
@@ -1760,7 +1760,7 @@ pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmS
     
     let key_pair = parse_create_primary_response(&response)?;
     let transient_handle = key_pair.handle;
-    info!("TPM: Signing key created: transient=0x{:08x}", transient_handle);
+    debug!("TPM: Signing key created: transient=0x{:08x}", transient_handle);
     
     // Step 2: EvictControl to persist the transient handle (same session!)
     let persist_cmd = build_evict_control_cmd(transient_handle, persistent_handle);
@@ -1775,7 +1775,7 @@ pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmS
             continue;
         }
         let rc = unpack_u32(&resp[6..10]);
-        info!("TPM: EvictControl(0x{:08x}->0x{:08x}) rc=0x{:08x} (attempt {})", 
+        debug!("TPM: EvictControl(0x{:08x}->0x{:08x}) rc=0x{:08x} (attempt {})", 
               transient_handle, persistent_handle, rc, attempt);
         if rc == 0x922 {
             boot::stall(core::time::Duration::from_millis(200));
@@ -1794,7 +1794,7 @@ pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmS
         return None;
     }
     
-    info!("TPM: Signing key persisted at 0x{:08x}", persistent_handle);
+    debug!("TPM: Signing key persisted at 0x{:08x}", persistent_handle);
     Some(TpmSigningKey {
         handle: persistent_handle,
         public_x: key_pair.public_x,
@@ -1902,7 +1902,7 @@ fn build_create_primary_signing_cmd() -> Vec<u8> {
 /// resource manager flushes transient handles when the protocol is closed.
 /// If a stale key exists at persistent_handle, it is evicted first.
 pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Option<(u32, Vec<u8>)> {
-    info!("TPM: tpm_create_hmac_and_persist() data_len={}, persist=0x{:08x}", data.len(), persistent_handle);
+    debug!("TPM: tpm_create_hmac_and_persist() data_len={}, persist=0x{:08x}", data.len(), persistent_handle);
     let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
     
@@ -1912,9 +1912,9 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
     if tcg.submit_command(&evict_cmd, &mut evict_resp).is_ok() {
         let rc = unpack_u32(&evict_resp[6..10]);
         if rc == 0 {
-            info!("TPM: Evicted stale HMAC key at 0x{:08x}", persistent_handle);
+            debug!("TPM: Evicted stale HMAC key at 0x{:08x}", persistent_handle);
         } else {
-            info!("TPM: No stale HMAC key at 0x{:08x} (rc=0x{:08x})", persistent_handle, rc);
+            debug!("TPM: No stale HMAC key at 0x{:08x} (rc=0x{:08x})", persistent_handle, rc);
         }
     }
     
@@ -1922,7 +1922,7 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
     let cmd = build_create_primary_hmac_cmd();
     let mut response = vec![0u8; 512];
     
-    info!("TPM: Creating HMAC key...");
+    debug!("TPM: Creating HMAC key...");
     let result = tcg.submit_command(&cmd, &mut response);
     
     if result.is_err() {
@@ -1941,7 +1941,7 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
     }
     
     let hmac_handle = unpack_u32(&response[10..14]);
-    info!("TPM: HMAC key created: transient=0x{:08x}", hmac_handle);
+    debug!("TPM: HMAC key created: transient=0x{:08x}", hmac_handle);
     
     // Step 2: Compute HMAC using the key (same TCG2 session — handle is still valid)
     let hmac_cmd = build_hmac_cmd(hmac_handle, data);
@@ -1960,7 +1960,7 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
         
         let rc = unpack_u32(&hmac_response[6..10]);
         if rc == 0x922 {
-            info!("TPM: HMAC got TPM_RC_RETRY (0x922), attempt {}, retrying after delay...", attempt);
+            debug!("TPM: HMAC got TPM_RC_RETRY (0x922), attempt {}, retrying after delay...", attempt);
             boot::stall(core::time::Duration::from_millis(200));
             continue;
         }
@@ -1990,7 +1990,7 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
             continue;
         }
         let rc = unpack_u32(&resp[6..10]);
-        info!("TPM: EvictControl HMAC(0x{:08x}->0x{:08x}) rc=0x{:08x} (attempt {})",
+        debug!("TPM: EvictControl HMAC(0x{:08x}->0x{:08x}) rc=0x{:08x} (attempt {})",
               hmac_handle, persistent_handle, rc, attempt);
         if rc == 0x922 {
             boot::stall(core::time::Duration::from_millis(200));
@@ -2008,7 +2008,7 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
         warn!("TPM: Failed to persist HMAC key at 0x{:08x}", persistent_handle);
         // Still return the HMAC value - DI can continue, just key won't be persistent
     } else {
-        info!("TPM: HMAC key persisted at 0x{:08x}", persistent_handle);
+        debug!("TPM: HMAC key persisted at 0x{:08x}", persistent_handle);
     }
     
     Some((persistent_handle, hmac_value))
@@ -2098,7 +2098,7 @@ fn build_create_primary_hmac_cmd() -> Vec<u8> {
 
 /// Compute HMAC using TPM key
 pub fn tpm_hmac(key_handle: u32, data: &[u8]) -> Option<Vec<u8>> {
-    info!("TPM: tpm_hmac() handle=0x{:08x}, data_len={}", key_handle, data.len());
+    debug!("TPM: tpm_hmac() handle=0x{:08x}, data_len={}", key_handle, data.len());
     let tcg_handle = match boot::get_handle_for_protocol::<Tcg>() {
         Ok(h) => h,
         Err(e) => {
@@ -2303,16 +2303,16 @@ pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
     
     // First try to define the NV space (with retry for TPM_RC_RETRY)
     let define_cmd = build_nv_define_space_cmd(nv_index, data.len() as u16);
-    info!("NV DefineSpace cmd ({} bytes) for index 0x{:08x}, size={}", define_cmd.len(), nv_index, data.len());
+    debug!("NV DefineSpace cmd ({} bytes) for index 0x{:08x}, size={}", define_cmd.len(), nv_index, data.len());
     
     let mut define_ok = false;
     for attempt in 0..5 {
         let mut response = vec![0u8; 64];
         if tcg.submit_command(&define_cmd, &mut response).is_ok() {
             let rc = unpack_u32(&response[6..10]);
-            info!("NV DefineSpace response: rc=0x{:08x} (attempt {})", rc, attempt);
+            debug!("NV DefineSpace response: rc=0x{:08x} (attempt {})", rc, attempt);
             if rc == 0x922 {
-                info!("NV DefineSpace got TPM_RC_RETRY, retrying...");
+                debug!("NV DefineSpace got TPM_RC_RETRY, retrying...");
                 boot::stall(core::time::Duration::from_millis(200));
                 continue;
             }
@@ -2334,7 +2334,7 @@ pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
     
     // Now write the data (with retry for TPM_RC_RETRY)
     let write_cmd = build_nv_write_cmd(nv_index, data);
-    info!("NV Write cmd: {} bytes of data to 0x{:08x}", data.len(), nv_index);
+    debug!("NV Write cmd: {} bytes of data to 0x{:08x}", data.len(), nv_index);
     
     for attempt in 0..5 {
         let mut response = vec![0u8; 64];
@@ -2351,10 +2351,10 @@ pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
         }
         
         let response_code = unpack_u32(&response[6..10]);
-        info!("NV_Write response: rc=0x{:08x} (attempt {})", response_code, attempt);
+        debug!("NV_Write response: rc=0x{:08x} (attempt {})", response_code, attempt);
         
         if response_code == 0x922 {
-            info!("NV_Write got TPM_RC_RETRY, retrying...");
+            debug!("NV_Write got TPM_RC_RETRY, retrying...");
             boot::stall(core::time::Duration::from_millis(200));
             continue;
         }
