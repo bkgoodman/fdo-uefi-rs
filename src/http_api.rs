@@ -36,32 +36,27 @@ pub struct HttpPostResponse {
 /// Dispatches to the appropriate transport backend based on compile-time features
 /// and runtime protocol availability.
 pub fn http_post_with_session(url: &str, body: &[u8], msg_type: u8, auth_token: Option<&str>) -> Option<HttpPostResponse> {
-    // Try UEFI HTTP protocol first (if compiled in)
-    #[cfg(feature = "uefi-http")]
-    {
-        let result = crate::http::http_post_with_session(url, body, msg_type, auth_token);
-        if result.is_some() {
-            return result;
-        }
-        // HTTP protocol not available on this firmware — fall through to TCP4 if available
-    }
-
-    // Fall back to TCP4-based HTTP (if compiled in)
+    // Use TCP4 directly for POST — UEFI HTTP protocol cannot reliably
+    // receive large responses (OVMF body drain fails with TIMEOUT for
+    // payloads > ~2KB), and mid-session fallback corrupts server state.
     #[cfg(feature = "tcp4-http")]
     {
-        // Ensure network is configured (DHCP) before TCP4 can connect.
-        // When uefi-http ran first, it initialized SNP but may not have run DHCP
-        // (DHCP only runs after finding an HTTP NIC handle, which didn't exist).
         ensure_network_configured();
-
-        log::debug!("Using TCP4 HTTP transport");
+        log::debug!("Using TCP4 HTTP transport for POST");
         return crate::tcp4_http::tcp4_http_post(url, body, msg_type, auth_token);
     }
 
-    // If we get here, UEFI HTTP was tried but failed, and TCP4 is not compiled in
+    // Fall back to UEFI HTTP only when TCP4 is not compiled in
     #[cfg(not(feature = "tcp4-http"))]
     {
-        log::error!("UEFI HTTP protocol not available and tcp4-http feature not enabled");
+        #[cfg(feature = "uefi-http")]
+        {
+            let result = crate::http::http_post_with_session(url, body, msg_type, auth_token);
+            if result.is_some() {
+                return result;
+            }
+        }
+        log::error!("No HTTP transport available for POST");
         return None;
     }
 }

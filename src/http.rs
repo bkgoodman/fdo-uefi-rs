@@ -234,6 +234,12 @@ pub fn http_get(url: &str) -> Option<Vec<u8>> {
         Ok(response) => {
             debug!("HTTP Status: {:?}", response.status);
             
+            // Reject non-200 responses (404, 500, etc.)
+            if response.status != uefi_raw::protocol::network::http::HttpStatusCode::STATUS_200_OK {
+                error!("HTTP GET failed with status: {:?}", response.status);
+                return None;
+            }
+            
             let mut body = response.body;
             
             // Check if we need more data
@@ -518,7 +524,7 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     let header_count = rx_msg.header_count;
     debug!("First response call: {} body bytes, {} headers", body_len, header_count);
     
-    // Extract Authorization and Message-Type headers from UEFI HTTP headers
+    // Extract Authorization, Message-Type, and Content-Length from UEFI HTTP headers
     let mut auth_header: Option<String> = None;
     let mut msg_type_header: Option<u8> = None;
     let mut content_length: Option<usize> = None;
@@ -546,7 +552,6 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
                     content_length = value.trim().parse::<usize>().ok();
                 }
                 if name.eq_ignore_ascii_case("Authorization") {
-                    // Strip "Bearer " prefix if present
                     let token = if value.starts_with("Bearer ") {
                         &value[7..]
                     } else {
@@ -557,6 +562,11 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
                 } else if name.eq_ignore_ascii_case("Message-Type") {
                     if let Ok(mt) = value.trim().parse::<u8>() {
                         msg_type_header = Some(mt);
+                    }
+                } else if name.eq_ignore_ascii_case("Content-Length") {
+                    if let Ok(cl) = value.trim().parse::<usize>() {
+                        content_length = Some(cl);
+                        debug!("Content-Length: {}", cl);
                     }
                 }
             }

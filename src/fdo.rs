@@ -1889,6 +1889,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     // u32, not u8: a 27MB image at a 64KB MTU needs ~420 rounds, and the round
     // counter also feeds the GCM nonce below, so it must not wrap.
     let mut round = 0u32;
+    let mut last_logged_pct = 0u32;
     
     while !is_done {
         round += 1;
@@ -1972,16 +1973,17 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
         
         is_done = owner_svc.is_done;
         
-        // ONE progress line per round. Everything else in this loop is debug —
-        // a BMO transfer runs ~50 rounds and console I/O is the dominant cost
-        // of a run, so per-round detail is measured in minutes of wall clock.
+        // Progress logging — keep it sparse for large transfers.
+        // Log every 10% during BMO, or every round when not yet transferring.
         if bmo_session.bytes_received > 0 {
             let pct = bmo_session.begin.as_ref()
                 .filter(|b| b.total_size > 0)
-                .map(|b| (bmo_session.bytes_received * 100 / b.total_size) as u32);
-            match pct {
-                Some(p) => info!("  Round {}: BMO {} bytes ({}%)", round, bmo_session.bytes_received, p),
-                None => info!("  Round {}: BMO {} bytes", round, bmo_session.bytes_received),
+                .map(|b| (bmo_session.bytes_received * 100 / b.total_size) as u32)
+                .unwrap_or(0);
+            if pct / 10 > last_logged_pct / 10 || round <= 3 || is_done {
+                info!("  Round {}: BMO {} / {} bytes ({}%)", round, bmo_session.bytes_received,
+                    bmo_session.begin.as_ref().map(|b| b.total_size).unwrap_or(0), pct);
+                last_logged_pct = pct;
             }
         } else {
             info!("  Round {}", round);

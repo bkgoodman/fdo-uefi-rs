@@ -533,8 +533,8 @@ pub fn tcp4_http_post(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
             return None;
         }
         
-        // Receive response
-        let mut response_buf = vec![0u8; 65536];
+        // Receive response — buffer must hold HTTP headers + body (up to ~65KB MTU)
+        let mut response_buf = vec![0u8; 131072];
         let mut total_received = 0usize;
         
         // Read until the response is complete. Termination is driven by
@@ -567,6 +567,10 @@ pub fn tcp4_http_post(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
             // path below already grows for this reason.
             if response_buf.len() - total_received == 0 {
                 response_buf.resize(response_buf.len() + 64 * 1024, 0);
+            }
+            let remaining = response_buf.len() - total_received;
+            if remaining == 0 {
+                response_buf.resize(response_buf.len() + 131072, 0);
             }
             let remaining = response_buf.len() - total_received;
             
