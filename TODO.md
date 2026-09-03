@@ -91,9 +91,10 @@ to the ECDH x-coordinate result before passing to KDF.
 - [ ] BIOS parameter setting (fdo.bmo:set) - enroll/change BIOS config (e.g. enable Secure Boot, EFI DB keys)
 - [ ] **Secure Boot + BMO** - allow unsigned BMO payloads to execute when Secure Boot is on (owner-signed via FDO = sufficient trust)
 - [x] **109MB UKI inline transfer** - Ubuntu UKI (kernel+initrd) delivered in ~1,670 rounds, SHA256 verified, chainloaded into Linux 7.0.0-14 (2026-09-03)
-- [ ] **UKI initrd casper fix** - Ubuntu mini-ISO initrd uses casper scripts that expect squashfs on CD-ROM. Need either: (a) attach ISO as virtual media, (b) custom initrd without casper, or (c) network-based rootfs
-- [ ] **Pre-allocate image buffer** - Done for inline mode; consider for URL mode too
-- [ ] **Transfer speed optimization** - 109MB at 65KB/round takes ~8-10 minutes. Consider larger chunks if server supports it
+- [x] **120MB UKI with full initrd** - Rebuilt UKI with full 91MB Ubuntu initrd + go-fdo client binary + custom init script. Custom init replaces casper (which expected squashfs on CD-ROM) with minimal boot: mounts proc/sys/dev, starts udevd, runs DHCP, drops to shell. Network working (10.0.2.15). go-fdo client available at /usr/local/bin/fdo. (2026-09-03)
+- [x] **Pre-allocate image buffer** - Done for inline mode (bmo.rs reserves total_size on image-begin)
+- [ ] **Transfer speed optimization** - 120MB at 65KB/round takes ~10-12 minutes. Consider larger chunks if server supports it
+- [ ] **Stage 2: go-fdo-endpoint** - Run go-fdo-endpoint client inside booted UKI to receive configuration (autoinstall.yaml, ISO payload) from orchestrator via FSIMs. See go-fdo-endpoint project for hook-based FSIM processing.
 
 ### RV-Based Firmware Delivery (rv-firmware feature) - E2E VERIFIED 2026-08-25
 - [x] HTTP GET added to dual-stack (tcp4_http.rs + http_api.rs dispatcher)

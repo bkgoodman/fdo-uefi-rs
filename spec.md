@@ -196,6 +196,26 @@ grep -i error /tmp/fdo-test3/server.log
 
 ## Performance
 
-- **BMO transfer rate**: ~15 chunks/minute (~15KB/min)
-- **136KB image**: ~9 minutes total transfer time
-- **Bottleneck**: UEFI HTTP stack latency, not network bandwidth
+- **BMO inline transfer**: ~65KB per round via TCP4, ~170 rounds/minute
+- **51KB payload.efi**: ~51 rounds, under 1 minute (OnLogic k800)
+- **27MB UKI (stripped initrd)**: ~425 rounds, ~3 minutes (QEMU)
+- **120MB UKI (full initrd+fdo)**: ~1,830 rounds, ~10-12 minutes (QEMU)
+- **Bottleneck**: Round-trip latency per ServiceInfo exchange, not bandwidth
+
+## Ubuntu UKI Boot Chain (Stage 1 Complete)
+
+End-to-end verified flow (2026-09-03):
+
+1. UEFI FDO client boots from flash, reads TPM credentials
+2. TO2 protocol completes (HelloDeviceProbe → DoneAck)
+3. 120MB UKI transferred via BMO inline delivery (~1,830 rounds, SHA256 verified)
+4. Chainloaded into Linux 7.0.0-14-generic via EFI LoadImage/StartImage
+5. Custom init: mounts proc/sys/dev, starts udevd, runs DHCP (10.0.2.15)
+6. go-fdo client available at /usr/local/bin/fdo
+7. BusyBox shell ready for Stage 2
+
+UKI built with `ukify` from Ubuntu mini-ISO kernel + full initrd + custom init
+(replaces casper scripts that expected squashfs on CD-ROM).
+
+Stage 2 (not yet implemented): go-fdo-endpoint client runs inside Linux to
+receive configuration (autoinstall.yaml, ISO payload) from orchestrator via FSIMs.
