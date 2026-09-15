@@ -183,6 +183,33 @@ See [docs/productization-guide.md](docs/productization-guide.md) for
 flash layout, DI placement decisions, update mechanisms, and how the
 test environment differs from production deployment.
 
+### VM vs Hardware Network Stack
+
+The default build (`uefi-http,tcp4-http,di,fdo-installer`) works on both
+QEMU/OVMF and real hardware. The transport dispatcher always uses TCP4 for
+POST requests (OVMF's HTTP protocol cannot drain large response bodies).
+
+Key differences between environments:
+
+| | QEMU/OVMF | Real Hardware (e.g. k800 AMI) |
+|---|---|---|
+| **SNP initialization** | Auto-started by PXE boot ROM | Must be explicitly started |
+| **DHCP** | IP from QEMU user-mode networking | Real DHCP server required |
+| **HTTP DXE** | Present but broken for POST | Not present at all |
+| **NIC enumeration** | 1 handle (virtio) | 6+ handles (one per physical port) |
+| **Link detection** | Always up | Only cabled ports show `media_present` |
+
+The `ensure_network_configured()` function in `http_api.rs` handles both:
+1. Starts SNP on all handles (required on real hardware, no-op if already started)
+2. Runs DHCP only on NICs with link detected (avoids 30s timeout per uncabled port)
+3. Falls back to static IP (`192.168.200.26/24`) if DHCP fails
+
+**Historical note (2026-09-15):** A bug where SNP initialization was guarded
+by `#[cfg(not(feature = "uefi-http"))]` caused TCP4 Configure to fail with
+`INVALID_PARAMETER` on all handles when the default features were compiled in.
+The guard assumed uefi-http would start SNP, but on hardware without HTTP DXE,
+it never ran. Fixed by always starting SNP unconditionally.
+
 ### Prerequisites
 
 **Build machine:**
@@ -367,9 +394,9 @@ it is armed before argument parsing, so it covers every mode.
 
 | Phase | Timeout | Notes |
 | ----- | ------- | ----- |
-| Application entry | **900s (15 min)** | Armed unconditionally; covers DI + TO1 + TO2 + BMO transfer |
+| Application entry | **1800s (30 min)** | Armed unconditionally; covers DI + TO1 + TO2 + BMO transfer (bumped from 900s for 106MB UKI on hardware) |
 | Immediately before `StartImage` | **60s** | Tighter window so a hung chainloaded image reboots quickly |
-| After `StartImage` returns | **900s** | Restored, so the rest of the run is not killed by the 60s window |
+| After `StartImage` returns | **1800s** | Restored, so the rest of the run is not killed by the 60s window |
 | Clean exit to the shell | **disarmed** | You are at a prompt, not hung |
 
 Look for `Watchdog: armed for 900 seconds` near the top of the output and
@@ -816,6 +843,51 @@ Three-stage FDO onboarding:
 
 - **init-tpm.sh** (run once): Creates device credential and voucher via quick-di
 - **start4.sh** (run many times): Tests FDO protocol with the same credential
+
+### K800 Hardware Full Installer Test
+
+Tests the complete Ubuntu installer pipeline on real hardware (OnLogic K800).
+Unlike the QEMU test, DI is done via the EFI app itself (no swtpm/quick-di).
+
+#### Network Layout
+
+- **pe2** (FDO server): `192.168.200.30:8080`
+- **k800** (device): `192.168.200.26`, 62GB RAM, real TPM 2.0
+- Only enp6s0 (NIC #6, MAC f9:bd) has link
+
+#### Phase 1: Device Initialization
+
+```bash
+# On pe2:
+cd ~/bkgvm && bash start-k800-server.sh di
+
+# On k800 EFI shell:
+fdo-uefi.efi -force-di -di http://192.168.200.30:8080 -rv http://192.168.200.30:8080
+```
+
+#### Phase 2: Full Installer (TO2 + BMO + Payload)
+
+```bash
+# On pe2: Ctrl-C the DI server, then:
+cd ~/bkgvm && bash start-k800-server.sh run
+
+# On k800 EFI shell:
+fdo-uefi.efi
+```
+
+Expected flow:
+1. TO1/TO2 with TPM-backed ECDH/signing
+2. BMO: 106MB UKI inline transfer (~1670 rounds at 65KB MTU)
+3. Chainload UKI via LoadImage/StartImage
+4. Linux boots, go-fdo-endpoint runs Stage 2 TO2
+5. Autoinstall YAML + 2.8GB ISO streamed to `/dev/pmem0`
+6. Ubuntu installer runs unattended
+
+#### Notes
+
+- Watchdog is 1800s (30 min) for the longer hardware transfer
+- The EFI client auto-detects the cabled NIC via `media_present` and skips uncabled ones
+- Server script: `efi-fdo-bmo/start-k800-server.sh` (also deployed to pe2 at `~/bkgvm/`)
 
 ## Project Structure
 

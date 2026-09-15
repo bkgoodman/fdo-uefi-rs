@@ -454,6 +454,44 @@ fn parse_ecdh_zgen_response(response: &[u8]) -> Option<Vec<u8>> {
     Some(shared_secret)
 }
 
+/// Flush all transient TPM objects (handles 0x80000000..0x8000000F).
+/// Called before chainloading to ensure the Linux kernel TPM resource manager
+/// doesn't inherit stale EFI-created contexts that would exhaust object slots.
+pub fn tpm_flush_all_transient() {
+    let tcg_handle = match boot::get_handle_for_protocol::<Tcg>() {
+        Ok(h) => h,
+        Err(_) => {
+            warn!("tpm_flush_all_transient: no TCG2 protocol");
+            return;
+        }
+    };
+    let mut tcg = match boot::open_protocol_exclusive::<Tcg>(tcg_handle) {
+        Ok(t) => t,
+        Err(_) => {
+            warn!("tpm_flush_all_transient: could not open TCG2");
+            return;
+        }
+    };
+
+    let mut flushed = 0u32;
+    // Transient object handles start at 0x80000000.  Real TPMs have 3-7
+    // transient slots; probing 16 covers any practical situation.
+    for i in 0..16u32 {
+        let handle = 0x80000000 + i;
+        let cmd = build_flush_context_cmd(handle);
+        let mut resp = vec![0u8; 32];
+        if tcg.submit_command(&cmd, &mut resp).is_ok() {
+            let rc = unpack_u32(&resp[6..10]);
+            if rc == 0 {
+                flushed += 1;
+                debug!("Flushed transient handle 0x{:08x}", handle);
+            }
+            // rc != 0 means handle doesn't exist — expected, just skip
+        }
+    }
+    info!("tpm_flush_all_transient: flushed {} handles", flushed);
+}
+
 /// Build TPM2_FlushContext command
 fn build_flush_context_cmd(handle: u32) -> Vec<u8> {
     let mut cmd = vec![0u8; 14];
@@ -2301,7 +2339,15 @@ pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
         Err(_) => return false,
     };
     
-    // First try to define the NV space (with retry for TPM_RC_RETRY)
+    // Undefine any existing NV space first (ignore errors — may not exist)
+    let undefine_cmd = build_nv_undefine_space_cmd(nv_index);
+    let mut undef_resp = vec![0u8; 64];
+    if tcg.submit_command(&undefine_cmd, &mut undef_resp).is_ok() {
+        let rc = unpack_u32(&undef_resp[6..10]);
+        debug!("NV UndefineSpace 0x{:08x}: rc=0x{:08x}", nv_index, rc);
+    }
+
+    // Define NV space with exact size for new data
     let define_cmd = build_nv_define_space_cmd(nv_index, data.len() as u16);
     debug!("NV DefineSpace cmd ({} bytes) for index 0x{:08x}, size={}", define_cmd.len(), nv_index, data.len());
     
@@ -2316,7 +2362,7 @@ pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
                 boot::stall(core::time::Duration::from_millis(200));
                 continue;
             }
-            if rc == 0 || rc == 0x0000014c {  // Success or "already exists"
+            if rc == 0 || rc == 0x0000014c {  // Success or NV_DEFINED (index still exists)
                 define_ok = true;
                 break;
             }
@@ -2369,6 +2415,39 @@ pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
     
     warn!("NV_Write failed after all retries");
     false
+}
+
+/// Build TPM2_NV_UndefineSpace command
+fn build_nv_undefine_space_cmd(nv_index: u32) -> Vec<u8> {
+    const TPM2_CC_NV_UNDEFINE_SPACE: u32 = 0x00000122;
+    let mut cmd = Vec::with_capacity(64);
+    
+    cmd.extend_from_slice(&[0u8; 10]);
+    pack_u16(&mut cmd[0..2], TPM2_ST_SESSIONS);
+    pack_u32(&mut cmd[6..10], TPM2_CC_NV_UNDEFINE_SPACE);
+    
+    // authHandle = TPM_RH_OWNER
+    let mut handle_bytes = [0u8; 4];
+    pack_u32(&mut handle_bytes, TPM2_RH_OWNER);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // nvIndex handle
+    pack_u32(&mut handle_bytes, nv_index);
+    cmd.extend_from_slice(&handle_bytes);
+    
+    // Auth area (password session, empty auth)
+    let auth_start = cmd.len();
+    cmd.extend_from_slice(&[0u8; 4]); // auth size placeholder
+    pack_u32(&mut handle_bytes, TPM2_RS_PW);
+    cmd.extend_from_slice(&handle_bytes);
+    cmd.extend_from_slice(&[0, 0, 0, 0, 0]); // nonce(0), attributes(0), auth(0)
+    let auth_size = (cmd.len() - auth_start - 4) as u32;
+    pack_u32(&mut cmd[auth_start..auth_start+4], auth_size);
+    
+    let cmd_len = cmd.len() as u32;
+    pack_u32(&mut cmd[2..6], cmd_len);
+    
+    cmd
 }
 
 /// Build TPM2_NV_DefineSpace command

@@ -267,8 +267,8 @@ fn build_di_set_hmac(hmac: &[u8]) -> Vec<u8> {
     // Hash = [hashType, hashValue]
     buf.push(0x82);  // array(2)
     
-    // hashType: -16 for HMAC-SHA256 (per FDO spec, negative = HMAC)
-    buf.push(0x2F);  // negative(-16) = -1 - 15 = 0x20 | 0x0F
+    // hashType: 5 for HMAC-SHA256 (per FDO spec: SHA256=-16, SHA384=-43, HMAC-SHA256=5, HMAC-SHA384=6)
+    buf.push(0x05);  // uint(5)
     
     // hashValue as bstr
     let len = hmac.len();
@@ -793,25 +793,21 @@ fn build_dctpm(ov_header: &OVHeader, dak_handle: u32, hmac_handle: u32) -> Vec<u
     buf.push(0x50); // bstr(16)
     buf.extend_from_slice(&ov_header.guid);
     
-    // RVInfo (bstr)
-    let rv_len = ov_header.rv_info.len();
-    if rv_len < 24 {
-        buf.push(0x40 | rv_len as u8);
-    } else {
-        buf.push(0x58);
-        buf.push(rv_len as u8);
-    }
+    // RVInfo — write the raw CBOR bytes directly (already a CBOR array of arrays).
+    // Previously this was bstr-wrapped (major type 2), but go-fdo's tpm_store
+    // expects the CBOR array directly (major type 4) for [][]RvInstruction.
     buf.extend_from_slice(&ov_header.rv_info);
     
-    // PubKeyHash (bstr) - hash of owner public key
-    let hash_len = ov_header.cert_chain_hash.len();
-    if hash_len < 24 {
-        buf.push(0x40 | hash_len as u8);
-    } else {
-        buf.push(0x58);
-        buf.push(hash_len as u8);
-    }
-    buf.extend_from_slice(&ov_header.cert_chain_hash);
+    // PubKeyHash = Hash(ManufacturerPublicKey) = [hashtype, hash_value]
+    // This is SHA256 over the raw CBOR encoding of OVPubKey (field [4] of OVHeader).
+    // go-fdo's VerifyManufacturerKey computes SHA256(CBOR(ManufacturerKey)) and
+    // compares it with this hash.  Previously we incorrectly stored OVDevCertChainHash.
+    let pub_key_hash = sha256(&ov_header.pub_key);
+    buf.push(0x82);  // array(2) — Hash = [hashtype, bstr]
+    buf.push(0x2F);  // negative(-16) = Sha256Hash per FDO spec
+    buf.push(0x58);  // bstr, 1-byte length follows
+    buf.push(32);    // 32 bytes
+    buf.extend_from_slice(&pub_key_hash);
     
     // DeviceKeyType = 0 (DAK)
     buf.push(0x00);

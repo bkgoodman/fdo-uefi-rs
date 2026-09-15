@@ -199,8 +199,10 @@ grep -i error /tmp/fdo-test3/server.log
 - **BMO inline transfer**: ~65KB per round via TCP4, ~170 rounds/minute
 - **51KB payload.efi**: ~51 rounds, under 1 minute (OnLogic k800)
 - **27MB UKI (stripped initrd)**: ~425 rounds, ~3 minutes (QEMU)
+- **106MB UKI (full installer)**: ~1,670 rounds, ~10 minutes (QEMU)
 - **120MB UKI (full initrd+fdo)**: ~1,830 rounds, ~10-12 minutes (QEMU)
 - **Bottleneck**: Round-trip latency per ServiceInfo exchange, not bandwidth
+- **Watchdog**: 1800s (30 min) — sufficient for 106MB transfer on real hardware
 
 ## Ubuntu UKI Boot Chain (Stage 1 Complete)
 

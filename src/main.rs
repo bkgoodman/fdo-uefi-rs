@@ -35,7 +35,7 @@ mod rv_firmware;
 ///
 /// Armed at entry and re-armed after a chainloaded image returns, so a hang
 /// anywhere in the run auto-reboots instead of requiring a lab visit.
-pub const WATCHDOG_TIMEOUT_SECS: usize = 900; // 15 minutes
+pub const WATCHDOG_TIMEOUT_SECS: usize = 1800; // 30 minutes (106MB UKI at 65KB MTU ~1670 rounds)
 
 /// Parsed command-line options
 struct FdoOptions {

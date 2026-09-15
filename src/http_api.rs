@@ -35,10 +35,27 @@ pub struct HttpPostResponse {
 /// Perform HTTP POST request with session token support.
 /// Dispatches to the appropriate transport backend based on compile-time features
 /// and runtime protocol availability.
+///
+/// When both uefi-http and tcp4-http are compiled in, tries uefi-http first.
+/// This is critical on real hardware: the uefi-http attempt calls
+/// start_snp_interface() + configure_network() which starts SNP and runs DHCP
+/// on the correct NIC handle. Even though HTTP protocol is absent on most
+/// real hardware (no HttpDxe), the side effect of initializing the IP4 stack
+/// on the right handle is required for TCP4 Configure to succeed afterwards.
 pub fn http_post_with_session(url: &str, body: &[u8], msg_type: u8, auth_token: Option<&str>) -> Option<HttpPostResponse> {
-    // Use TCP4 directly for POST — UEFI HTTP protocol cannot reliably
-    // receive large responses (OVMF body drain fails with TIMEOUT for
-    // payloads > ~2KB), and mid-session fallback corrupts server state.
+    // Try UEFI HTTP protocol first (if compiled in).
+    // On real hardware this will fail (no HttpDxe), but the SNP init and DHCP
+    // side effects prepare the network stack for the TCP4 fallback.
+    #[cfg(feature = "uefi-http")]
+    {
+        let result = crate::http::http_post_with_session(url, body, msg_type, auth_token);
+        if result.is_some() {
+            return result;
+        }
+        // HTTP protocol not available — fall through to TCP4
+    }
+
+    // Fall back to TCP4-based HTTP (if compiled in)
     #[cfg(feature = "tcp4-http")]
     {
         ensure_network_configured();
@@ -46,16 +63,8 @@ pub fn http_post_with_session(url: &str, body: &[u8], msg_type: u8, auth_token: 
         return crate::tcp4_http::tcp4_http_post(url, body, msg_type, auth_token);
     }
 
-    // Fall back to UEFI HTTP only when TCP4 is not compiled in
-    #[cfg(not(feature = "tcp4-http"))]
+    #[cfg(not(any(feature = "uefi-http", feature = "tcp4-http")))]
     {
-        #[cfg(feature = "uefi-http")]
-        {
-            let result = crate::http::http_post_with_session(url, body, msg_type, auth_token);
-            if result.is_some() {
-                return result;
-            }
-        }
         log::error!("No HTTP transport available for POST");
         return None;
     }
@@ -76,7 +85,10 @@ fn ensure_network_configured() {
         return;
     }
 
-    // When uefi-http is not compiled in, we also need to start SNP
+    // When uefi-http is not compiled in, we need to start SNP ourselves.
+    // When uefi-http IS compiled in, http.rs::start_snp_interface() handles
+    // this as a side effect of the uefi-http attempt (even when HTTP protocol
+    // is absent on the firmware).
     #[cfg(not(feature = "uefi-http"))]
     {
         use uefi::proto::network::snp::SimpleNetwork;

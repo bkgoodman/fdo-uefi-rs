@@ -61,3 +61,9 @@ ukify build \
 # Copy to server directory
 cp /tmp/ubuntu-installer-full.efi /tmp/fdo-firmware-server/ubuntu-installer.efi
 ```
+
+## Develop and Build on DevVM
+
+Develop and build on `devvm` only. This is the source-of-truth for all code, tools, and where our working code and git repos live. We must build *here*, and copy any required components to other machines we actually run and deliver code, servers, etc. 
+
+

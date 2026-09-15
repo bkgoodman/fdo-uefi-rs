@@ -95,6 +95,9 @@ to the ECDH x-coordinate result before passing to KDF.
 - [x] **Pre-allocate image buffer** - Done for inline mode (bmo.rs reserves total_size on image-begin)
 - [ ] **Transfer speed optimization** - 120MB at 65KB/round takes ~10-12 minutes. Consider larger chunks if server supports it
 - [ ] **Stage 2: go-fdo-endpoint** - Run go-fdo-endpoint client inside booted UKI to receive configuration (autoinstall.yaml, ISO payload) from orchestrator via FSIMs. See go-fdo-endpoint project for hook-based FSIM processing.
+- [x] **Watchdog bumped to 1800s (30 min)** for 106MB UKI transfer on k800 hardware (2026-09-15)
+- [x] **SNP initialization bug fixed** - `ensure_network_configured()` had SNP start guarded by `#[cfg(not(feature = "uefi-http"))]`, meaning the default build (which includes both uefi-http and tcp4-http) never started SNP on real hardware. TCP4 Configure returned INVALID_PARAMETER on all 6 handles. Fixed by always starting SNP unconditionally. (2026-09-15)
+- [ ] **K800 UKI installer test** - Full BMO + payload installer flow on real hardware (in progress, 2026-09-15). Server script: `efi-fdo-bmo/start-k800-server.sh` on pe2.
 
 ### RV-Based Firmware Delivery (rv-firmware feature) - E2E VERIFIED 2026-08-25
 - [x] HTTP GET added to dual-stack (tcp4_http.rs + http_api.rs dispatcher)

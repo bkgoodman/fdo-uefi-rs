@@ -1897,9 +1897,9 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
 
         // Completing a round is proof we are not hung, so refresh the watchdog.
         // A full image transfer takes far longer than the watchdog interval
-        // (~420 rounds at ~3s each vs a 900s timer), and without this the
-        // firmware reboots mid-transfer. A round that genuinely stalls still
-        // trips the timer and reboots as intended.
+        // (~1670 rounds for a 106MB UKI vs a 1800s timer), and without this
+        // the firmware reboots mid-transfer. A round that genuinely stalls
+        // still trips the timer and reboots as intended.
         let _ = uefi::boot::set_watchdog_timer(crate::WATCHDOG_TIMEOUT_SECS, 0x10000, None);
         
         // Build DeviceSvcInfo (msg 88): [is_more, service_info_array]
@@ -2038,6 +2038,15 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     debug!("  nonce_to2_prove_dv: {:02x?}", &done_ack.nonce[..8]);
     
     info!("=== TO2 Protocol Complete! ===");
+    
+    // Flush all transient TPM objects before chainloading.
+    // EFI has no resource manager, so transient handles from TO2 (DAK loads,
+    // HMAC operations, ECDH key exchange) are still loaded.  The Linux kernel
+    // RM (/dev/tpmrm0) inherits these and can run out of object slots
+    // (TPM_RC_OBJECT_MEMORY) when the Stage 2 go-fdo-endpoint tries to use
+    // the persistent HMAC key.  Flushing here avoids that.
+    info!("Flushing transient TPM objects before chainload...");
+    tpm::tpm_flush_all_transient();
     
     // Chainload AFTER Done/DoneAck — this is the point of no return.
     // The chainloaded image (OS installer, UKI, GRUB, etc.) takes over
