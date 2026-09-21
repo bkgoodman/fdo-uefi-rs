@@ -44,23 +44,30 @@ pub const BMO_KEY_IMAGE_ACK: &str = "fdo.bmo:image-ack";
 pub const BMO_KEY_SET: &str = "fdo.bmo:set";
 pub const BMO_KEY_SET_RESPONSE: &str = "fdo.bmo:set-response";
 
-/// BMO BeginMessage field keys (negative integers for FSIM-specific)
-pub const BMO_FIELD_IMAGE_TYPE: i8 = -1;    // MIME type (required)
-pub const BMO_FIELD_BOOT_ARGS: i8 = -2;     // Kernel arguments (optional)
-pub const BMO_FIELD_NAME: i8 = -3;          // Image name (optional)
-pub const BMO_FIELD_HASH_EXPECTED: i8 = -4; // Expected hash (optional)
-pub const BMO_FIELD_HASH_ALG: i8 = -5;      // Hash algorithm (optional)
-pub const BMO_FIELD_DELIVERY_MODE: i8 = -6; // Delivery mode (optional, default 0)
-pub const BMO_FIELD_URL: i8 = -7;           // URL for mode 1 (optional)
-pub const BMO_FIELD_TLS_CA: i8 = -8;        // TLS CA cert for URL (optional)
-pub const BMO_FIELD_META_URL: i8 = -9;      // Meta-URL for mode 2 (optional)
-pub const BMO_FIELD_SIGNER_KEY: i8 = -10;   // Signer key for mode 2 (optional)
+/// BMO ImageBegin field keys (negative integers for FSIM-specific).
+///
+/// These MUST match the "ImageBegin Schema Extensions" table in
+/// fdo-sim/fsim-repository/fdo.bmo.md and `FSIMFields[...]` in
+/// go-fdo/fsim/bmo_owner.go. They are `i32` so they can be used directly as
+/// match patterns in `parse_bmo_image_begin`, which is what keeps the parser
+/// and this table from drifting apart.
+pub const BMO_FIELD_IMAGE_TYPE: i32 = -1;     // MIME type (required)
+pub const BMO_FIELD_BOOT_ARGS: i32 = -2;      // Kernel arguments (optional)
+pub const BMO_FIELD_NAME: i32 = -3;           // Image name (optional, informational)
+pub const BMO_FIELD_VERSION: i32 = -4;        // Version string (optional, informational)
+pub const BMO_FIELD_DESCRIPTION: i32 = -5;    // Description (optional, informational)
+pub const BMO_FIELD_DELIVERY_MODE: i32 = -6;  // Delivery mode (optional, default 0)
+pub const BMO_FIELD_URL: i32 = -7;            // URL for modes 1 and 2 (optional)
+pub const BMO_FIELD_TLS_CA: i32 = -8;         // Single DER CA cert for TLS (optional)
+pub const BMO_FIELD_EXPECTED_HASH: i32 = -9;  // Expected hash of final image (optional)
+pub const BMO_FIELD_META_SIGNER: i32 = -10;   // COSE_Key for meta-payload sig (optional)
 
-/// Generic chunking field keys (non-negative)
-pub const CHUNK_FIELD_TOTAL_SIZE: u8 = 0;   // Total bytes
-pub const CHUNK_FIELD_HASH_ALG: u8 = 1;     // Hash algorithm
-pub const CHUNK_FIELD_METADATA: u8 = 2;     // Optional metadata
-pub const CHUNK_FIELD_REQUIRE_ACK: u8 = 3;  // Require acknowledgment
+/// Generic chunking field keys (non-negative), per chunking-strategy.md
+pub const CHUNK_FIELD_TOTAL_SIZE: i32 = 0;   // Total bytes
+pub const CHUNK_FIELD_HASH_ALG: i32 = 1;     // Hash algorithm
+pub const CHUNK_FIELD_METADATA: i32 = 2;     // Optional metadata
+pub const CHUNK_FIELD_REQUIRE_ACK: i32 = 3;  // Require acknowledgment
+pub const CHUNK_FIELD_EST_DURATION: i32 = 4; // Advisory: estimated transfer+apply time (seconds)
 
 /// Parsed BMO image-begin message
 #[derive(Debug, Default)]
@@ -69,17 +76,23 @@ pub struct BmoImageBegin {
     pub total_size: u64,
     pub hash_alg: Option<String>,
     pub require_ack: bool,
+    pub estimated_duration: u64, // Advisory: seconds for transfer+apply (0 = unset)
     
     // BMO-specific fields
     pub image_type: Option<String>,
     pub boot_args: Option<String>,
     pub name: Option<String>,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    /// Expected hash of the final image (key -9). This is the field that binds
+    /// image content to the authorising `image-begin`; the hash optionally
+    /// carried in the unsigned `image-end` is transport integrity only.
     pub expected_hash: Option<Vec<u8>>,
     pub delivery_mode: u8,
+    /// URL for delivery mode 1 (image) and mode 2 (meta-payload) — key -7 in both.
     pub url: Option<String>,
     pub tls_ca: Option<Vec<u8>>,
-    pub meta_url: Option<String>,
-    pub signer_key: Option<Vec<u8>>,
+    pub meta_signer: Option<Vec<u8>>,
 }
 
 /// BMO session state
@@ -164,70 +177,63 @@ pub fn parse_bmo_image_begin(data: &[u8]) -> Option<BmoImageBegin> {
         };
         
         match key {
-            // Generic chunking fields (non-negative)
-            0 => {
-                // total_size
+            // Generic chunking fields (non-negative), per chunking-strategy.md
+            CHUNK_FIELD_TOTAL_SIZE => {
                 begin.total_size = dec.read_uint().ok()? as u64;
                 debug!("BMO: total_size = {}", begin.total_size);
             }
-            1 => {
-                // hash_alg
+            CHUNK_FIELD_HASH_ALG => {
                 begin.hash_alg = Some(dec.read_text().ok()?);
                 debug!("BMO: hash_alg = {:?}", begin.hash_alg);
             }
-            3 => {
-                // require_ack
+            CHUNK_FIELD_REQUIRE_ACK => {
                 begin.require_ack = dec.read_bool().ok()?;
                 debug!("BMO: require_ack = {}", begin.require_ack);
             }
-            
-            // BMO-specific fields (negative keys)
-            -1 => {
-                // image_type (required)
+            CHUNK_FIELD_EST_DURATION => {
+                begin.estimated_duration = dec.read_uint().ok()? as u64;
+                debug!("BMO: estimated_duration = {}s", begin.estimated_duration);
+            }
+
+            // BMO-specific fields (negative keys), per fdo.bmo.md
+            BMO_FIELD_IMAGE_TYPE => {
                 begin.image_type = Some(dec.read_text().ok()?);
                 debug!("BMO: image_type = {:?}", begin.image_type);
             }
-            -2 => {
-                // boot_args
+            BMO_FIELD_BOOT_ARGS => {
                 begin.boot_args = Some(dec.read_text().ok()?);
                 debug!("BMO: boot_args = {:?}", begin.boot_args);
             }
-            -3 => {
-                // name
+            BMO_FIELD_NAME => {
                 begin.name = Some(dec.read_text().ok()?);
                 debug!("BMO: name = {:?}", begin.name);
             }
-            -4 => {
-                // expected_hash
-                begin.expected_hash = Some(dec.read_bytes().ok()?);
-                debug!("BMO: expected_hash = {} bytes", begin.expected_hash.as_ref().map(|h| h.len()).unwrap_or(0));
+            BMO_FIELD_VERSION => {
+                begin.version = Some(dec.read_text().ok()?);
+                debug!("BMO: version = {:?}", begin.version);
             }
-            -5 => {
-                // hash_alg (FSIM-specific, overrides generic)
-                begin.hash_alg = Some(dec.read_text().ok()?);
+            BMO_FIELD_DESCRIPTION => {
+                begin.description = Some(dec.read_text().ok()?);
+                debug!("BMO: description = {:?}", begin.description);
             }
-            -6 => {
-                // delivery_mode
+            BMO_FIELD_DELIVERY_MODE => {
                 begin.delivery_mode = dec.read_uint().ok()? as u8;
                 debug!("BMO: delivery_mode = {}", begin.delivery_mode);
             }
-            -7 => {
-                // url (for mode 1)
+            BMO_FIELD_URL => {
                 begin.url = Some(dec.read_text().ok()?);
                 debug!("BMO: url = {:?}", begin.url);
             }
-            -8 => {
-                // tls_ca
+            BMO_FIELD_TLS_CA => {
                 begin.tls_ca = Some(dec.read_bytes().ok()?);
             }
-            -9 => {
-                // meta_url (for mode 2)
-                begin.meta_url = Some(dec.read_text().ok()?);
-                debug!("BMO: meta_url = {:?}", begin.meta_url);
+            BMO_FIELD_EXPECTED_HASH => {
+                begin.expected_hash = Some(dec.read_bytes().ok()?);
+                debug!("BMO: expected_hash = {} bytes",
+                       begin.expected_hash.as_ref().map(|h| h.len()).unwrap_or(0));
             }
-            -10 => {
-                // signer_key
-                begin.signer_key = Some(dec.read_bytes().ok()?);
+            BMO_FIELD_META_SIGNER => {
+                begin.meta_signer = Some(dec.read_bytes().ok()?);
             }
             _ => {
                 // Skip unknown fields
@@ -293,24 +299,108 @@ pub fn build_service_info_kv(key: &str, value: &[u8]) -> Vec<u8> {
     enc.into_bytes()
 }
 
-/// Process BMO ServiceInfo message from owner
-/// Returns optional response ServiceInfo to send back
+/// Returns true if `data` starts with CBOR tag 18 (0xD2 = major 6, value 18).
+fn is_cbor_tag18(data: &[u8]) -> bool {
+    // CBOR tag 18: major type 6 (0xC0), additional info 18 → 0xD2
+    data.first() == Some(&0xD2)
+}
+
+/// Attempt to unwrap a signed BMO provisioning envelope (COSE_Sign1 tag 18).
+///
+/// Returns `Some(inner_payload_bytes)` if the body was tag 18, signature verified,
+/// and content_type matched. Returns `None` if the body is not tag 18 (caller
+/// should treat it as a bare map) or if verification failed (caller checks
+/// `is_cbor_tag18` to distinguish).
+fn unwrap_bmo_signed(data: &[u8], owner_key_point: Option<&[u8]>, expected_ct: &str) -> Option<Vec<u8>> {
+    if !is_cbor_tag18(data) {
+        return None; // Not signed — bare map
+    }
+
+    info!("BMO: Detected COSE_Sign1 (tag 18) — artifact authority");
+
+    let owner_point = match owner_key_point {
+        Some(p) => p,
+        None => {
+            error!("BMO: Signed envelope received but no Owner key available for verification");
+            return None;
+        }
+    };
+
+    match crate::cose::verify_bmo_signed(data, owner_point, expected_ct) {
+        Some(payload) => {
+            info!("BMO: Provisioning signature VERIFIED ({} byte payload)", payload.len());
+            Some(payload.to_vec())
+        }
+        None => {
+            error!("BMO: Provisioning signature verification FAILED");
+            None
+        }
+    }
+}
+
+/// Process BMO ServiceInfo message from owner.
+///
+/// `owner_key_point` is the TO2-proven Owner public key (P-256, 65 bytes).
+/// When present, signed provisioning envelopes (CBOR tag 18 / COSE_Sign1) are
+/// verified against it. When `None`, only unsigned (channel-authority) messages
+/// are accepted.
+///
+/// Returns optional response ServiceInfo to send back.
 pub fn process_bmo_message(
     session: &mut BmoSession,
     key: &str,
     value: &[u8],
+    owner_key_point: Option<&[u8]>,
 ) -> Option<(String, Vec<u8>)> {
     debug!("BMO: Processing message key='{}', value={} bytes", key, value.len());
     
     match key {
         BMO_KEY_IMAGE_BEGIN => {
+            // Check if the body is a signed COSE_Sign1 (tag 18 = 0xD2 first byte)
+            // or a bare CBOR map.
+            let inner_data = unwrap_bmo_signed(value, owner_key_point,
+                crate::cose::BMO_CONTENT_TYPE_IMAGE_BEGIN);
+            let parse_data = match &inner_data {
+                Some(d) => d.as_slice(),
+                None if is_cbor_tag18(value) => {
+                    // It was tag 18 but verification failed — reject
+                    error!("BMO: image-begin was signed but verification FAILED — rejecting");
+                    session.state = BmoState::Error;
+                    let result = build_bmo_image_result(BMO_STATUS_ERROR,
+                        Some("Provisioning signature verification failed"));
+                    return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                }
+                None => {
+                    // Bare map — channel authority (cases 1/2)
+                    debug!("BMO: image-begin is unsigned (channel authority)");
+                    value
+                }
+            };
+
             // Parse the image-begin message
-            if let Some(mut begin) = parse_bmo_image_begin(value) {
+            if let Some(mut begin) = parse_bmo_image_begin(parse_data) {
                 debug!("BMO: Received image-begin");
                 debug!("  image_type: {:?}", begin.image_type);
                 debug!("  delivery_mode: {}", begin.delivery_mode);
                 debug!("  total_size: {}", begin.total_size);
                 debug!("  require_ack: {}", begin.require_ack);
+                
+                // If server provided an estimated duration, double it for safety
+                // and re-arm the watchdog IF it exceeds the current default.
+                if begin.estimated_duration > 0 {
+                    let watchdog_secs = (begin.estimated_duration * 2) as usize;
+                    if watchdog_secs > crate::WATCHDOG_TIMEOUT_SECS {
+                        info!("BMO: Server estimated_duration={}s, extending watchdog to {}s (2x, was {}s)",
+                              begin.estimated_duration, watchdog_secs, crate::WATCHDOG_TIMEOUT_SECS);
+                        match uefi::boot::set_watchdog_timer(watchdog_secs, 0x10000, None) {
+                            Ok(_) => info!("BMO: Watchdog extended to {}s", watchdog_secs),
+                            Err(e) => warn!("BMO: Failed to extend watchdog: {:?}", e.status()),
+                        }
+                    } else {
+                        info!("BMO: Server estimated_duration={}s (2x={}s <= default {}s, keeping current watchdog)",
+                              begin.estimated_duration, watchdog_secs, crate::WATCHDOG_TIMEOUT_SECS);
+                    }
+                }
                 
                 // Handle delivery mode
                 match begin.delivery_mode {
@@ -443,9 +533,36 @@ pub fn process_bmo_message(
             
             // Parse image-end message for SHA256 hash (CBOR map, key 1 = hash value)
             let end_hash = parse_image_end_hash(value);
-            
+
+            // Choose which hash to verify against.
+            //
+            // `expected_hash` (key -9) arrives in `image-begin`, which is the
+            // message that carries provisioning authority; a hash in the
+            // unsigned `image-end` is transport integrity only and grants no
+            // authorisation over content. So image-begin wins, and if both are
+            // present they must agree — a disagreement means the sender is
+            // trying to substitute content after the authorising message.
+            let begin_hash = session.begin.as_ref().and_then(|b| b.expected_hash.clone());
+            if let (Some(bh), Some(eh)) = (&begin_hash, &end_hash) {
+                if bh != eh {
+                    error!("BMO: image-begin expected_hash disagrees with image-end hash_value.");
+                    error!("BMO: REFUSING to chainload — content does not match what was authorised.");
+                    session.state = BmoState::Error;
+                    let result = build_bmo_image_result(
+                        BMO_STATUS_ERROR, Some("image-begin/image-end hash disagreement"));
+                    return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                }
+            }
+            let from_begin = begin_hash.is_some();
+            let authoritative_hash = begin_hash.or(end_hash);
+            if authoritative_hash.is_some() && !from_begin {
+                warn!("BMO: image-begin carried no expected_hash (key -9); verifying against the");
+                warn!("BMO: unsigned image-end hash. This checks transport integrity but does NOT");
+                warn!("BMO: bind the image to an authorising message.");
+            }
+
             // Verify SHA256 hash of reassembled image buffer
-            if let Some(expected_hash) = &end_hash {
+            if let Some(expected_hash) = &authoritative_hash {
                 let mut hasher = Sha256::new();
                 hasher.update(&session.image_buffer);
                 let computed = hasher.finalize();
@@ -464,8 +581,8 @@ pub fn process_bmo_message(
                 }
                 debug!("BMO: SHA256 verified OK");
             } else {
-                warn!("BMO: No SHA256 hash in image-end message — cannot verify integrity");
-                warn!("BMO: Proceeding without hash verification (server should send hash)");
+                warn!("BMO: No hash in image-begin (key -9) or image-end — cannot verify integrity");
+                warn!("BMO: Proceeding without hash verification (server should send a hash)");
             }
             
             session.state = BmoState::Complete;
@@ -612,7 +729,7 @@ pub fn test_bmo_handling() {
     // Simulate fdo.bmo:active
     debug!("Test 1: Processing fdo.bmo:active");
     let active_value = alloc::vec![0xf5]; // CBOR true
-    let result = process_bmo_message(&mut session, "fdo.bmo:active", &active_value);
+    let result = process_bmo_message(&mut session, "fdo.bmo:active", &active_value, None);
     debug!("  Result: {:?}", result.is_some());
     
     // Simulate fdo.bmo:image-begin with inline delivery
@@ -629,24 +746,24 @@ pub fn test_bmo_handling() {
     begin_msg.push(0x18); // uint8
     begin_msg.push(0x64); // 100 bytes
     
-    let result = process_bmo_message(&mut session, BMO_KEY_IMAGE_BEGIN, &begin_msg);
+    let result = process_bmo_message(&mut session, BMO_KEY_IMAGE_BEGIN, &begin_msg, None);
     debug!("  Result: {:?}", result.is_some());
     debug!("  State: {:?}", session.state);
     
     // Simulate image data chunks
     debug!("Test 3: Processing fdo.bmo:image-data chunks");
     let chunk_data: Vec<u8> = (0u8..50).collect();
-    let result = process_bmo_message(&mut session, "fdo.bmo:image-data-0", &chunk_data);
+    let result = process_bmo_message(&mut session, "fdo.bmo:image-data-0", &chunk_data, None);
     debug!("  Chunk 0 result: {:?}, bytes_received: {}", result.is_some(), session.bytes_received);
     
     let chunk_data: Vec<u8> = (50u8..100).collect();
-    let result = process_bmo_message(&mut session, "fdo.bmo:image-data-1", &chunk_data);
+    let result = process_bmo_message(&mut session, "fdo.bmo:image-data-1", &chunk_data, None);
     debug!("  Chunk 1 result: {:?}, bytes_received: {}", result.is_some(), session.bytes_received);
     
     // Simulate image-end
     debug!("Test 4: Processing fdo.bmo:image-end");
     let end_msg = alloc::vec![0xf6]; // CBOR null
-    let result = process_bmo_message(&mut session, BMO_KEY_IMAGE_END, &end_msg);
+    let result = process_bmo_message(&mut session, BMO_KEY_IMAGE_END, &end_msg, None);
     debug!("  Result: {:?}", result.is_some());
     debug!("  Final state: {:?}", session.state);
     debug!("  Image buffer size: {} bytes", session.image_buffer.len());

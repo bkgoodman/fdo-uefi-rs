@@ -7,7 +7,7 @@ set -x
 
 HOSTNAME=$(hostname)
 echo "Running on: $HOSTNAME"
-if [ "$HOSTNAME" != "k800" ] && [ "$HOSTNAME" != "onlogic" ]; then
+if [ "$HOSTNAME" != "k800" ] && [ "$HOSTNAME" != "onlogic" ] && [ "$HOSTNAME" != "fdo-installed" ]; then
 	echo "ERROR: Must run on the OnLogic k800, not $HOSTNAME"
 	exit 1
 fi

@@ -615,6 +615,74 @@ fn parse_sign_response(response: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((r, s))
 }
 
+/// TPM2_GetRandom command code
+const TPM2_CC_GET_RANDOM: u32 = 0x0000017B;
+
+/// Build a TPM2_GetRandom command for `bytes_requested` bytes.
+fn build_get_random_cmd(bytes_requested: u16) -> Vec<u8> {
+    let mut cmd = vec![0u8; 12];
+    pack_u16(&mut cmd[0..2], TPM2_ST_NO_SESSIONS);
+    pack_u32(&mut cmd[2..6], 12);
+    pack_u32(&mut cmd[6..10], TPM2_CC_GET_RANDOM);
+    pack_u16(&mut cmd[10..12], bytes_requested);
+    cmd
+}
+
+/// Draw `len` random bytes from the TPM's RNG.
+///
+/// Used for protocol nonces and key-exchange randomness. These were previously
+/// hardcoded constants, which made device-contributed randomness predictable.
+/// The TPM is the only entropy source available this early in boot — UEFI's
+/// EFI_RNG_PROTOCOL is optional and frequently absent.
+///
+/// The TPM caps a single GetRandom at the size of its largest digest, so this
+/// loops until `len` bytes have been collected.
+pub fn tpm_get_random(len: usize) -> Option<Vec<u8>> {
+    let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;
+    let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(len);
+    let mut guard = 0;
+
+    while out.len() < len {
+        guard += 1;
+        if guard > 16 {
+            warn!("TPM: GetRandom made no progress after {} attempts", guard);
+            return None;
+        }
+
+        let want = core::cmp::min(len - out.len(), 32) as u16;
+        let cmd = build_get_random_cmd(want);
+        let mut response = vec![0u8; 256];
+
+        if tcg.submit_command(&cmd, &mut response).is_err() {
+            warn!("TPM2_GetRandom submit failed");
+            return None;
+        }
+
+        // Response: tag(2) size(4) rc(4) randomBytes(TPM2B: size(2) || bytes)
+        if response.len() < 12 {
+            warn!("TPM2_GetRandom response too short");
+            return None;
+        }
+        let rc = unpack_u32(&response[6..10]);
+        if rc != 0 {
+            warn!("TPM2_GetRandom returned rc=0x{:08x}", rc);
+            return None;
+        }
+        let n = unpack_u16(&response[10..12]) as usize;
+        if n == 0 || 12 + n > response.len() {
+            warn!("TPM2_GetRandom returned {} bytes (invalid)", n);
+            return None;
+        }
+        out.extend_from_slice(&response[12..12 + n]);
+    }
+
+    out.truncate(len);
+    debug!("TPM: GetRandom produced {} bytes", out.len());
+    Some(out)
+}
+
 /// Create an ECDH key pair using TPM and return public key
 pub fn tpm_create_ecdh_key() -> Option<TpmEcdhKeyPair> {
     let tcg_handle = boot::get_handle_for_protocol::<Tcg>().ok()?;

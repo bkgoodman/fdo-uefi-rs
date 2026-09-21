@@ -278,6 +278,8 @@ pub fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8], aad: &[u8]) 
 }
 
 /// FDO Message Types
+/// FDO error message type (see spec "Error - Type 255").
+pub const MSG_ERROR: u8 = 255;
 pub const MSG_TO1_HELLO_RV: u8 = 30;
 pub const MSG_TO1_HELLO_RV_ACK: u8 = 31;
 pub const MSG_TO1_PROVE_TO_RV: u8 = 32;
@@ -784,10 +786,15 @@ fn parse_to1_rv_redirect(data: &[u8]) -> Result<To1RvRedirect, FdoError> {
     })
 }
 
-/// Build TO1.ProveToRV message (type 32)
-/// This is a COSE_Sign1 containing an EAT with device GUID and nonce4
-/// For now, builds an unsigned placeholder - real impl needs device key
-pub fn build_to1_prove_to_rv(guid: &[u8; 16], nonce4: &[u8; 16], _device_key: Option<&[u8]>) -> Vec<u8> {
+/// Build TO1.ProveToRV message (type 32).
+///
+/// A COSE_Sign1 containing an EAT with the device GUID and nonce4, signed with
+/// the device attestation key held in the TPM.
+pub fn build_to1_prove_to_rv(
+    guid: &[u8; 16],
+    nonce4: &[u8; 16],
+    device_key_handle: u32,
+) -> Result<Vec<u8>, FdoError> {
     let mut enc = CborEncoder::new();
     
     // COSE_Sign1 structure: [protected, unprotected, payload, signature]
@@ -795,13 +802,14 @@ pub fn build_to1_prove_to_rv(guid: &[u8; 16], nonce4: &[u8; 16], _device_key: Op
     enc.buf.push(0xd2); // tag(18)
     enc.array(4);
     
-    // Protected header (empty map as bstr)
-    // {1: -7} means alg: ES256
+    // Protected header {1: -7} means alg: ES256. Keep the serialised bytes:
+    // they must be fed into the Sig_structure verbatim.
     let mut prot_enc = CborEncoder::new();
     prot_enc.buf.push(0xa1); // map(1)
     prot_enc.buf.push(0x01); // key: 1 (alg)
     prot_enc.neg_int(-7);    // value: -7 (ES256)
-    enc.bytes(&prot_enc.into_bytes());
+    let prot_bytes = prot_enc.into_bytes();
+    enc.bytes(&prot_bytes);
     
     // Unprotected header (empty map)
     enc.buf.push(0xa0); // map(0)
@@ -824,13 +832,39 @@ pub fn build_to1_prove_to_rv(guid: &[u8; 16], nonce4: &[u8; 16], _device_key: Op
     payload_enc.uint(10);
     payload_enc.bytes(nonce4);
     
-    enc.bytes(&payload_enc.into_bytes());
-    
-    // Signature (placeholder - 64 bytes of zeros for ES256)
-    // Real implementation would sign: Sign(protected || payload)
-    enc.bytes(&[0u8; 64]);
-    
-    enc.into_bytes()
+    let protected = prot_bytes;
+    let payload = payload_enc.into_bytes();
+    enc.bytes(&payload);
+
+    // Sign with the device attestation key in the TPM. This is what proves to
+    // the Rendezvous Server that the GUID in the EAT belongs to a device
+    // holding the matching DAK. It was previously 64 zero bytes, which meant
+    // the device never authenticated itself to the RV at all.
+    let external_aad = crate::cose::domain_aad(
+        crate::cose::AAD_TAG_PROVE_TO_RV,
+        FDO_PROTOCOL_VERSION,
+    );
+    let sig_structure = crate::cose::build_sig_structure(&protected, &external_aad, &payload);
+    let sig_hash = sha256(&sig_structure);
+
+    match crate::tpm::tpm_sign_with_persistent(device_key_handle, &sig_hash) {
+        Some(sig) if sig.len() == 64 => {
+            debug!("TO1: ProveToRV signed with DAK at 0x{:08x}", device_key_handle);
+            enc.bytes(&sig);
+        }
+        Some(sig) => {
+            error!("TO1: DAK signature was {} bytes, expected 64", sig.len());
+            return Err(FdoError::CryptoError(String::from(
+                "unexpected ProveToRV signature length")));
+        }
+        None => {
+            error!("TO1: TPM refused to sign ProveToRV with handle 0x{:08x}", device_key_handle);
+            return Err(FdoError::CryptoError(String::from(
+                "TPM signing failed for ProveToRV")));
+        }
+    }
+
+    Ok(enc.into_bytes())
 }
 
 /// Build TO1.HelloRV message (type 30)
@@ -911,18 +945,47 @@ impl To2HelloDeviceAck {
     }
 }
 
+/// Produce the next AES-GCM IV for a TO2 session and advance the counter.
+///
+/// Deterministic IV construction per NIST SP 800-38D §8.2.1: a 96-bit IV built
+/// from a fixed field (zero here — there is exactly one encrypting party per
+/// session key) and a monotonic 64-bit invocation counter. Every message in a
+/// session is encrypted under the same SEK, so uniqueness is mandatory; a
+/// counter guarantees it without needing an entropy source.
+fn next_session_iv(counter: &mut u64) -> [u8; 12] {
+    let mut iv = [0u8; 12];
+    iv[4..].copy_from_slice(&counter.to_be_bytes());
+    *counter += 1;
+    iv
+}
+
+/// Protocol version this client speaks. Selects domain-separation AAD:
+/// FDO 2.0 uses per-context tags, FDO 1.01 used an empty external_aad.
+pub const FDO_PROTOCOL_VERSION: u16 = 200;
+
 /// TO2.ProveOVHdr20 parsed payload (from inside COSE_Sign1)
 #[derive(Debug)]
 pub struct To2ProveOvHdr20Payload {
     pub ov_header: Vec<u8>,
     pub num_ov_entries: u8,
     pub hmac: Vec<u8>,
+    /// Raw CBOR bytes of the `HMac` structure exactly as received.
+    ///
+    /// Voucher entry 0's `hashPrevEntry` is computed over
+    /// `OVHeader || HMac` *as encoded*, so re-serialising from the parsed
+    /// values risks a byte mismatch. Keep the original span.
+    pub hmac_raw: Vec<u8>,
     pub nonce_to2_prove_ov: [u8; 16],
     pub xb_key_exchange: Vec<u8>,  // Server's ECDH public key
     pub max_owner_msg_size: u16,
 }
 
-/// Extract payload from COSE_Sign1 message (unverified)
+/// Extract the payload from a COSE_Sign1 message **without** verifying it.
+///
+/// Only valid where the caller verifies the signature separately over the same
+/// buffer (see TO2 Step 3b, which checks ProveOVHdr against the voucher-derived
+/// Owner key). Do not use this as the sole handling of a signed message.
+///
 /// COSE_Sign1 = [protected, unprotected, payload, signature] (tag 18 optional)
 fn extract_cose_payload(data: &[u8]) -> Result<Vec<u8>, FdoError> {
     let mut dec = CborDecoder::new(data);
@@ -973,7 +1036,9 @@ fn parse_prove_ov_hdr_payload(data: &[u8]) -> Result<To2ProveOvHdr20Payload, Fdo
     // num_ov_entries (uint)
     let num_ov_entries = dec.read_uint()? as u8;
     
-    // hmac (Hash array [type, bytes])
+    // hmac (Hash array [type, bytes]) — capture the raw span as well, since
+    // entry 0's hashPrevEntry is computed over the encoded bytes.
+    let hmac_start = dec.pos;
     let hmac_len = dec.read_array_len()?;
     let _hmac_type = dec.read_int()?;
     let hmac = if hmac_len > 1 {
@@ -981,6 +1046,13 @@ fn parse_prove_ov_hdr_payload(data: &[u8]) -> Result<To2ProveOvHdr20Payload, Fdo
     } else {
         Vec::new()
     };
+    for _ in 2..hmac_len {
+        dec.skip_value()?;
+    }
+    let hmac_raw = data
+        .get(hmac_start..dec.pos)
+        .unwrap_or(&[])
+        .to_vec();
     
     // nonce_to2_prove_ov (bstr, 16 bytes)
     let nonce_bytes = dec.read_bytes()?;
@@ -999,6 +1071,7 @@ fn parse_prove_ov_hdr_payload(data: &[u8]) -> Result<To2ProveOvHdr20Payload, Fdo
         ov_header,
         num_ov_entries,
         hmac,
+        hmac_raw,
         nonce_to2_prove_ov,
         xb_key_exchange,
         max_owner_msg_size,
@@ -1272,27 +1345,15 @@ pub fn build_encrypted_message(nonce: &[u8], ciphertext: &[u8]) -> Vec<u8> {
 }
 
 /// Parse COSE_Encrypt0 message (tag 16)
-/// Also detects FDO error responses (5 elements)
+///
+/// Error responses (Message-Type 255) are now rejected by `check_fdo_error`
+/// before the body reaches this function, so the old 5-element-array sniff
+/// is gone.
 pub fn parse_encrypted_message(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), FdoError> {
     let mut dec = CborDecoder::new(data);
     
-    // Check for FDO error response first (5-element array, no tag)
     let first_byte = dec.peek().unwrap_or(0);
     let major_type = first_byte >> 5;
-    
-    if major_type == 4 { // Array without tag - could be error
-        let arr_len = dec.read_array_header()?;
-        if arr_len == 5 {
-            let fb = dec.peek().unwrap_or(0);
-            if (fb >> 5) == 0 { // First element is uint (error code)
-                let error_code = dec.read_uint()?;
-                let _prev_msg = dec.read_uint()?;
-                let error_text = dec.read_text()?;
-                return Err(FdoError::CborError(format!("Server error {}: {}", error_code, error_text)));
-            }
-        }
-        return Err(FdoError::CborError(format!("Expected COSE_Encrypt0 tag, got array")));
-    }
     
     // Expect tag 16 (COSE_Encrypt0)
     if major_type != 6 { // Tag major type
@@ -1597,6 +1658,7 @@ pub fn perform_to2_hello(owner_url: &str, guid: &[u8; 16]) -> Result<(To2HelloDe
     // Send HTTP POST and capture session token
     let resp = http_post_with_session(&url, &hello_probe, MSG_TO2_HELLO_DEVICE_PROBE, None)
         .ok_or_else(|| FdoError::HttpError(String::from("HTTP POST failed")))?;
+    check_fdo_error(resp.message_type, &resp.body, "TO2.HelloDeviceAck")?;
     let response = resp.body;
     let auth_token = resp.auth_token;
     
@@ -1618,7 +1680,13 @@ pub fn perform_to2_hello(owner_url: &str, guid: &[u8; 16]) -> Result<(To2HelloDe
 
 /// Perform TO2 protocol (initial steps - unencrypted)
 /// device_key_handle: persistent TPM handle for the DAK, read from DCTPM.DeviceKeyHandle
-pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> Result<(), FdoError> {
+pub fn perform_to2(
+    owner_url: &str,
+    guid: &[u8; 16],
+    device_key_handle: u32,
+    hmac_key_handle: u32,
+    to1d: Option<&[u8]>,
+) -> Result<(), FdoError> {
     use crate::tpm;
     
     info!("=== Starting TO2 Protocol ===");
@@ -1647,10 +1715,12 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     
     // Build xA in FDO format: len_x || x || len_y || y || len_random || random
     // For ECDH256: 2+32+2+32+2+16 = 86 bytes
-    let random: [u8; 16] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    ]; // TODO: Use real RNG
+    // The device's contribution to the shared secret. Must be unpredictable:
+    // it is concatenated into the KDF input as xA.Rand, so a fixed value hands
+    // an attacker half of the secret material for free.
+    let random = tpm::tpm_get_random(16)
+        .ok_or_else(|| FdoError::CryptoError(String::from(
+            "TPM GetRandom failed for key exchange randomness")))?;
     
     let mut xa_public_key = Vec::with_capacity(86);
     // len_x (big-endian u16)
@@ -1738,6 +1808,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_PROVE_DEVICE);
     let resp = http_post_with_session(&url, &prove_device, MSG_TO2_PROVE_DEVICE, session_token.as_deref())
         .ok_or_else(|| FdoError::HttpError(String::from("HTTP POST failed")))?;
+    check_fdo_error(resp.message_type, &resp.body, "TO2.ProveOVHdr")?;
     let response = resp.body;
     
     debug!("  Response: {} bytes", response.len());
@@ -1749,21 +1820,13 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     debug!("  Received ProveOVHdr20: {} bytes", response.len());
     debug!("  ProveOVHdr20 first bytes: {:02x?}", &response[..response.len().min(16)]);
     
-    // Check for error response (5-element array starting with error code)
-    if response.len() > 2 && response[0] == 0x85 {
-        // Might be error response [code, type, msg, timestamp, id]
-        let mut dec = CborDecoder::new(&response);
-        if let Ok(5) = dec.read_array_len() {
-            if let Ok(error_code) = dec.read_uint() {
-                if error_code != 0 {
-                    return Err(FdoError::ProtocolError(format!("Server error code {}", error_code)));
-                }
-            }
-        }
-    }
-    
-    // Parse ProveOVHdr20 COSE_Sign1 to extract payload
-    let payload = extract_cose_payload(&response)?;
+    // Keep the raw ProveOVHdr20 bytes. The payload is extracted now because
+    // xB is needed to derive session keys, but the COSE_Sign1 signature over
+    // these bytes is not verifiable until the Owner key has been established
+    // from the voucher entries — that happens in Step 3b below, before any
+    // ServiceInfo is exchanged.
+    let response_prove_ov = response;
+    let payload = extract_cose_payload(&response_prove_ov)?;
     debug!("  ProveOVHdr20 payload: {} bytes", payload.len());
     
     // Parse the payload to get xB and other fields
@@ -1819,12 +1882,14 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     
     // Step 3: Fetch OV entries (GetOVNextEntry20 is NOT encrypted)
     info!("TO2 Step 3: Fetching {} OV entries...", prove_ov.num_ov_entries);
+    let mut ov_entries: Vec<Vec<u8>> = Vec::with_capacity(prove_ov.num_ov_entries as usize);
     for entry_num in 0..prove_ov.num_ov_entries {
         let get_entry = build_to2_get_ov_next_entry(entry_num);
         let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_GET_OV_NEXT_ENTRY);
         
         let resp = http_post_with_session(&url, &get_entry, MSG_TO2_GET_OV_NEXT_ENTRY, session_token.as_deref())
             .ok_or_else(|| FdoError::HttpError(String::from("GetOVNextEntry failed")))?;
+        check_fdo_error(resp.message_type, &resp.body, "TO2.OVNextEntry")?;
         let response = resp.body;
         
         // Parse OVNextEntry20 response: [entry_num, entry_bytes]
@@ -1834,10 +1899,110 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
             return Err(FdoError::CborError(format!("OVNextEntry expected 2 elements, got {}", arr_len)));
         }
         let resp_entry_num = dec.read_u8()?;
+        // The bstr contents are the tag-18 COSE_Sign1 for this entry. Keep the
+        // bytes verbatim: the next entry's hashPrevEntry is computed over them.
         let entry_bytes = dec.read_bytes()?;
         debug!("  OV entry {}: {} bytes", resp_entry_num, entry_bytes.len());
+        if resp_entry_num != entry_num {
+            return Err(FdoError::ProtocolError(format!(
+                "OVNextEntry out of order: asked for {}, got {}", entry_num, resp_entry_num)));
+        }
+        ov_entries.push(entry_bytes);
     }
     info!("TO2 Step 3 complete: All {} OV entries received", prove_ov.num_ov_entries);
+
+    // ---------------------------------------------------------------------
+    // Step 3b: VERIFY the Ownership Voucher and the Owner's signature.
+    //
+    // Everything above this point is unauthenticated. The session keys were
+    // derived from an ECDH exchange with a peer whose identity has not been
+    // established; ECDH alone gives confidentiality against a passive
+    // eavesdropper, not authentication. Until the voucher chain is walked and
+    // ProveOVHdr is checked against the resulting Owner key, this peer could
+    // be anyone who can answer the TO2 URL.
+    //
+    // The spec requires this to complete before the first ServiceInfo is
+    // processed, so it happens here, immediately before Step 4.
+    // ---------------------------------------------------------------------
+    info!("TO2 Step 3b: Verifying Ownership Voucher...");
+    let owner_key = match crate::voucher::verify_voucher(
+        &prove_ov.ov_header,
+        &prove_ov.hmac_raw,
+        &prove_ov.hmac,
+        hmac_key_handle,
+        guid,
+        &ov_entries,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("TO2: OWNERSHIP VOUCHER VERIFICATION FAILED: {:?}", e);
+            error!("TO2: ABORTING — refusing to onboard to an unverified owner.");
+            return Err(FdoError::CryptoError(format!("voucher verification failed: {:?}", e)));
+        }
+    };
+    debug!("TO2: Owner key: {:02x?}...", &owner_key[..owner_key.len().min(16)]);
+
+    // Now verify that the ProveOVHdr we received was actually signed by that
+    // Owner key. This is what binds the session (and xB, hence the session
+    // keys) to the proven Owner.
+    let prove_ov_s1 = crate::cose::parse_cose_sign1(&response_prove_ov)
+        .ok_or_else(|| FdoError::CborError(String::from("ProveOVHdr is not a valid COSE_Sign1")))?;
+
+    if crate::cose::has_delegate_header(prove_ov_s1.unprotected_header) {
+        // A Delegate signed ProveOVHdr on the Owner's behalf. Validating that
+        // requires X.509 delegate-chain support, which is not implemented.
+        // Refuse loudly rather than silently accepting an unverified signer.
+        error!("TO2: ProveOVHdr carries a DelegateChain / delegate key header.");
+        error!("TO2: Delegate onboarding requires X.509 chain validation, which is not");
+        error!("TO2: implemented. ABORTING rather than accepting an unverified signer.");
+        return Err(FdoError::CryptoError(String::from(
+            "delegate-signed ProveOVHdr not supported")));
+    }
+
+    let prove_ov_aad = crate::cose::domain_aad(
+        crate::cose::AAD_TAG_PROVE_OV_HDR,
+        FDO_PROTOCOL_VERSION,
+    );
+    if !crate::cose::verify_sign1(&prove_ov_s1, &prove_ov_aad, &owner_key) {
+        error!("TO2: ProveOVHdr SIGNATURE VERIFICATION FAILED against the Owner key.");
+        error!("TO2: ABORTING — the peer does not hold the Owner key for this device.");
+        return Err(FdoError::CryptoError(String::from(
+            "ProveOVHdr signature verification failed")));
+    }
+    // Verify the TO1 rendezvous blob against the same Owner key. Per FDO, if
+    // the to1d signature does not verify the device must assume a man in the
+    // middle is monitoring its traffic and fail TO2 immediately — an attacker
+    // who can forge a redirect is how a device gets pointed at a hostile owner
+    // in the first place.
+    match to1d {
+        Some(blob) if !blob.is_empty() => {
+            let s1 = crate::cose::parse_cose_sign1(blob)
+                .ok_or_else(|| FdoError::CborError(String::from("to1d is not a valid COSE_Sign1")))?;
+            if crate::cose::has_delegate_header(s1.unprotected_header) {
+                error!("TO2: to1d was signed by a Delegate; X.509 chain validation not implemented.");
+                return Err(FdoError::CryptoError(String::from(
+                    "delegate-signed to1d not supported")));
+            }
+            let aad = crate::cose::domain_aad(
+                crate::cose::AAD_TAG_OWNER_SIGN,
+                FDO_PROTOCOL_VERSION,
+            );
+            if !crate::cose::verify_sign1(&s1, &aad, &owner_key) {
+                error!("TO2: to1d (rendezvous blob) SIGNATURE VERIFICATION FAILED.");
+                error!("TO2: A man in the middle may be redirecting this device. ABORTING.");
+                return Err(FdoError::CryptoError(String::from(
+                    "to1d signature verification failed")));
+            }
+            info!("TO2: to1d rendezvous blob signature VERIFIED against Owner key");
+        }
+        _ => {
+            // Legitimate for RV bypass, where no blob is issued. Also reached
+            // if TO1 failed, in which case we have nothing to check.
+            warn!("TO2: no to1d blob to verify (RV bypass, or TO1 did not complete)");
+        }
+    }
+
+    info!("TO2 Step 3b complete: voucher chain and Owner signature VERIFIED");
     
     // Step 4: DeviceSvcInfoRdy20 (ENCRYPTED - type 86)
     // UEFI HTTP client has ~1KB response buffer limit, negotiate MTU down
@@ -1850,8 +2015,14 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     let device_svc_info_rdy = build_device_svc_info_rdy(Some(65535));
     debug!("  Plaintext: {} bytes, hex: {:02x?}", device_svc_info_rdy.len(), &device_svc_info_rdy);
     
-    // Generate nonce for encryption (12 bytes for AES-GCM)
-    let nonce: [u8; 12] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c]; // TODO: real random
+    // AES-GCM IV. Every message in this session is encrypted under the same
+    // SEK, so an IV must never repeat: GCM loses confidentiality AND
+    // authenticity on reuse (the authentication subkey becomes recoverable).
+    // Use the deterministic construction from NIST SP 800-38D §8.2.1 — a
+    // per-session invocation counter — which makes a collision impossible
+    // rather than merely improbable, and needs no entropy source.
+    let mut iv_counter: u64 = 0;
+    let nonce = next_session_iv(&mut iv_counter);
     
     // Use unified COSE encryption
     let encrypted_msg = cose_encrypt0_a256gcm(&session_keys.sek, &nonce, &device_svc_info_rdy)?;
@@ -1860,6 +2031,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_DEVICE_SVC_INFO_RDY);
     let resp = http_post_with_session(&url, &encrypted_msg, MSG_TO2_DEVICE_SVC_INFO_RDY, session_token.as_deref())
         .ok_or_else(|| FdoError::HttpError(String::from("DeviceSvcInfoRdy failed")))?;
+    check_fdo_error(resp.message_type, &resp.body, "TO2.SetupDevice")?;
     let response = resp.body;
     
     debug!("  SetupDevice20 response: {} bytes (encrypted)", response.len());
@@ -1924,19 +2096,14 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
         let device_svc_info = build_device_svc_info(false, &svc_info); // is_more = false
         debug!("    DeviceSvcInfo plaintext: {} bytes", device_svc_info.len());
         
-        // Encrypt and send.
-        // The nonce must never repeat for a given session key — AES-GCM loses all
-        // integrity guarantees on nonce reuse. Carry the full round counter so it
-        // stays unique for the life of the session rather than wrapping every 256
-        // rounds as a single-byte counter would.
-        let mut nonce = [0u8; 12];
-        nonce[..4].copy_from_slice(&round.to_be_bytes());
-        nonce[4..].copy_from_slice(&[0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c]);
+        // Encrypt and send, drawing the next IV from the session counter.
+        let nonce = next_session_iv(&mut iv_counter);
         let encrypted_msg = cose_encrypt0_a256gcm(&session_keys.sek, &nonce, &device_svc_info)?;
         
         let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_DEVICE_SVC_INFO);
         let resp = http_post_with_session(&url, &encrypted_msg, MSG_TO2_DEVICE_SVC_INFO, session_token.as_deref())
             .ok_or_else(|| FdoError::HttpError(String::from("DeviceSvcInfo failed")))?;
+        check_fdo_error(resp.message_type, &resp.body, "TO2.OwnerSvcInfo")?;
         let response = resp.body;
         
         // Decrypt OwnerSvcInfo (msg 89)
@@ -1956,7 +2123,7 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
                         // Check if this is a BMO message
                         if key.starts_with("fdo.bmo:") {
                             debug!("    Processing BMO message: {}", key);
-                            if let Some((resp_key, resp_value)) = process_bmo_message(&mut bmo_session, &key, &value) {
+                            if let Some((resp_key, resp_value)) = process_bmo_message(&mut bmo_session, &key, &value, Some(&owner_key)) {
                                 debug!("    BMO response: {} ({} bytes)", resp_key, resp_value.len());
                                 bmo_responses.push((resp_key, resp_value));
                             }
@@ -2019,13 +2186,16 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
     let done_msg = build_to2_done(&setup_device.nonce_to2_setup_dv);
     debug!("  Done plaintext: {} bytes", done_msg.len());
     
-    // Encrypt and send
-    let done_nonce: [u8; 12] = [0xD0, 0x0E, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
+    // Encrypt and send. Same session counter — previously a hardcoded IV whose
+    // 8-byte tail was identical to the ServiceInfo round IVs, relying on the
+    // round counter never reaching 0xD00E0304 to avoid a collision.
+    let done_nonce = next_session_iv(&mut iv_counter);
     let done_encrypted = cose_encrypt0_a256gcm(&session_keys.sek, &done_nonce, &done_msg)?;
     
     let url = format!("{}/fdo/200/msg/{}", owner_url, MSG_TO2_DONE);
     let resp = http_post_with_session(&url, &done_encrypted, MSG_TO2_DONE, session_token.as_deref())
         .ok_or_else(|| FdoError::HttpError(String::from("Done failed")))?;
+    check_fdo_error(resp.message_type, &resp.body, "TO2.DoneAck")?;
     let response = resp.body;
     
     // Decrypt DoneAck (msg 91)
@@ -2068,10 +2238,16 @@ pub fn perform_to2(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) -> 
 }
 
 /// Test TO2 protocol against a live server
-pub fn test_to2_protocol(owner_url: &str, guid: &[u8; 16], device_key_handle: u32) {
+pub fn test_to2_protocol(
+    owner_url: &str,
+    guid: &[u8; 16],
+    device_key_handle: u32,
+    hmac_key_handle: u32,
+    to1d: Option<&[u8]>,
+) {
     info!("=== TO2 Protocol Test ===");
     
-    match perform_to2(owner_url, guid, device_key_handle) {
+    match perform_to2(owner_url, guid, device_key_handle, hmac_key_handle, to1d) {
         Ok(()) => info!("TO2 test completed successfully!"),
         Err(e) => error!("TO2 test failed: {:?}", e),
     }
@@ -2079,7 +2255,10 @@ pub fn test_to2_protocol(owner_url: &str, guid: &[u8; 16], device_key_handle: u3
 
 /// Perform TO1 protocol step 1: HelloRV -> HelloRVAck
 /// Returns the nonce4 from the server for use in ProveToRV
-pub fn perform_to1_hello(rv_url: &str, guid: &[u8; 16]) -> Result<To1HelloRvAck, FdoError> {
+pub fn perform_to1_hello(
+    rv_url: &str,
+    guid: &[u8; 16],
+) -> Result<(To1HelloRvAck, Option<String>), FdoError> {
     debug!("TO1: Sending HelloRV to {}", rv_url);
     
     // Build HelloRV message
@@ -2090,39 +2269,85 @@ pub fn perform_to1_hello(rv_url: &str, guid: &[u8; 16]) -> Result<To1HelloRvAck,
     let url = format!("{}/fdo/200/msg/{}", rv_url, MSG_TO1_HELLO_RV);
     
     // Send HTTP POST
-    let response = http_post(&url, &hello_rv, MSG_TO1_HELLO_RV)
+    let resp = http_post_with_session(&url, &hello_rv, MSG_TO1_HELLO_RV, None)
         .ok_or_else(|| FdoError::HttpError(String::from("HTTP POST failed")))?;
+    let response = resp.body;
     
     debug!("  Response: {} bytes", response.len());
     debug!("  CBOR: {:02x?}", &response[..response.len().min(32)]);
+
+    check_fdo_error(resp.message_type, &response, "TO1.HelloRVAck")?;
     
     // Parse HelloRVAck
     let ack = parse_to1_hello_rv_ack(&response)?;
     debug!("  Nonce4: {:02x?}", ack.nonce4);
     
-    Ok(ack)
+    // The RV issues a bearer token in the HelloRVAck response which must be
+    // presented with ProveToRV, or the server rejects it with "invalid
+    // session". TO1 previously discarded it.
+    if resp.auth_token.is_some() {
+        debug!("  TO1 session token: present");
+    } else {
+        warn!("  TO1: no session token in HelloRVAck response");
+    }
+    
+    Ok((ack, resp.auth_token))
+}
+
+/// Reject an FDO error message (Message-Type 255) before trying to parse a
+/// response as its expected type.
+///
+/// Without this, an error body is happily accepted as whatever was expected —
+/// which is how a 60-byte `[500, 32, "invalid session", ...]` error was being
+/// stored and reported as a valid to1d rendezvous blob.
+fn check_fdo_error(message_type: Option<u8>, body: &[u8], context: &str) -> Result<(), FdoError> {
+    if message_type != Some(MSG_ERROR) {
+        return Ok(());
+    }
+    // ErrorMessage = [code, prevMsgType, errStr, timestamp, correlationId]
+    let mut dec = CborDecoder::new(body);
+    let (code, prev, msg) = match dec.read_array_len() {
+        Ok(n) if n >= 3 => {
+            let code = dec.read_uint().unwrap_or(0);
+            let prev = dec.read_uint().unwrap_or(0);
+            let msg = dec.read_text().unwrap_or_else(|_| String::from("<unparseable>"));
+            (code, prev, msg)
+        }
+        _ => (0, 0, String::from("<malformed error message>")),
+    };
+    error!("{}: server returned FDO error {} (for msg {}): {}", context, code, prev, msg);
+    Err(FdoError::ProtocolError(format!(
+        "{}: FDO error {}: {}", context, code, msg)))
 }
 
 /// Perform TO1 ProveToRV step: send ProveToRV, receive RVRedirect
-fn perform_to1_prove(rv_url: &str, guid: &[u8; 16], nonce4: &[u8; 16]) -> Result<To1RvRedirect, FdoError> {
+fn perform_to1_prove(
+    rv_url: &str,
+    guid: &[u8; 16],
+    nonce4: &[u8; 16],
+    device_key_handle: u32,
+    session_token: Option<&str>,
+) -> Result<To1RvRedirect, FdoError> {
     debug!("TO1: Sending ProveToRV to {}", rv_url);
     
-    // Build ProveToRV message (COSE_Sign1 with EAT)
-    // Note: Using placeholder signature - real impl needs device key
-    let prove_to_rv = build_to1_prove_to_rv(guid, nonce4, None);
+    // Build ProveToRV message (COSE_Sign1 with EAT), signed by the TPM DAK
+    let prove_to_rv = build_to1_prove_to_rv(guid, nonce4, device_key_handle)?;
     debug!("  ProveToRV: {} bytes", prove_to_rv.len());
     
     // Build URL for message type 32
     let url = format!("{}/fdo/200/msg/{}", rv_url, MSG_TO1_PROVE_TO_RV);
     
-    // Send HTTP POST
-    let response = http_post(&url, &prove_to_rv, MSG_TO1_PROVE_TO_RV)
+    // Send HTTP POST, carrying the session token issued with HelloRVAck
+    let resp = http_post_with_session(&url, &prove_to_rv, MSG_TO1_PROVE_TO_RV, session_token)
         .ok_or_else(|| FdoError::HttpError(String::from("HTTP POST failed")))?;
+    let response = resp.body;
     
     debug!("  Response: {} bytes", response.len());
     if !response.is_empty() {
         debug!("  CBOR: {:02x?}", &response[..response.len().min(32)]);
     }
+
+    check_fdo_error(resp.message_type, &response, "TO1.RVRedirect")?;
     
     // Parse RVRedirect
     let redirect = parse_to1_rv_redirect(&response)?;
@@ -2133,13 +2358,17 @@ fn perform_to1_prove(rv_url: &str, guid: &[u8; 16], nonce4: &[u8; 16]) -> Result
 
 /// Perform TO1 protocol (full flow)
 /// Returns TO1D blob (owner rendezvous info) on success
-pub fn perform_to1(rv_url: &str, guid: &[u8; 16]) -> Result<To1RvRedirect, FdoError> {
+pub fn perform_to1(
+    rv_url: &str,
+    guid: &[u8; 16],
+    device_key_handle: u32,
+) -> Result<To1RvRedirect, FdoError> {
     info!("=== Starting TO1 Protocol ===");
     debug!("RV URL: {}", rv_url);
     debug!("GUID: {:02x?}", guid);
     
     // Step 1: HelloRV -> HelloRVAck
-    let ack = perform_to1_hello(rv_url, guid)?;
+    let (ack, session_token) = perform_to1_hello(rv_url, guid)?;
     
     info!("TO1 Step 1 complete: HelloRV -> HelloRVAck");
     debug!("  Nonce4: {:02x?}", ack.nonce4);
@@ -2147,8 +2376,13 @@ pub fn perform_to1(rv_url: &str, guid: &[u8; 16]) -> Result<To1RvRedirect, FdoEr
     debug!("  CapabilityFlags: {:02x?}", ack.capability_flags);
     
     // Step 2: ProveToRV -> RVRedirect
-    warn!("Note: ProveToRV using placeholder signature (no device key)");
-    let redirect = perform_to1_prove(rv_url, guid, &ack.nonce4)?;
+    let redirect = perform_to1_prove(
+        rv_url,
+        guid,
+        &ack.nonce4,
+        device_key_handle,
+        session_token.as_deref(),
+    )?;
     
     info!("TO1 Step 2 complete: ProveToRV -> RVRedirect");
     debug!("  TO1D blob: {} bytes", redirect.to1d_cose.len());
@@ -2184,10 +2418,10 @@ pub fn test_fdo_messages() {
 }
 
 /// Test TO1 protocol against a live server
-pub fn test_to1_protocol(rv_url: &str, guid: &[u8; 16]) {
+pub fn test_to1_protocol(rv_url: &str, guid: &[u8; 16], device_key_handle: u32) {
     info!("=== TO1 Protocol Test ===");
     
-    match perform_to1(rv_url, guid) {
+    match perform_to1(rv_url, guid, device_key_handle) {
         Ok(redirect) => {
             info!("TO1 test completed successfully!");
             debug!("  Received TO1D: {} bytes", redirect.to1d_cose.len());

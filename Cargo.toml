@@ -14,8 +14,10 @@ uefi-http = []
 tcp4-http = []
 # Device Initialization — FDO DI protocol (manufacturing/provisioning)
 di = []
-# FDO Installer Image — TO1/TO2 onboarding + BMO payload delivery
-fdo-installer = []
+# FDO Installer Image — TO1/TO2 onboarding + BMO payload delivery.
+# Requires p256/ecdsa: the device MUST verify the Ownership Voucher entry chain
+# and the TO2.ProveOVHdr / to1d signatures, which is ECDSA P-256 work.
+fdo-installer = ["dep:p256", "dep:ecdsa"]
 # RV-based firmware delivery (pre-onboarding firmware update via COSE_Sign1)
 rv-firmware = ["dep:p256", "dep:ecdsa"]
 

@@ -128,6 +128,227 @@ to the ECDH x-coordinate result before passing to KDF.
 ### Pending
 - [ ] Credential replacement after successful TO2
 
+## CRITICAL: Owner-side authentication (found 2026-09-18, implemented 2026-09-18)
+
+TO2 is specified as *mutual* authentication. Only the device→owner direction was
+implemented. Every check that would let the device authenticate the party it was
+talking to was absent, so the shipping installer build completed TO2 with, and accepted
+a bootable image from, **any** peer that could answer the TO2 URL. The `default`
+feature set did not even include `p256`/`ecdsa`, so the installer image contained no
+ECDSA verification code at all and was structurally incapable of checking a signature.
+
+### Status: code complete, NOT yet tested end-to-end
+
+| # | Check | Was | Now |
+| - | ----- | --- | --- |
+| 1 | `TO2.ProveOVHdr` COSE_Sign1 signature | never read | `fdo.rs` Step 3b verifies against the voucher-derived Owner key, AAD `FDO-TO2-ProveOVHdr-v1` |
+| 2 | `OVHeader` HMAC vs TPM HMAC key | parsed, never compared | `voucher.rs` recomputes via `tpm_hmac()` and compares; mismatch aborts |
+| 3 | `OVEntries` signature chain | fetched and dropped | `voucher.rs` walks the chain: per-entry signature, `hashHdrInfo`, `hashPrevEntry` |
+| 4 | `TO1.RVRedirect` to1d signature | only `.len()` logged | threaded into TO2, verified against the Owner key, AAD `FDO-TO0-OwnerSign-v1` |
+| 5 | `TO1.ProveToRV` outbound signature | 64 zero bytes | real TPM DAK signature, AAD `FDO-TO1-ProveToRV-v1` |
+
+Supporting work:
+
+- [x] `src/cose.rs` — single shared COSE_Sign1 parser + ES256 verifier + `Sig_structure`
+  builder + domain-AAD table. Slice-based, because verification needs the exact wire
+  bytes of the protected header and payload.
+- [x] `src/voucher.rs` — FDO `PublicKey` parsing (SPKI and COSE_Key; X5CHAIN refused),
+  `OVHeader` / `OVEntryPayload` parsing, full chain walk.
+- [x] `fdo-installer` now pulls `dep:p256`/`dep:ecdsa`. Default build 300 KiB → 345 KiB.
+- [x] Domain AAD is version-conditional: FDO 2.0 uses the tag, 1.01 uses empty. The
+  OVEntry AAD is selected from the **voucher's** `OVHProtVer`, not the session version,
+  matching `go-fdo/voucher.go`.
+- [x] `prove_ov.hmac_raw` keeps the verbatim CBOR of the `HMac` structure — entry 0's
+  `hashPrevEntry` is computed over `OVHeader || HMac` *as encoded*, so re-serialising
+  risks a byte mismatch.
+- [x] Delegate-signed `ProveOVHdr` / to1d / voucher entries are **refused** (label 258 /
+  x5chain detected) rather than silently accepted, pending X.509 support.
+- [x] `tpm_get_random()` added; key-exchange `xA.Rand` now comes from the TPM instead of
+  the fixed sequence `01..10`.
+- [x] All session AES-GCM IVs now use a single per-session invocation counter
+  (`next_session_iv`, NIST SP 800-38D §8.2.1). Previously `DeviceSvcInfoRdy` and `Done`
+  used hardcoded IVs and `Done`'s 8-byte tail was *identical* to the ServiceInfo round
+  IVs — collision-free only because the round counter never reached `0xD00E0304`.
+
+### Verified on pe2 QEMU + swtpm (2026-09-18)
+
+Positive run (`~/bkgvm/start5-verify.sh`, no BMO so TO2 completes in seconds):
+
+```
+TO1 Step 1 complete: HelloRV -> HelloRVAck
+TO1 Step 2 complete: ProveToRV -> RVRedirect        <- real TPM sig accepted by RV
+TO1 complete: to1d blob 129 bytes (verified in TO2)
+Voucher: header protver=200 entries=2 device_info="EFI-FDO-Verify"
+Voucher: OVHeader HMAC verified against TPM key — header is authentic for this device
+Voucher: all 2 entries verified; Owner key established
+TO2: to1d rendezvous blob signature VERIFIED against Owner key
+TO2 Step 3b complete: voucher chain and Owner signature VERIFIED
+TO2 Step 6 complete: DoneAck received
+```
+
+Negative runs (`~/bkgvm/start6-negative.sh <msg_type>`, with
+`~/bkgvm/fdo-tamper-proxy.py` on :8080 forwarding to the real server on :8081 and
+flipping one byte of the chosen response):
+
+| Tampered | Device result |
+| -------- | ------------- |
+| *nothing* (control: proxy in path, `msg 99` never matches) | onboarding completes, all checks VERIFIED |
+| msg 85 last byte — voucher entry signature | `entry 0 signature did NOT verify` → `EntrySignatureInvalid(0)` → ABORT |
+| msg 33 last byte — to1d signature | `to1d signature verification failed` → ABORT |
+| msg 83 last byte — ProveOVHdr signature | `ProveOVHdr SIGNATURE VERIFICATION FAILED` → ABORT |
+| msg 83 offset 320 — OVHeader HMAC value | `OVHeader HMAC MISMATCH` → `HmacMismatch` → ABORT |
+| msg 83 offset 150 — OVHeader RVInfo bytes | `HeaderParse("bad OVRVInfo")` → ABORT (fails closed on malformed input) |
+| msg 83 offset 60 — unprotected `OwnerPubKey` (COSE label 257) | **no effect, and that is correct**: the header is unsigned by design and the device ignores it, using the voucher-derived Owner key instead |
+
+The control run matters: it establishes that the failures above are caused by the
+tampering and not by having a proxy in the path.
+
+### Remaining
+
+- [ ] Delegate support (X.509) — see the BMO section below; currently refused loudly.
+- [ ] SHA-384 / P-384 vouchers are refused, not supported.
+- [ ] Re-run the full BMO path (`start4.sh`) — the verified runs above deliberately
+  omit BMO to keep the cycle short, so the 109 MB UKI transfer has not been re-tested
+  since these changes. `start4.sh` also currently references
+  `/tmp/fdo-firmware-server/ubuntu-installer.efi` and `test-config.json`, neither of
+  which exists on pe2; the UKI present is `ubuntu-26.04.1-live-server-fdo.efi`.
+- [ ] Fold TO1 error-response handling into TO2 as well — TO2 still sniffs for a
+  5-element CBOR array rather than checking `Message-Type: 255`.
+
+### Bugs found while testing
+
+- [x] **TO1 never sent its session token.** `perform_to1_hello` used `http_post`
+  (no auth) and discarded the bearer token from the HelloRVAck response, so
+  `ProveToRV` was rejected with `error getting TO1 proof nonce: invalid session`.
+  Now threaded through via `http_post_with_session`.
+- [x] **TO1 accepted FDO error messages as valid responses.** `parse_to1_rv_redirect`
+  stored *any* response body as `to1d_cose`, so a 60-byte
+  `[500, 32, "invalid session", ...]` error was logged as "TO1 Step 2 complete" and
+  carried forward as a rendezvous blob. Added `check_fdo_error()`, which rejects
+  `Message-Type: 255` and logs the server's code and message before parsing.
+  This is the same class of failure as the original audit: a success path that never
+  checked whether it had actually succeeded.
+
+### Why this was invisible — and the process fix
+
+The TO2 checklist was worded as plumbing ("**parses** OV header", "**fetches** voucher
+entries"), marked `[x]`, under a heading reading "FULLY TESTED". Those words were
+literally accurate but the sign-off was not: verification is a mandatory part of TO2,
+not a separate feature, so "parses" was never an acceptable completion state for a
+message whose whole purpose is to authenticate the owner. The QEMU and k800 runs were
+real but only ever demonstrated interoperability with a *cooperative* server.
+
+**Rule going forward: a protocol message that carries a signature is not "done" until
+the negative test passes — i.e. until a bad signature is shown to fail the protocol.**
+"Onboarding completed" is not evidence that anything was verified.
+
+### Exploitability (pre-fix)
+
+An active attacker who could answer the TO2 URL — rogue DHCP/DNS on the provisioning
+LAN, ARP spoofing, a spoofed RV server (gap 4 made this the easy path, since the
+redirect was unauthenticated) — completed TO2 and delivered an arbitrary EFI image,
+which `chainload.rs` executes. Unsigned arbitrary code execution pre-OS. ECDH gave
+confidentiality against a passive eavesdropper only; nothing bound the peer's ECDH key
+to an FDO Owner.
+
+The Phase-1 rv-firmware stub was and is unaffected: it verifies its payload against the
+compiled-in platform key, so Stage 1 → Stage 2 was always signature-checked. It was
+Stage 2 → Stage 3 (TO2 delivering the installer/UKI) that was unauthenticated.
+
+## BMO Provisioning Authorization (fdo.bmo.md "Authorization of Provisioning Messages")
+
+Spec was amended 2026-09-18 in `fdo-sim/fsim-repository/fdo.bmo.md` to define two
+authorization modes and a signed scope-constraint header. None of it is implemented
+on the device yet. Ordered by dependency.
+
+- [x] **ImageBegin field-numbering fix** (2026-09-18) — `-4`/`-5`/`-9` disagreed with
+  both the spec and `go-fdo/fsim/bmo_owner.go`. The client read `expected_hash` from
+  `-4` (actually `version`) and `meta_url` from `-9` (actually `expected_hash`), so the
+  inline-transfer hash check was silently never using the begin-message hash. Correct
+  map is now: `-4` version, `-5` description, `-7` url (modes 1 *and* 2), `-9`
+  expected_hash, `-10` meta_signer. Parser match arms now use the `BMO_FIELD_*`
+  constants directly so the table and the parser cannot drift apart again.
+- [x] **Prefer the authorising hash** (2026-09-18) — inline mode verified against the
+  hash in the *unsigned* `image-end`. Now prefers `expected_hash` from `image-begin`,
+  requires the two to agree when both are present, and warns loudly when only the
+  image-end hash is available (transport integrity, not an authorisation binding).
+
+- [ ] **Voucher walk → TO2-proven Owner key.** Prerequisite for everything below.
+  Today `perform_to2()` never verifies the `ProveOVHdr` signature (`extract_cose_payload`
+  skips it) and discards all OV entries, so the device has no Owner key and no
+  cryptographic proof of who it is talking to. Needs: recompute the OVHeader HMAC with
+  the TPM HMAC key and compare; walk the entry chain (entry[0] signed by
+  `OVHeader.ManufacturerKey`, entry[i] by entry[i-1]); check `hashPrevEntry` /
+  `hashHdrInfo`; Owner key = last entry's `OVEPubKey`.
+
+  **No X.509 certificate parsing is required for this**, despite appearances. FDO's
+  `PublicKey = [pkType, pkEnc, pkBody]` defines `pkEnc = X509: 1`, which the spec
+  states means `pkBody` *is* the ASN.1 `SubjectPublicKeyInfo` — an algorithm OID plus
+  a public key bit string, **not** a certificate. No issuer, subject, validity,
+  extensions or signature. For P-256 it is a fixed 26-byte prefix followed by
+  `0x04 || X(32) || Y(32)`, and `di/protocol.rs:934` already hardcodes that prefix for
+  CSR generation. go-fdo's `-di-key-enc x509` default therefore means "raw SPKI key
+  blob", not "certificate". Certificates only appear if a deployment uses
+  `pkEnc = X5CHAIN: 2` for voucher keys (not the go-fdo default), or in `DelegateChain`
+  / artifact `x5chain` — see the separate x5chain item below.
+
+  Requires moving `p256`/`ecdsa` out of the `rv-firmware` feature gate into the default
+  build (~20 KiB, measured). This item is a hard prerequisite for *all* the delegate
+  work too: both `fdo.bmo.md` and the delegate spec root trust in the "TO2-proven Owner
+  key", and a delegate chain cannot be validated against a key the device does not have.
+- [ ] **Determine and retain peer provisioning authority** (channel authority).
+  Owner-direct (no DelegateChain, ProveOVHdr verifies against Owner key) ⇒ authorised.
+  DelegateChain present ⇒ authorised iff `fdo-ekt-permit-provision` (PERM.7,
+  `1.3.6.1.4.1.45724.3.1.7`) is present in *every* cert in the chain. Spec makes this
+  mode REQUIRED and it MUST be enabled by default.
+- [ ] **Artifact authority, Owner-direct.** Detect CBOR tag 18 on `image-begin`/`set`,
+  verify COSE_Sign1 against the Owner key with `external_aad =
+  ["FDO-FSIM-BmoProvision-v1"]`, check protected `content_type`. Generalize
+  `rv_firmware/cose_verify.rs` — currently hardcodes the platform key and an empty
+  external_aad — to take key + AAD as parameters. Must honour the **no-downgrade**
+  rule: a tag-18 body that fails verification is rejected, never retried as unsigned.
+- [ ] **`fdo.bmo.scope` evaluation.** Protected-header map, text label `"fdo.bmo.scope"`.
+  `guid` is MUST once artifact authority exists — compare against the **voucher** GUID
+  proven in TO2, *not* any replacement GUID from `TO2.SetupDevice`, so the voucher GUID
+  must be retained for the session. `not_before`/`not_after` SHOULD, `generation` MAY.
+  Unevaluable constraints MUST fail closed (error 17 clock / 18 generation / 15 unknown
+  field) — never silently ignored.
+- [ ] **Error codes 16/17/18** — Provisioning Scope Mismatch / Validity Failed /
+  Superseded. Add alongside the existing 15.
+- [ ] **Delegate `x5chain` in artifacts** (spec says SHOULD, not MUST). Measured cost:
+  `x509-cert` 0.3.0 builds clean for `x86_64-unknown-uefi` `no_std` and costs **+64 KiB**
+  on top of ECDSA (+85 KiB over baseline, 293→376 KiB). Use the crate rather than
+  hand-rolling DER — attacker-supplied DER parsed in a pre-OS path that then chainloads
+  code is a boot-chain CVE generator. Caveat: `x509-cert` 0.3 pulls `der 0.8.2` while
+  `p256`/`ecdsa` 0.13 pull `der 0.7.10`, so two DER parsers link in; check whether
+  upgrading the RustCrypto stack collapses them before accepting the 64 KiB. Also
+  confirm `x509-cert` 0.3.0 is >7 days published before adding it.
+- [ ] **Clock policy.** `not_before`/`not_after` need a clock the device can justify
+  trusting. Classify UEFI `GetTime()` as trustworthy only with a working RTC and a
+  plausible reading (≥ firmware build date); maintain a monotonic high-water mark in
+  TPM NV; fail closed otherwise. A validity window is a supersession control against a
+  remote conduit, **not** tamper resistance against someone who can pull the RTC battery.
+- [ ] **`generation` anti-rollback storage.** OPTIONAL to implement, but if implemented
+  the high-water mark MUST live in rollback-protected NV (TPM NV under policy) — a
+  counter that can be rewound fails *permissively*, which is worse than not implementing
+  it. `rv_firmware/anti_rollback.rs` (TPM NV 0x01D10002) is the existing precedent.
+- [ ] **Strict provisioning policy** (MAY) — operator switch to require artifact
+  authority even from a peer that holds provisioning authority. MUST default to off.
+
+### Blocked on other repos
+
+- [ ] **`go-fdo-meta-tool`: `fdo.bmo.scope` support.** The tool cannot currently produce
+  a scoped provisioning artifact, so the device-side work above cannot be tested
+  end-to-end against anything. Needs: mint a signed `image-begin` carrying
+  `fdo.bmo.scope` with `guid` (per-device or a small array), `not_before`/`not_after`,
+  and `generation`; bulk-mint per-GUID artifacts from a voucher set; and sign either
+  Owner-direct or as a PERM.7 delegate with the `x5chain` embedded. Offline/HSM signing
+  is the whole point — the tool must not need to be online during TO2.
+- [ ] **`go-fdo`: server-side scope emission.** `fsim/bmo_provision.go` implements
+  signing but knows nothing about `fdo.bmo.scope`; it needs to emit the protected header
+  and to support delivering pre-signed artifacts it did not mint itself (CDN mode —
+  the server holds only an onboard delegate and must not re-sign).
+
 ### Recently Completed (2026-08-10)
 - [x] Error response handling: Message-Type header parsing, FDO error body decoder (error_code, msg_type, error_string)
 - [x] Negative test verified: intentionally wrong KeyType produces clean error log with server message

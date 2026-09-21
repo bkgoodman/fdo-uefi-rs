@@ -25,6 +25,12 @@ mod tcp4_http;
 mod fdo;
 #[cfg(feature = "fdo-installer")]
 mod bmo;
+// Shared COSE_Sign1 verification, used by TO1/TO2/voucher and (later) BMO.
+#[cfg(any(feature = "fdo-installer", feature = "rv-firmware"))]
+mod cose;
+// Ownership Voucher verification — establishes the TO2-proven Owner key.
+#[cfg(feature = "fdo-installer")]
+mod voucher;
 mod chainload;
 #[cfg(feature = "di")]
 mod di;
@@ -488,13 +494,30 @@ fn run_onboarding(creds: &tpm::FdoCredentials, opts: &FdoOptions) {
     };
     debug!("Owner/RV URL: {}", owner_url);
     
-    // Run TO1 protocol
+    // Run TO1 protocol. Keep the to1d ("rendezvous blob") — its signature can
+    // only be checked once TO2 has established the Owner key from the voucher,
+    // so it is verified inside TO2 rather than here.
     info!("");
     info!("--- TO1 Protocol ---");
-    fdo::test_to1_protocol(&owner_url, &creds.guid);
+    let to1d = match fdo::perform_to1(&owner_url, &creds.guid, creds.device_key_handle) {
+        Ok(redirect) => {
+            info!("TO1 complete: to1d blob {} bytes (verified in TO2)", redirect.to1d_cose.len());
+            Some(redirect.to1d_cose)
+        }
+        Err(e) => {
+            warn!("TO1 failed: {:?}", e);
+            None
+        }
+    };
     
     // Run TO2 protocol (pass device_key_handle from DCTPM per spec)
     info!("");
     info!("--- TO2 Protocol ---");
-    fdo::test_to2_protocol(&owner_url, &creds.guid, creds.device_key_handle);
+    fdo::test_to2_protocol(
+        &owner_url,
+        &creds.guid,
+        creds.device_key_handle,
+        creds.hmac_key_handle,
+        to1d.as_deref(),
+    );
 }
