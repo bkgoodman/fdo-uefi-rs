@@ -97,7 +97,34 @@ to the ECDH x-coordinate result before passing to KDF.
 - [ ] **Stage 2: go-fdo-endpoint** - Run go-fdo-endpoint client inside booted UKI to receive configuration (autoinstall.yaml, ISO payload) from orchestrator via FSIMs. See go-fdo-endpoint project for hook-based FSIM processing.
 - [x] **Watchdog bumped to 1800s (30 min)** for 106MB UKI transfer on k800 hardware (2026-09-15)
 - [x] **SNP initialization bug fixed** - `ensure_network_configured()` had SNP start guarded by `#[cfg(not(feature = "uefi-http"))]`, meaning the default build (which includes both uefi-http and tcp4-http) never started SNP on real hardware. TCP4 Configure returned INVALID_PARAMETER on all 6 handles. Fixed by always starting SNP unconditionally. (2026-09-15)
-- [ ] **K800 UKI installer test** - Full BMO + payload installer flow on real hardware (in progress, 2026-09-15). Server script: `efi-fdo-bmo/start-k800-server.sh` on pe2.
+- [ ] **K800 UKI installer test** - Full BMO + payload installer flow on real hardware (in progress, 2026-09-15). Server script: `examples/start-hw-server.sh` (also deployed to pe2).
+- [x] **Hardware EFI test: Model 1 (unsigned BMO, channel authority)** — DI + TO2 on
+  onlogic with real TPM. Unsigned BMO accepted via Owner channel authority. (2026-09-23)
+- [x] **Hardware EFI test: Model 3 (owner-signed BMO)** — COSE_Sign1 tag 18 detected,
+  Owner-signed artifact verified, payload accepted. (2026-09-23)
+- [x] **Hardware EFI test: Model 3 + scope** — Signed BMO with not_before/not_after/generation
+  scope constraints parsed and evaluated on real hardware. (2026-09-23)
+- [x] **Hardware EFI test: GUID scope positive** — Pre-signed COSE with correct device
+  GUID matched, scope evaluation PASSED. (2026-09-23)
+- [x] **Hardware EFI test: GUID scope negative** — Pre-signed COSE with wrong GUID
+  rejected: "scope guid MISMATCH — artifact not for this device". (2026-09-23)
+- [x] **Hardware EFI test: Model 2 (delegate channel authority)** — Delegate with
+  onboard+provision (PERM.7) verified, unsigned BMO accepted via delegate channel
+  authority. (2026-09-23)
+- [x] **Hardware EFI test: Model 4 (delegate-signed artifact authority)** — COSE_Sign1
+  with x5chain detected, delegate cert chain verified against Owner key, leaf has
+  PERM.7, delegate-signed artifact verified OK. (2026-09-23)
+- [x] **Model 1 bug fix** — Unsigned BMO payloads were wrongly rejected when Owner key
+  was present ("no signing or delegate authority"). Fixed: Owner-direct channel
+  authority (Model 1) now correctly accepts unsigned payloads. (2026-09-23)
+- [ ] **DI: flush TPM transient handles on network error** — If DI fails after
+  `CreatePrimary` (e.g. HTTP send fails), transient handles leak. The next DI
+  attempt gets `TPM_RC_OBJECT_MEMORY` (0x902) and requires a reboot. Fix: add
+  cleanup in the DI error path to flush any transient handles before returning.
+- [ ] **DI: retry on transient failure** — Add a wait-and-retry loop (e.g. 3
+  attempts with a few seconds between) so transient network errors don't
+  require manual reboot and re-run. May be a compile-time option to keep the
+  minimal build small.
 
 ### RV-Based Firmware Delivery (rv-firmware feature) - E2E VERIFIED 2026-08-25
 - [x] HTTP GET added to dual-stack (tcp4_http.rs + http_api.rs dispatcher)
@@ -255,99 +282,135 @@ The Phase-1 rv-firmware stub was and is unaffected: it verifies its payload agai
 compiled-in platform key, so Stage 1 → Stage 2 was always signature-checked. It was
 Stage 2 → Stage 3 (TO2 delivering the installer/UKI) that was unauthenticated.
 
-## BMO Provisioning Authorization (fdo.bmo.md "Authorization of Provisioning Messages")
+## BMO Provisioning Authorization — Four Security Models
 
-Spec was amended 2026-09-18 in `fdo-sim/fsim-repository/fdo.bmo.md` to define two
-authorization modes and a signed scope-constraint header. None of it is implemented
-on the device yet. Ordered by dependency.
+See `go-fdo/provisioning-security.md` for the high-level narrative. The four
+models and their status on the EFI client:
 
-- [x] **ImageBegin field-numbering fix** (2026-09-18) — `-4`/`-5`/`-9` disagreed with
-  both the spec and `go-fdo/fsim/bmo_owner.go`. The client read `expected_hash` from
-  `-4` (actually `version`) and `meta_url` from `-9` (actually `expected_hash`), so the
-  inline-transfer hash check was silently never using the begin-message hash. Correct
-  map is now: `-4` version, `-5` description, `-7` url (modes 1 *and* 2), `-9`
-  expected_hash, `-10` meta_signer. Parser match arms now use the `BMO_FIELD_*`
-  constants directly so the table and the parser cannot drift apart again.
-- [x] **Prefer the authorising hash** (2026-09-18) — inline mode verified against the
-  hash in the *unsigned* `image-end`. Now prefers `expected_hash` from `image-begin`,
-  requires the two to agree when both are present, and warns loudly when only the
-  image-end hash is available (transport integrity, not an authorisation binding).
+| Model | Description | EFI status | QEMU tested? |
+|---|---|---|---|
+| 1 | Owner service, unsigned payloads | **Working** (channel authority) | Yes (`start4.sh`, `start5-verify.sh`) |
+| 2 | Delegate service, unsigned payloads | **Working** (delegate chain validated, PERM.7 checked) | Yes (`start8-delegate-unsigned.sh`, positive + negative) |
+| 3 | Owner-signed payloads (COSE_Sign1 tag 18) | **Working** (image-begin + set + scope + GUID) | Yes (`start7-bmo-signed.sh`, `start11-signed-negative.sh`, `start12-signed-set.sh`, `start13-bmo-signed-scope.sh`, `start14-scope-guid.sh`) |
+| 4 | Delegate-signed payloads (x5chain) | **Working** (x5chain validated, PERM.7 checked, leaf key verified) | Yes (`start9-delegate-signed.sh`, positive + server-side negative) |
 
-- [ ] **Voucher walk → TO2-proven Owner key.** Prerequisite for everything below.
-  Today `perform_to2()` never verifies the `ProveOVHdr` signature (`extract_cose_payload`
-  skips it) and discards all OV entries, so the device has no Owner key and no
-  cryptographic proof of who it is talking to. Needs: recompute the OVHeader HMAC with
-  the TPM HMAC key and compare; walk the entry chain (entry[0] signed by
-  `OVHeader.ManufacturerKey`, entry[i] by entry[i-1]); check `hashPrevEntry` /
-  `hashHdrInfo`; Owner key = last entry's `OVEPubKey`.
+### Completed prerequisites
 
-  **No X.509 certificate parsing is required for this**, despite appearances. FDO's
-  `PublicKey = [pkType, pkEnc, pkBody]` defines `pkEnc = X509: 1`, which the spec
-  states means `pkBody` *is* the ASN.1 `SubjectPublicKeyInfo` — an algorithm OID plus
-  a public key bit string, **not** a certificate. No issuer, subject, validity,
-  extensions or signature. For P-256 it is a fixed 26-byte prefix followed by
-  `0x04 || X(32) || Y(32)`, and `di/protocol.rs:934` already hardcodes that prefix for
-  CSR generation. go-fdo's `-di-key-enc x509` default therefore means "raw SPKI key
-  blob", not "certificate". Certificates only appear if a deployment uses
-  `pkEnc = X5CHAIN: 2` for voucher keys (not the go-fdo default), or in `DelegateChain`
-  / artifact `x5chain` — see the separate x5chain item below.
+- [x] **ImageBegin field-numbering fix** (2026-09-18)
+- [x] **Prefer the authorising hash** (2026-09-18)
+- [x] **Voucher walk -> TO2-proven Owner key** — `voucher.rs` recomputes HMAC,
+  walks the entry chain, verifies signatures. Owner key is established at
+  `fdo.rs:1927-1943` and threaded into `process_bmo_message` at `fdo.rs:2123-2128`.
+  ProveOVHdr signature verified at `fdo.rs:1945-1971`. Negative tests pass
+  (start6-negative.sh: tampered entries, HMAC, ProveOVHdr, to1d all abort).
+- [x] **Artifact authority, Owner-direct (Model 3, image-begin)** — `bmo.rs`
+  detects CBOR tag 18 (`0xD2`), calls `cose::verify_bmo_signed()` with external
+  AAD `["FDO-FSIM-BmoProvision-v1"]`, checks protected `content_type`. No-downgrade
+  rule enforced: tag-18 body that fails verification is rejected, never retried as
+  unsigned. Tested on QEMU with `-bmo-sign` (start7-bmo-signed.sh).
+- [x] **Delegate TO2 support (Models 2 and 4 prerequisite)** (2026-09-23) —
+  New `delegate.rs` module provides minimal no-std X.509 DER parsing for delegate
+  certificate chain validation. Replaces the delegate rejection at `fdo.rs:1951-1960`
+  with actual validation:
+  - Parses delegate chain from ProveOVHdr label 258 (FDO PublicKey X5CHAIN)
+  - Validates certificate chain: root signed by Owner key, each cert by its parent
+  - Extracts leaf public key for ProveOVHdr signature verification
+  - Checks OIDPermitProvision (PERM.7) and onboard permissions on leaf cert
+  - Rejects delegates that lack any onboard permission
+  - to1d delegate support also implemented (same chain validation)
+  - `delegate_has_provision` flag threaded from TO2 into `process_bmo_message`
+- [x] **Model 2: Delegate channel authority for unsigned BMO** (2026-09-23) —
+  `bmo.rs` `process_bmo_message` now accepts unsigned image-begin when:
+  (a) Owner key present, AND (b) delegate has PERM.7. Rejects unsigned when
+  Owner key present and no delegate PERM.7. Tested on QEMU:
+  - Positive: `start8-delegate-unsigned.sh` (delegate with onboard+provision)
+  - Negative: `start8-delegate-unsigned.sh --no-provision` (onboard only, rejected)
 
-  Requires moving `p256`/`ecdsa` out of the `rv-firmware` feature gate into the default
-  build (~20 KiB, measured). This item is a hard prerequisite for *all* the delegate
-  work too: both `fdo.bmo.md` and the delegate spec root trust in the "TO2-proven Owner
-  key", and a delegate chain cannot be validated against a key the device does not have.
-- [ ] **Determine and retain peer provisioning authority** (channel authority).
-  Owner-direct (no DelegateChain, ProveOVHdr verifies against Owner key) ⇒ authorised.
-  DelegateChain present ⇒ authorised iff `fdo-ekt-permit-provision` (PERM.7,
-  `1.3.6.1.4.1.45724.3.1.7`) is present in *every* cert in the chain. Spec makes this
-  mode REQUIRED and it MUST be enabled by default.
-- [ ] **Artifact authority, Owner-direct.** Detect CBOR tag 18 on `image-begin`/`set`,
-  verify COSE_Sign1 against the Owner key with `external_aad =
-  ["FDO-FSIM-BmoProvision-v1"]`, check protected `content_type`. Generalize
-  `rv_firmware/cose_verify.rs` — currently hardcodes the platform key and an empty
-  external_aad — to take key + AAD as parameters. Must honour the **no-downgrade**
-  rule: a tag-18 body that fails verification is rejected, never retried as unsigned.
-- [ ] **`fdo.bmo.scope` evaluation.** Protected-header map, text label `"fdo.bmo.scope"`.
-  `guid` is MUST once artifact authority exists — compare against the **voucher** GUID
-  proven in TO2, *not* any replacement GUID from `TO2.SetupDevice`, so the voucher GUID
-  must be retained for the session. `not_before`/`not_after` SHOULD, `generation` MAY.
-  Unevaluable constraints MUST fail closed (error 17 clock / 18 generation / 15 unknown
-  field) — never silently ignored.
+### Remaining work — ordered by priority
+
+#### Model 3 completion (Owner-signed)
+
+- [x] **Signed `fdo.bmo:set` handling** (2026-09-23) — `process_bmo_message` now
+  calls `unwrap_bmo_signed` for `fdo.bmo:set` with the same signed/unsigned gate
+  as `image-begin`. `parse_bmo_set` extracts name/value pairs from the CBOR array.
+  Device responds with `fdo.bmo:response` (matching go-fdo wire key). Tested on
+  QEMU with `start12-signed-set.sh` — both signed image-begin and signed set
+  verified OK. Also fixed go-fdo server bug: BIOS params were never sent due to
+  early `moduleDone=true` return before BIOS sending state.
+- [x] **QEMU negative test for signed BMO** (2026-09-23) — `start11-signed-negative.sh`
+  uses `-bmo-presigned` with a COSE body signed by a wrong key. Device correctly
+  rejects: `SIGNATURE VERIFICATION FAILED against Owner key` → `BMO state: Error`.
+- [x] **`fdo.bmo.scope` evaluation** (2026-09-23) — `evaluate_bmo_scope()` in
+  `cose.rs` parses the `fdo.bmo.scope` protected header field and evaluates:
+  - `guid` (MUST): compare against voucher GUID proven in TO2. Single bstr or
+    array of bstr (any-match). Mismatch → reject.
+  - `not_before`/`not_after` (SHOULD): parsed and logged. Enforcement skipped
+    (no trusted clock in UEFI — see clock policy below).
+  - `generation` (MAY): parsed and logged. Enforcement skipped (no rollback
+    storage yet — see anti-rollback below).
+  - Unknown scope fields → fail closed.
+  Tested on QEMU:
+  - `start13-bmo-signed-scope.sh` — not_before/not_after/generation parsed and
+    logged, artifact accepted (positive).
+  - `start14-scope-guid.sh` — GUID scope enforcement tested with two legs:
+    - **Positive**: correct device GUID in scope → "scope guid matches device
+      GUID" → accepted, BMO state Complete.
+    - **Negative**: wrong GUID (deadbeef...) → "scope guid MISMATCH — artifact
+      not for this device" → rejected, BMO state Error.
+  Server flags: `-bmo-scope-not-before`, `-bmo-scope-not-after`,
+  `-bmo-scope-generation`. Pre-signed helper: `presign_guid` (cross-compiled).
 - [ ] **Error codes 16/17/18** — Provisioning Scope Mismatch / Validity Failed /
-  Superseded. Add alongside the existing 15.
-- [ ] **Delegate `x5chain` in artifacts** (spec says SHOULD, not MUST). Measured cost:
-  `x509-cert` 0.3.0 builds clean for `x86_64-unknown-uefi` `no_std` and costs **+64 KiB**
-  on top of ECDSA (+85 KiB over baseline, 293→376 KiB). Use the crate rather than
-  hand-rolling DER — attacker-supplied DER parsed in a pre-OS path that then chainloads
-  code is a boot-chain CVE generator. Caveat: `x509-cert` 0.3 pulls `der 0.8.2` while
-  `p256`/`ecdsa` 0.13 pull `der 0.7.10`, so two DER parsers link in; check whether
-  upgrading the RustCrypto stack collapses them before accepting the 64 KiB. Also
-  confirm `x509-cert` 0.3.0 is >7 days published before adding it.
-- [ ] **Clock policy.** `not_before`/`not_after` need a clock the device can justify
-  trusting. Classify UEFI `GetTime()` as trustworthy only with a working RTC and a
-  plausible reading (≥ firmware build date); maintain a monotonic high-water mark in
-  TPM NV; fail closed otherwise. A validity window is a supersession control against a
-  remote conduit, **not** tamper resistance against someone who can pull the RTC battery.
-- [ ] **`generation` anti-rollback storage.** OPTIONAL to implement, but if implemented
-  the high-water mark MUST live in rollback-protected NV (TPM NV under policy) — a
-  counter that can be rewound fails *permissively*, which is worse than not implementing
-  it. `rv_firmware/anti_rollback.rs` (TPM NV 0x01D10002) is the existing precedent.
+  Superseded. Add alongside the existing 15. Currently scope failures return
+  generic rejection; specific error codes would improve diagnostics.
+
+#### Model 4: Delegate-signed BMO artifacts (x5chain)
+
+- [x] **Delegate TO2 support** — Done (see "Completed prerequisites" above).
+  `delegate.rs` provides full X.509 chain validation with no external x509 crate.
+- [x] **Delegate `x5chain` in BMO artifacts (Model 4)** (2026-09-23) —
+  `verify_bmo_signed` in `cose.rs` now:
+  - Extracts x5chain (label 33) from BMO COSE unprotected header
+  - Validates certificate chain to Owner key via `delegate::verify_delegate_chain`
+  - Checks PERM.7 (`OIDPermitProvision`) on leaf certificate
+  - Verifies COSE signature against delegate leaf key (not Owner key)
+  - Tested on QEMU:
+    - Positive: `start9-delegate-signed.sh` (delegate with PERM.7 signs BMO)
+    - Negative: `start9-delegate-signed.sh --no-provision` (server refuses to start)
+
+#### Scope infrastructure
+
+- [ ] **Clock policy** — `not_before`/`not_after` need a trustworthy clock.
+  Classify UEFI `GetTime()` as trustworthy only with working RTC and plausible
+  reading (>= firmware build date). Maintain monotonic high-water mark in TPM NV.
+  Fail closed otherwise.
+- [ ] **`generation` anti-rollback storage** — OPTIONAL. If implemented, the
+  high-water mark MUST live in rollback-protected TPM NV. A counter that can be
+  rewound fails permissively, worse than not implementing it.
+  `rv_firmware/anti_rollback.rs` (NV 0x01D10002) is the precedent.
 - [ ] **Strict provisioning policy** (MAY) — operator switch to require artifact
-  authority even from a peer that holds provisioning authority. MUST default to off.
+  authority even from a peer that holds provisioning authority. Default off.
+
+### Historical notes
+
+The original TODO items for "Voucher walk -> TO2-proven Owner key" and
+"Artifact authority, Owner-direct" are now completed (see above). The old text
+described `perform_to2()` as never verifying ProveOVHdr — that was accurate at
+the time but is no longer true. The current code at `fdo.rs:1927-1971`
+implements full voucher chain verification and ProveOVHdr signature checking.
 
 ### Blocked on other repos
 
-- [ ] **`go-fdo-meta-tool`: `fdo.bmo.scope` support.** The tool cannot currently produce
-  a scoped provisioning artifact, so the device-side work above cannot be tested
-  end-to-end against anything. Needs: mint a signed `image-begin` carrying
-  `fdo.bmo.scope` with `guid` (per-device or a small array), `not_before`/`not_after`,
-  and `generation`; bulk-mint per-GUID artifacts from a voucher set; and sign either
-  Owner-direct or as a PERM.7 delegate with the `x5chain` embedded. Offline/HSM signing
-  is the whole point — the tool must not need to be online during TO2.
-- [ ] **`go-fdo`: server-side scope emission.** `fsim/bmo_provision.go` implements
-  signing but knows nothing about `fdo.bmo.scope`; it needs to emit the protected header
-  and to support delivering pre-signed artifacts it did not mint itself (CDN mode —
-  the server holds only an onboard delegate and must not re-sign).
+- [x] **`go-fdo-meta-tool`: scope encoding.** The meta-tool now supports `-guid`,
+  `-not-before`, `-not-after`, `-generation` flags on `provision sign`. Scope is
+  encoded into the COSE protected header. **However**, `provision verify` does not
+  evaluate scope — it only checks signature validity. See `go-fdo-meta-tool/TODO.md`.
+- [x] **`go-fdo`: server-side pre-signed artifact delivery.** (2026-09-23)
+  `BMOOwner.AddPreSignedImage()` delivers a pre-signed COSE body as-is via
+  `-bmo-presigned`. Used in negative tests and meta-tool round-trip.
+- [x] **`go-fdo`: server-side scope emission from flags.** (2026-09-23)
+  `-bmo-scope-not-before`, `-bmo-scope-not-after`, `-bmo-scope-generation` flags
+  added to the server CLI. Scope is included in the COSE protected header when
+  any scope flag is set alongside `-bmo-sign` or `-bmo-delegate-provision`.
 
 ### Recently Completed (2026-08-10)
 - [x] Error response handling: Message-Type header parsing, FDO error body decoder (error_code, msg_type, error_string)
@@ -748,66 +811,85 @@ first; the new firmware config takes effect on the next boot.
   firmware stub", recommended OEM config) so it can re-provision itself. A pure
   `rv-firmware` Stage 1 cannot, and would need a separate DI binary deployed.
 
-## Build Size Analysis — all 7 feature combinations (2026-09-01)
+## Build Size Analysis — all 8 feature combinations
 
-Release builds, `x86_64-unknown-uefi`, all with `uefi-http,tcp4-http`.
-Full table with use cases lives in README.md under "Valid Feature Combinations".
+### Current (2026-09-23)
 
-| `di` | `fdo-installer` | `rv-firmware` | Size | over base |
-|:----:|:---------------:|:-------------:|---------:|----------:|
-| | | | 51 KiB | base |
-| ✓ | | | 162 KiB | +111 KiB |
-| | | ✓ | 178 KiB | +127 KiB |
-| | ✓ | | 226 KiB | +175 KiB |
-| ✓ | | ✓ | 238.5 KiB | +187.5 KiB |
-| ✓ | ✓ | | 264 KiB | +213 KiB |
-| | ✓ | ✓ | 306 KiB | +255 KiB |
-| ✓ | ✓ | ✓ | 340 KiB | +289 KiB |
+Since the 2026-09-01 baseline, the `fdo-installer` feature gained:
+- Delegation support (x5chain X.509 chain validation in `delegate.rs`)
+- Signed BMO (COSE_Sign1 tag 18 verification for image-begin + set)
+- `fdo.bmo.scope` evaluation (guid, not_before, not_after, generation)
+- Signed `fdo.bmo:set` handling with BIOS parameter parsing
+
+Release builds, `x86_64-unknown-uefi`, all with `uefi-http,tcp4-http`:
+
+| `di` | `fdo-installer` | `rv-firmware` | Size | over base | Δ from Sep-01 |
+|:----:|:---------------:|:-------------:|---------:|----------:|-------------:|
+| | | | 51 KiB | base | +0 |
+| ✓ | | | 168 KiB | +117 KiB | +6 KiB |
+| | | ✓ | 168 KiB | +117 KiB | −10 KiB |
+| | ✓ | | 328 KiB | +277 KiB | +102 KiB |
+| ✓ | | ✓ | 328 KiB | +277 KiB | +89.5 KiB |
+| ✓ | ✓ | | 368 KiB | +317 KiB | +104 KiB |
+| | ✓ | ✓ | 375.5 KiB | +324.5 KiB | +69.5 KiB |
+| ✓ | ✓ | ✓ | 409 KiB | +358 KiB | +69 KiB |
 
 Marginal cost, alone vs added to a build that already has the other two:
 
 | Feature | alone | incremental |
 |---------|---------:|-----------:|
-| `di` | +111 KiB | +34 KiB |
-| `fdo-installer` | +175 KiB | +101.5 KiB |
-| `rv-firmware` | +127 KiB | +76 KiB |
+| `di` | +117 KiB | +33.5 KiB |
+| `fdo-installer` | +277 KiB | +81 KiB |
+| `rv-firmware` | +117 KiB | +41 KiB |
+
+### Where the growth went
+
+The `fdo-installer` feature grew **+102 KiB** (from 226→328 KiB). This is the
+cost of the new security features:
+- **Delegation** (`delegate.rs`): X.509 chain validation, ASN.1 DER parsing,
+  OID matching, signature verification for x5chain — replaces the need for an
+  external x509 crate.
+- **COSE verification** (`cose.rs`): COSE_Sign1 parsing, protected header map
+  iteration, content_type and fdo.bmo.scope evaluation, ECDSA signature
+  verification against Owner or delegate keys.
+- **Signed BMO handlers** (`bmo.rs`): unwrap_bmo_signed for image-begin and set,
+  BIOS parameter CBOR parsing, set-response builder.
+
+The non-`fdo-installer` features (`di`, `rv-firmware`, base) barely changed
+because the new code is gated behind `fdo-installer`.
+
+### Previous (2026-09-01 baseline)
+
+| `di` | `fdo-installer` | `rv-firmware` | Size |
+|:----:|:---------------:|:-------------:|---------:|
+| | | | 51 KiB |
+| ✓ | | | 162 KiB |
+| | | ✓ | 178 KiB |
+| | ✓ | | 226 KiB |
+| ✓ | | ✓ | 238.5 KiB |
+| ✓ | ✓ | | 264 KiB |
+| | ✓ | ✓ | 306 KiB |
+| ✓ | ✓ | ✓ | 340 KiB |
 
 ### Observations
 
-- The two columns differ by shared code (CBOR, COSE, TPM, HTTP helpers) that
-  each feature needs but the linker only includes once. `di` alone costs
-  +111 KiB but only +34 KiB incrementally — nearly all of it is already linked.
-- The transports alone are 51 KiB, so no build gets smaller than that.
-- Stage 1 as shipped today (`rv-firmware,di`, self-provisioning) is 238.5 KiB.
-  Dropping `di` — provisioning at the factory with a separate tool instead —
-  would save 60.5 KiB, worth considering if Stage 1 is flash-resident.
-- The everything binary (340 KiB) is roughly 2x the minimal stub (178 KiB).
+- The everything binary grew from 340→409 KiB (+69 KiB, +20%) — the cost of
+  full Model 3/4 security (delegation + signed BMO + scope).
+- `di` and `rv-firmware` converged to the same size (168 KiB each), likely due
+  to shared code paths being refactored.
+- The transports alone remain 51 KiB — no change.
+- Incrementally, `fdo-installer` costs only +81 KiB when `di` + `rv-firmware`
+  are already present (shared COSE/CBOR/crypto code).
 
-### Stripped sizes: identical (verified, 2026-09-01)
+### Stripped sizes: still identical (verified, 2026-09-23)
 
-An earlier note here claimed these were "unstripped debug-symbol-bearing
-builds". That was wrong. Rebuilding every combination with
-`RUSTFLAGS="-C strip=symbols"` produces **byte-identical** output:
-
+`RUSTFLAGS="-C strip=symbols"` produces byte-identical output:
 ```
-di                            162 KiB   -> 162 KiB
-rv-firmware                   178 KiB   -> 178 KiB
-di,fdo-installer,rv-firmware  340 KiB   -> 340 KiB
+di,fdo-installer,rv-firmware  409 KiB   -> 409 KiB
 ```
+Same reasons as before: UEFI target puts debug info in `.pdb` (not in `.efi`),
+and `[profile.release]` already has `lto = true`, `opt-level = "z"`.
 
-Two reasons:
-
-- The UEFI target links MSVC-style: debug info goes to a separate
-  `fdo_uefi.pdb` (128 KiB) which is never part of the `.efi`. The image has no
-  PE debug directory — data directory index 6 is RVA 0, size 0.
-- `[profile.release]` already sets `lto = true`, `opt-level = "z"`,
-  `panic = "abort"`.
-
-So the chart numbers are the real shippable sizes, and there is no build-flag
-headroom left. Section breakdown of the 238.5 KiB `rv-firmware,di` build:
-`.text` 173 KiB (73%), `.rdata` 61 KiB (26%), `.reloc` 1.9 KiB, `.data` 80 B,
-`.eh_frame` 64 B — almost entirely code and read-only data.
-
-- [ ] The only remaining lever is content, not flags: `.rdata` at 61 KiB is
-  substantial and a large share of it is log format strings. A build-time
-  feature to compile out non-error logging would be the next real saving.
+- [ ] The only remaining lever is content, not flags: `.rdata` is likely ~80 KiB
+  now with the added log strings from scope/delegation. A build-time feature to
+  compile out non-error logging would be the next real saving.

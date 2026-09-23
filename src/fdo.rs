@@ -1948,26 +1948,65 @@ pub fn perform_to2(
     let prove_ov_s1 = crate::cose::parse_cose_sign1(&response_prove_ov)
         .ok_or_else(|| FdoError::CborError(String::from("ProveOVHdr is not a valid COSE_Sign1")))?;
 
-    if crate::cose::has_delegate_header(prove_ov_s1.unprotected_header) {
-        // A Delegate signed ProveOVHdr on the Owner's behalf. Validating that
-        // requires X.509 delegate-chain support, which is not implemented.
-        // Refuse loudly rather than silently accepting an unverified signer.
-        error!("TO2: ProveOVHdr carries a DelegateChain / delegate key header.");
-        error!("TO2: Delegate onboarding requires X.509 chain validation, which is not");
-        error!("TO2: implemented. ABORTING rather than accepting an unverified signer.");
-        return Err(FdoError::CryptoError(String::from(
-            "delegate-signed ProveOVHdr not supported")));
-    }
+    // Check for delegate chain (label 258) in the unprotected header.
+    // If present, validate the chain and use the delegate leaf key for
+    // ProveOVHdr verification instead of the Owner key directly.
+    let mut delegate_has_provision = false;
 
-    let prove_ov_aad = crate::cose::domain_aad(
-        crate::cose::AAD_TAG_PROVE_OV_HDR,
-        FDO_PROTOCOL_VERSION,
-    );
-    if !crate::cose::verify_sign1(&prove_ov_s1, &prove_ov_aad, &owner_key) {
-        error!("TO2: ProveOVHdr SIGNATURE VERIFICATION FAILED against the Owner key.");
-        error!("TO2: ABORTING — the peer does not hold the Owner key for this device.");
-        return Err(FdoError::CryptoError(String::from(
-            "ProveOVHdr signature verification failed")));
+    if crate::cose::has_delegate_header(prove_ov_s1.unprotected_header) {
+        info!("TO2: ProveOVHdr carries a delegate chain — validating...");
+
+        // Extract DER certificates from label 258
+        let cert_ders = crate::delegate::extract_delegate_chain_from_unprotected(
+            prove_ov_s1.unprotected_header,
+        ).ok_or_else(|| {
+            error!("TO2: Failed to parse delegate chain from ProveOVHdr");
+            FdoError::CryptoError(String::from("delegate chain parse failed"))
+        })?;
+
+        // Build a reference slice for the validation function
+        let cert_refs: Vec<&[u8]> = cert_ders.iter().map(|c| c.as_slice()).collect();
+
+        // Validate the chain: root signed by Owner, each cert by its parent
+        let chain_result = crate::delegate::verify_delegate_chain(&cert_refs, &owner_key)
+            .ok_or_else(|| {
+                error!("TO2: Delegate chain VERIFICATION FAILED");
+                FdoError::CryptoError(String::from("delegate chain verification failed"))
+            })?;
+
+        if !chain_result.has_onboard {
+            error!("TO2: Delegate certificate lacks any fdo-ekt-permit-onboard-* permission");
+            return Err(FdoError::CryptoError(String::from(
+                "delegate lacks onboard permission")));
+        }
+
+        info!("TO2: Delegate chain verified — leaf has onboard={}, provision={}",
+            chain_result.has_onboard, chain_result.has_provision);
+        delegate_has_provision = chain_result.has_provision;
+
+        // Verify ProveOVHdr signature with the delegate leaf key
+        let prove_ov_aad = crate::cose::domain_aad(
+            crate::cose::AAD_TAG_PROVE_OV_HDR,
+            FDO_PROTOCOL_VERSION,
+        );
+        if !crate::cose::verify_sign1(&prove_ov_s1, &prove_ov_aad, &chain_result.leaf_key_point) {
+            error!("TO2: ProveOVHdr SIGNATURE VERIFICATION FAILED against delegate leaf key.");
+            return Err(FdoError::CryptoError(String::from(
+                "ProveOVHdr signature verification failed (delegate)")));
+        }
+        info!("TO2: ProveOVHdr signature VERIFIED against delegate leaf key");
+    } else {
+        // No delegate — verify ProveOVHdr directly against the Owner key
+        let prove_ov_aad = crate::cose::domain_aad(
+            crate::cose::AAD_TAG_PROVE_OV_HDR,
+            FDO_PROTOCOL_VERSION,
+        );
+        if !crate::cose::verify_sign1(&prove_ov_s1, &prove_ov_aad, &owner_key) {
+            error!("TO2: ProveOVHdr SIGNATURE VERIFICATION FAILED against the Owner key.");
+            error!("TO2: ABORTING — the peer does not hold the Owner key for this device.");
+            return Err(FdoError::CryptoError(String::from(
+                "ProveOVHdr signature verification failed")));
+        }
     }
     // Verify the TO1 rendezvous blob against the same Owner key. Per FDO, if
     // the to1d signature does not verify the device must assume a man in the
@@ -1978,22 +2017,41 @@ pub fn perform_to2(
         Some(blob) if !blob.is_empty() => {
             let s1 = crate::cose::parse_cose_sign1(blob)
                 .ok_or_else(|| FdoError::CborError(String::from("to1d is not a valid COSE_Sign1")))?;
-            if crate::cose::has_delegate_header(s1.unprotected_header) {
-                error!("TO2: to1d was signed by a Delegate; X.509 chain validation not implemented.");
-                return Err(FdoError::CryptoError(String::from(
-                    "delegate-signed to1d not supported")));
-            }
             let aad = crate::cose::domain_aad(
                 crate::cose::AAD_TAG_OWNER_SIGN,
                 FDO_PROTOCOL_VERSION,
             );
-            if !crate::cose::verify_sign1(&s1, &aad, &owner_key) {
-                error!("TO2: to1d (rendezvous blob) SIGNATURE VERIFICATION FAILED.");
-                error!("TO2: A man in the middle may be redirecting this device. ABORTING.");
-                return Err(FdoError::CryptoError(String::from(
-                    "to1d signature verification failed")));
+            if crate::cose::has_delegate_header(s1.unprotected_header) {
+                // to1d was signed by a delegate. Validate the chain and use
+                // the delegate leaf key for signature verification.
+                info!("TO2: to1d was signed by a delegate — validating chain...");
+                let cert_ders = crate::delegate::extract_delegate_chain_from_unprotected(
+                    s1.unprotected_header,
+                ).ok_or_else(|| {
+                    error!("TO2: Failed to parse delegate chain from to1d");
+                    FdoError::CryptoError(String::from("to1d delegate chain parse failed"))
+                })?;
+                let cert_refs: Vec<&[u8]> = cert_ders.iter().map(|c| c.as_slice()).collect();
+                let chain_result = crate::delegate::verify_delegate_chain(&cert_refs, &owner_key)
+                    .ok_or_else(|| {
+                        error!("TO2: to1d delegate chain VERIFICATION FAILED");
+                        FdoError::CryptoError(String::from("to1d delegate chain verification failed"))
+                    })?;
+                if !crate::cose::verify_sign1(&s1, &aad, &chain_result.leaf_key_point) {
+                    error!("TO2: to1d SIGNATURE VERIFICATION FAILED against delegate leaf key.");
+                    return Err(FdoError::CryptoError(String::from(
+                        "to1d signature verification failed (delegate)")));
+                }
+                info!("TO2: to1d signature VERIFIED against delegate leaf key");
+            } else {
+                if !crate::cose::verify_sign1(&s1, &aad, &owner_key) {
+                    error!("TO2: to1d (rendezvous blob) SIGNATURE VERIFICATION FAILED.");
+                    error!("TO2: A man in the middle may be redirecting this device. ABORTING.");
+                    return Err(FdoError::CryptoError(String::from(
+                        "to1d signature verification failed")));
+                }
+                info!("TO2: to1d rendezvous blob signature VERIFIED against Owner key");
             }
-            info!("TO2: to1d rendezvous blob signature VERIFIED against Owner key");
         }
         _ => {
             // Legitimate for RV bypass, where no blob is issued. Also reached
@@ -2123,7 +2181,7 @@ pub fn perform_to2(
                         // Check if this is a BMO message
                         if key.starts_with("fdo.bmo:") {
                             debug!("    Processing BMO message: {}", key);
-                            if let Some((resp_key, resp_value)) = process_bmo_message(&mut bmo_session, &key, &value, Some(&owner_key)) {
+                            if let Some((resp_key, resp_value)) = process_bmo_message(&mut bmo_session, &key, &value, Some(&owner_key), delegate_has_provision, Some(guid.as_slice())) {
                                 debug!("    BMO response: {} ({} bytes)", resp_key, resp_value.len());
                                 bmo_responses.push((resp_key, resp_value));
                             }

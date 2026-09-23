@@ -205,13 +205,18 @@ pub fn verify_sign1(s1: &CoseSign1, external_aad: &[u8], point: &[u8]) -> bool {
 /// Checks:
 /// 1. Parses the COSE_Sign1 (expects tag 18 to already be present)
 /// 2. Verifies content_type in protected header matches `expected_ct`
-/// 3. Builds external_aad = CBOR(["FDO-FSIM-BmoProvision-v1"])
-/// 4. Verifies signature against `owner_point` (P-256, 65 bytes)
-/// 5. If x5chain (label 33) is present in unprotected header, logs it
-///    (full delegate chain validation is a future item)
+/// 3. Evaluates fdo.bmo.scope if present (guid, not_before, not_after, generation)
+/// 4. Builds external_aad = CBOR(["FDO-FSIM-BmoProvision-v1"])
+/// 5. If x5chain (label 33) is present in unprotected header:
+///    - Validates certificate chain to `owner_point`
+///    - Checks PERM.7 (OIDPermitProvision) on leaf certificate
+///    - Verifies signature against delegate leaf key (Model 4)
+/// 6. Otherwise verifies signature against `owner_point` directly (Model 3)
+///
+/// `device_guid` is the 16-byte voucher GUID proven in TO2 (for scope.guid check).
 ///
 /// Returns the inner payload bytes on success, or None on failure.
-pub fn verify_bmo_signed<'a>(data: &'a [u8], owner_point: &[u8], expected_ct: &str) -> Option<&'a [u8]> {
+pub fn verify_bmo_signed<'a>(data: &'a [u8], owner_point: &[u8], expected_ct: &str, device_guid: Option<&[u8]>) -> Option<&'a [u8]> {
     let s1 = parse_cose_sign1(data)?;
 
     // Check content_type (label 3) in protected header
@@ -230,31 +235,304 @@ pub fn verify_bmo_signed<'a>(data: &'a [u8], owner_point: &[u8], expected_ct: &s
         }
     }
 
-    // Check for delegate x5chain in unprotected header
-    if has_delegate_header(s1.unprotected_header) {
-        // For now, we only support Owner-signed (Case 3).
-        // Delegate-signed (Case 4) requires x509 cert chain validation.
-        warn!("BMO COSE: x5chain/delegate header present — delegate verification not yet implemented");
-        warn!("BMO COSE: falling back to direct Owner key verification");
-        // TODO: extract leaf cert from x5chain, verify chain to owner_point,
-        // check OIDPermitProvision, and verify signature with leaf key.
+    // Evaluate fdo.bmo.scope if present in the protected header.
+    if !evaluate_bmo_scope(s1.protected_header, device_guid) {
+        error!("BMO COSE: scope evaluation FAILED — rejecting artifact");
+        return None;
     }
 
     // Build external_aad = CBOR(["FDO-FSIM-BmoProvision-v1"])
-    // This is always used (no version gating like FDO protocol AAD).
     let mut aad = Vec::with_capacity(AAD_TAG_BMO_PROVISION.len() + 3);
     aad.push(0x81); // array(1)
     encode_tstr(&mut aad, AAD_TAG_BMO_PROVISION);
 
-    // Verify signature
-    let sig_structure = build_sig_structure(s1.protected_header, &aad, s1.payload);
-    if !verify_es256(&sig_structure, s1.signature, owner_point) {
-        error!("BMO COSE: SIGNATURE VERIFICATION FAILED");
-        return None;
+    // Determine the verification key: Owner-direct (Model 3) or delegate x5chain (Model 4).
+    if has_delegate_header(s1.unprotected_header) {
+        // Model 4: Delegate-signed provisioning artifact.
+        // Extract the x5chain, validate the certificate chain against the Owner key,
+        // check that the leaf has PERM.7, and verify the signature with the leaf key.
+        info!("BMO COSE: x5chain present — delegate-signed artifact (Model 4)");
+
+        let cert_ders = match crate::delegate::extract_x5chain_from_unprotected(s1.unprotected_header) {
+            Some(c) => c,
+            None => {
+                error!("BMO COSE: failed to extract x5chain from unprotected header");
+                return None;
+            }
+        };
+
+        let cert_refs: Vec<&[u8]> = cert_ders.iter().map(|c| c.as_slice()).collect();
+        let chain_result = match crate::delegate::verify_delegate_chain(&cert_refs, owner_point) {
+            Some(r) => r,
+            None => {
+                error!("BMO COSE: delegate x5chain verification FAILED");
+                return None;
+            }
+        };
+
+        if !chain_result.has_provision {
+            error!("BMO COSE: delegate leaf certificate lacks OIDPermitProvision (PERM.7)");
+            error!("BMO COSE: a delegate signing provisioning artifacts MUST have PERM.7");
+            return None;
+        }
+
+        info!("BMO COSE: delegate chain verified, leaf has PERM.7");
+
+        // Verify signature against the delegate leaf key
+        let sig_structure = build_sig_structure(s1.protected_header, &aad, s1.payload);
+        if !verify_es256(&sig_structure, s1.signature, &chain_result.leaf_key_point) {
+            error!("BMO COSE: SIGNATURE VERIFICATION FAILED against delegate leaf key");
+            return None;
+        }
+
+        info!("BMO COSE: delegate-signed artifact verified OK (content_type={})", expected_ct);
+    } else {
+        // Model 3: Owner-direct signed provisioning artifact.
+        let sig_structure = build_sig_structure(s1.protected_header, &aad, s1.payload);
+        if !verify_es256(&sig_structure, s1.signature, owner_point) {
+            error!("BMO COSE: SIGNATURE VERIFICATION FAILED against Owner key");
+            return None;
+        }
+
+        info!("BMO COSE: Owner-signed artifact verified OK (content_type={})", expected_ct);
     }
 
-    info!("BMO COSE: signature verified OK (content_type={})", expected_ct);
     Some(s1.payload)
+}
+
+/// Label for the scope field in the protected header.
+const BMO_SCOPE_LABEL: &str = "fdo.bmo.scope";
+
+/// Evaluate fdo.bmo.scope from the protected header.
+///
+/// Returns `true` if scope is absent (no constraint) or all constraints pass.
+/// Returns `false` if any constraint fails (caller should reject the artifact).
+fn evaluate_bmo_scope(protected_header: &[u8], device_guid: Option<&[u8]>) -> bool {
+    // Find the scope bytes in the protected header (text-keyed map entry)
+    let scope_bytes = match extract_tstr_keyed_value(protected_header, BMO_SCOPE_LABEL) {
+        Some(b) => b,
+        None => return true, // No scope → no constraints
+    };
+
+    info!("BMO COSE: evaluating fdo.bmo.scope ({} bytes)", scope_bytes.len());
+
+    // Parse scope as a CBOR map with text keys
+    let mut pos = 0usize;
+    let b = match scope_bytes.get(pos) {
+        Some(&b) => b,
+        None => return true,
+    };
+    pos += 1;
+    if (b >> 5) != 5 {
+        error!("BMO COSE: scope is not a CBOR map");
+        return false; // Unevaluable → fail closed
+    }
+    let map_len = match cbor_read_uint_arg(scope_bytes, &mut pos, b & 0x1f) {
+        Some(n) => n,
+        None => { error!("BMO COSE: scope map length parse error"); return false; }
+    };
+
+    for _ in 0..map_len {
+        // Read text key
+        let key_start = pos;
+        let kb = match scope_bytes.get(pos) {
+            Some(&b) => b,
+            None => { error!("BMO COSE: scope key truncated"); return false; }
+        };
+        pos += 1;
+        if (kb >> 5) != 3 {
+            // Not a text key — skip key+value
+            pos = key_start;
+            if cbor_skip(scope_bytes, &mut pos).is_none() { return false; }
+            if cbor_skip(scope_bytes, &mut pos).is_none() { return false; }
+            continue;
+        }
+        let key_len = match cbor_read_uint_arg(scope_bytes, &mut pos, kb & 0x1f) {
+            Some(n) => n,
+            None => { error!("BMO COSE: scope key length parse error"); return false; }
+        };
+        let key_str = match scope_bytes.get(pos..pos + key_len).and_then(|s| core::str::from_utf8(s).ok()) {
+            Some(s) => s,
+            None => { error!("BMO COSE: scope key not valid UTF-8"); return false; }
+        };
+        pos += key_len;
+
+        match key_str {
+            "guid" => {
+                // guid may be a single bstr (16 bytes) or an array of bstr
+                let guid_ok = evaluate_scope_guid(scope_bytes, &mut pos, device_guid);
+                if !guid_ok {
+                    return false;
+                }
+            }
+            "not_before" => {
+                let ts = match read_scope_uint(scope_bytes, &mut pos) {
+                    Some(v) => v,
+                    None => { error!("BMO COSE: scope not_before parse error"); return false; }
+                };
+                info!("BMO COSE: scope not_before={}", ts);
+                // Clock evaluation: log but do not enforce (no trusted clock in UEFI)
+                warn!("BMO COSE: not_before enforcement skipped (no trusted clock)");
+            }
+            "not_after" => {
+                let ts = match read_scope_uint(scope_bytes, &mut pos) {
+                    Some(v) => v,
+                    None => { error!("BMO COSE: scope not_after parse error"); return false; }
+                };
+                info!("BMO COSE: scope not_after={}", ts);
+                warn!("BMO COSE: not_after enforcement skipped (no trusted clock)");
+            }
+            "generation" => {
+                let gen = match read_scope_uint(scope_bytes, &mut pos) {
+                    Some(v) => v,
+                    None => { error!("BMO COSE: scope generation parse error"); return false; }
+                };
+                info!("BMO COSE: scope generation={}", gen);
+                // Generation enforcement: log but do not enforce (no rollback storage yet)
+                warn!("BMO COSE: generation enforcement skipped (no rollback storage)");
+            }
+            _ => {
+                // Unknown scope field — fail closed per spec
+                error!("BMO COSE: unknown scope field '{}' — fail closed", key_str);
+                return false;
+            }
+        }
+    }
+
+    info!("BMO COSE: scope evaluation PASSED");
+    true
+}
+
+/// Evaluate scope.guid constraint.
+/// Returns true if the GUID matches the device GUID (or if no device GUID provided).
+fn evaluate_scope_guid(data: &[u8], pos: &mut usize, device_guid: Option<&[u8]>) -> bool {
+    let b = match data.get(*pos) {
+        Some(&b) => b,
+        None => { error!("BMO COSE: scope guid truncated"); return false; }
+    };
+
+    let major = b >> 5;
+
+    if major == 2 {
+        // Single bstr (16-byte GUID)
+        *pos += 1;
+        let len = match cbor_read_uint_arg(data, pos, b & 0x1f) {
+            Some(n) => n,
+            None => { error!("BMO COSE: scope guid bstr length error"); return false; }
+        };
+        let guid = match data.get(*pos..*pos + len) {
+            Some(g) => g,
+            None => { error!("BMO COSE: scope guid bstr truncated"); return false; }
+        };
+        *pos += len;
+
+        if let Some(dev_guid) = device_guid {
+            if guid == dev_guid {
+                info!("BMO COSE: scope guid matches device GUID");
+                return true;
+            } else {
+                error!("BMO COSE: scope guid MISMATCH — artifact not for this device");
+                return false;
+            }
+        }
+        info!("BMO COSE: scope guid present but no device GUID to check against");
+        return true;
+    }
+
+    if major == 4 {
+        // Array of bstr (multiple GUIDs — any must match)
+        *pos += 1;
+        let arr_len = match cbor_read_uint_arg(data, pos, b & 0x1f) {
+            Some(n) => n,
+            None => { error!("BMO COSE: scope guid array length error"); return false; }
+        };
+        for _ in 0..arr_len {
+            let gb = match data.get(*pos) {
+                Some(&b) => b,
+                None => { error!("BMO COSE: scope guid array entry truncated"); return false; }
+            };
+            *pos += 1;
+            if (gb >> 5) != 2 {
+                error!("BMO COSE: scope guid array entry not a bstr");
+                return false;
+            }
+            let glen = match cbor_read_uint_arg(data, pos, gb & 0x1f) {
+                Some(n) => n,
+                None => return false,
+            };
+            let guid = match data.get(*pos..*pos + glen) {
+                Some(g) => g,
+                None => return false,
+            };
+            *pos += glen;
+
+            if let Some(dev_guid) = device_guid {
+                if guid == dev_guid {
+                    info!("BMO COSE: scope guid matches device GUID (from array)");
+                    return true;
+                }
+            }
+        }
+        if device_guid.is_some() {
+            error!("BMO COSE: scope guid array — no entry matches device GUID");
+            return false;
+        }
+        return true;
+    }
+
+    error!("BMO COSE: scope guid is not a bstr or array");
+    false
+}
+
+/// Read a uint value from CBOR at position.
+fn read_scope_uint(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let b = *data.get(*pos)?;
+    *pos += 1;
+    if (b >> 5) != 0 {
+        return None; // not a uint
+    }
+    let val = cbor_read_uint_arg(data, pos, b & 0x1f)? as u64;
+    Some(val)
+}
+
+/// Extract a raw CBOR value from a protected header map for a given text key.
+/// Returns the bytes of the value (not decoded), positioned right after the value.
+fn extract_tstr_keyed_value<'a>(header: &'a [u8], target_key: &str) -> Option<&'a [u8]> {
+    if header.is_empty() {
+        return None;
+    }
+    let mut pos = 0usize;
+    let b = *header.get(pos)?;
+    pos += 1;
+    if (b >> 5) != 5 {
+        return None; // not a map
+    }
+    let map_len = cbor_read_uint_arg(header, &mut pos, b & 0x1f)?;
+    for _ in 0..map_len {
+        // Read key — may be int or tstr
+        let key_byte = *header.get(pos)?;
+        let key_major = key_byte >> 5;
+        if key_major == 3 {
+            // Text string key
+            pos += 1;
+            let key_len = cbor_read_uint_arg(header, &mut pos, key_byte & 0x1f)?;
+            let key_str = core::str::from_utf8(header.get(pos..pos + key_len)?).ok()?;
+            pos += key_len;
+            if key_str == target_key {
+                // Return from here to end of this value
+                let value_start = pos;
+                cbor_skip(header, &mut pos)?;
+                return Some(&header[value_start..pos]);
+            }
+            // Skip value
+            cbor_skip(header, &mut pos)?;
+        } else {
+            // Integer or other key type — skip key + value
+            cbor_skip(header, &mut pos)?;
+            cbor_skip(header, &mut pos)?;
+        }
+    }
+    None
 }
 
 /// Extract a text string value for a given integer label from a protected header map.

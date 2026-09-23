@@ -488,6 +488,35 @@ Both positive and negative tests are provided.
 | DI all | `./test-di.sh all` | Both positive and negative |
 | TO2 + BMO | `start3.sh` | Full onboarding with image transfer |
 
+### Hardware Testing with go-fdo Server
+
+`examples/start-hw-server.sh` is a self-contained script for testing the EFI
+client against a go-fdo server on real hardware. It manages the server lifecycle
+across DI and multiple TO2 test modes. Deploy it to the machine running the
+go-fdo server (e.g. pe2), then point the EFI client at it.
+
+```bash
+# On the server machine:
+./start-hw-server.sh di              # Fresh DB + DI server (Ctrl-C after DI)
+./start-hw-server.sh to2             # Unsigned BMO (Model 1: channel authority)
+./start-hw-server.sh to2-signed      # Owner-signed BMO (Model 3: artifact authority)
+./start-hw-server.sh to2-scope       # Signed BMO + scope constraints (Model 3)
+./start-hw-server.sh to2-uki         # Full UKI transfer (~106MB, ~10 min)
+./start-hw-server.sh stop            # Kill server
+./start-hw-server.sh status          # Check status + tail log
+```
+
+```text
+# On the EFI shell (DI — first time or re-provision):
+fs0:\EFI\fdo-uefi.efi -force-di -di http://<server-ip>:8080
+
+# On the EFI shell (TO2 — reads RV URL from TPM credential):
+fs0:\EFI\fdo-uefi.efi
+```
+
+Edit `EXT_HTTP` and `SERVER` at the top of the script to match your
+environment. See the script header for full documentation.
+
 ### Prerequisites (Test Machine)
 
 ```bash

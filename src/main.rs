@@ -31,6 +31,9 @@ mod cose;
 // Ownership Voucher verification — establishes the TO2-proven Owner key.
 #[cfg(feature = "fdo-installer")]
 mod voucher;
+// Delegate certificate chain validation — FDO 2.0 delegate support.
+#[cfg(feature = "fdo-installer")]
+mod delegate;
 mod chainload;
 #[cfg(feature = "di")]
 mod di;
