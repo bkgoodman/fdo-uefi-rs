@@ -175,6 +175,8 @@ fn ensure_network_configured() {
                                 log::debug!("TCP4: DHCP IP={}, Mask={}", info2.station_addr, info2.subnet_mask);
                             }
                             DHCP_SUCCEEDED.store(true, AtomicOrdering::Relaxed);
+                            // Discover DNS server from DHCP for hostname resolution
+                            crate::dns::discover_dns_server();
                             break;
                         }
                         Err(e) => {

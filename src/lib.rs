@@ -21,6 +21,9 @@ pub mod tcp4_http;
 #[cfg(target_os = "uefi")]
 pub mod chainload;
 
+// DNS resolver — pure packet logic on all targets; UDP4 transport is UEFI-only
+pub mod dns;
+
 // --- Pure + mixed modules (protocol logic, crypto, parsing) ---
 // These compile on both UEFI and native targets.
 #[cfg(any(feature = "fdo-installer", feature = "rv-firmware"))]

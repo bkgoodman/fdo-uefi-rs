@@ -11,7 +11,7 @@ UEFI dependencies (`uefi`, `uefi-raw`) are target-conditional, and UEFI-specific
 is gated with `#[cfg(target_os = "uefi")]`. This lets `make test` / `cargo test` run
 on native Linux with no QEMU or swtpm.
 
-**175 tests** across 6 modules, ~0.15s:
+**188 tests** across 7 modules, ~0.15s:
 
 | Module | Tests | Key coverage |
 |--------|-------|-------------|
@@ -20,6 +20,7 @@ on native Linux with no QEMU or swtpm.
 | `fdo.rs` | 41 | CBOR encoder/decoder, AES-GCM (wrong key/nonce/AAD/tampered), KDF (128 vs 256), COSE_Encrypt0 (tampered), encrypted message parsing (wrong tag/no tag/missing IV/empty/truncated), SetupDevice parsing, session key derivation |
 | `bmo.rs` | 45 | Full Model 1-4 authorization matrix, delegate-signed x5chain, meta-payload parse (basic/all-fields/missing/garbage/unknown), COSE_Key P-256 parse, signed meta verify (valid/wrong-key/tampered/wrong-AAD/bad-key/not-COSE), unsigned meta passthrough |
 | `voucher.rs` | 20 | OVHeader/PublicKey parse, HMAC (RFC 4231), 0/1/2-entry chains, entry swap/reorder, cross-device injection, wrong domain AAD (v2.0), chain break at entry 1, GUID mismatch |
+| `dns.rs` | 13 | DNS name encoding, query build, response parse (basic/wrong-ID/NXDOMAIN/short/no-QR/CNAME-then-A/multi-question), is_ipv4_address |
 | `di/mfginfo.rs` | 1 | DeviceMfgInfo encoding |
 
 See `TODO_TEST.md` for the full test plan and remaining items.
@@ -55,6 +56,29 @@ AAD constant `AAD_TAG_META_PAYLOAD` in `cose.rs`.
 QEMU-verified: both unsigned and signed meta-payload delivery tested
 end-to-end against go-fdo server (`start15-meta-url.sh` on pe2).
 
+## DNS Hostname Resolution — implemented 2026-09-25
+
+DNS hostnames are now supported in HTTP URLs (RV lists, meta-payload URLs, etc.):
+
+- **EFI HTTP path** (OVMF/QEMU): DNS is handled natively by the firmware's
+  HTTP stack — no additional code needed.
+- **TCP4 fallback path** (real hardware): `parse_url()` in `tcp4_http.rs` now
+  calls `crate::dns::dns_resolve()` when the hostname is not a literal IPv4
+  address. DNS resolution uses a custom UDP4-based resolver over
+  `EFI_UDP4_PROTOCOL` (DNS A-record queries, port 53).
+
+**Components** (`src/dns.rs`):
+- `encode_dns_name()` / `build_dns_query()` — DNS packet builder (pure, testable)
+- `parse_dns_response()` — DNS response parser with compression support (pure)
+- `discover_dns_server()` — reads DNS server IP from `Ip4Config2` after DHCP
+- `dns_resolve()` — public API: cache check → UDP4 query → parse → cache store
+- `udp4_dns_query()` — sends/receives DNS via `EFI_UDP4_PROTOCOL`
+
+13 unit tests for DNS packet encoding/decoding (native `cargo test`).
+
+QEMU-verified: meta-payload with hostname `fdo-test.local` in image URL —
+device resolved hostname, fetched image, hash VERIFIED, TO2 complete.
+
 ### Future: TLS/HTTPS and IPv6
 
 - **TLS/HTTPS:** Not currently feasible — UEFI firmware does not readily
@@ -62,8 +86,8 @@ end-to-end against go-fdo server (`start15-meta-url.sh` on pe2).
   the `tls_ca` field (meta key 2 / image-begin key -8) is already parsed and
   stored but unused. Security is not compromised because meta-payload signing
   and image hashing provide integrity without transport encryption.
-- **IPv6:** TCP4 backend only supports literal IPv4 addresses. DNS hostname
-  resolution is also not available. Both are UEFI platform limitations.
+- **IPv6:** TCP4 backend only supports literal IPv4 addresses. IPv6 is a
+  UEFI platform limitation requiring `EFI_TCP6_PROTOCOL` support.
 - **Streaming hash:** Currently the entire image is buffered before hashing.
   For very large images, streaming download + incremental SHA-256 would reduce
   peak memory usage.

@@ -58,7 +58,9 @@ struct ServiceBindingProtocol {
     ) -> RawStatus,
 }
 
-/// Parse URL into (host, port, path) components
+/// Parse URL into (host, port, path) components.
+/// Supports both literal IPv4 addresses and DNS hostnames.
+/// DNS resolution is performed via EFI_UDP4_PROTOCOL when the host is not an IP.
 fn parse_url(url: &str) -> Option<([u8; 4], u16, &str)> {
     // Strip scheme
     let rest = url.strip_prefix("http://")?;
@@ -75,16 +77,23 @@ fn parse_url(url: &str) -> Option<([u8; 4], u16, &str)> {
         None => (hostport, 80),
     };
     
-    // Parse IPv4 address
+    // Try parsing as IPv4 address first
     let parts: Vec<&str> = host_str.split('.').collect();
-    if parts.len() != 4 { return None; }
-    let ip = [
-        parts[0].parse::<u8>().ok()?,
-        parts[1].parse::<u8>().ok()?,
-        parts[2].parse::<u8>().ok()?,
-        parts[3].parse::<u8>().ok()?,
-    ];
-    
+    if parts.len() == 4 {
+        if let (Some(a), Some(b), Some(c), Some(d)) = (
+            parts[0].parse::<u8>().ok(),
+            parts[1].parse::<u8>().ok(),
+            parts[2].parse::<u8>().ok(),
+            parts[3].parse::<u8>().ok(),
+        ) {
+            return Some(([a, b, c, d], port, path));
+        }
+    }
+
+    // Not a literal IP — try DNS resolution
+    debug!("TCP4: Hostname '{}' is not an IP address, attempting DNS resolution", host_str);
+    let ip = crate::dns::dns_resolve(host_str)?;
+    info!("TCP4: DNS resolved '{}' → {}.{}.{}.{}", host_str, ip[0], ip[1], ip[2], ip[3]);
     Some((ip, port, path))
 }
 

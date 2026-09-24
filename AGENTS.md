@@ -43,7 +43,7 @@ went unnoticed through multiple "FULLY TESTED" sign-offs.
 
 About commands such as `apt` and others which require user-interaction as they may hang agent work.
 
-## Native Unit Tests (175 tests)
+## Native Unit Tests (188 tests)
 
 ```bash
 make test          # Runs cargo test on native Linux (no UEFI, no QEMU, ~0.15s)
