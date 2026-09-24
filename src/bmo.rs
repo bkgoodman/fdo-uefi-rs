@@ -29,6 +29,8 @@ pub const BMO_ERROR_TRANSFER_ERROR: u8 = 5;
 pub const BMO_ERROR_SECURE_BOOT_VIOLATION: u8 = 6;
 pub const BMO_ERROR_URL_FETCH_FAILED: u8 = 9;
 pub const BMO_ERROR_HASH_MISMATCH: u8 = 11;
+pub const BMO_ERROR_META_SIGNATURE_INVALID: u8 = 12;
+pub const BMO_ERROR_META_PARSE_ERROR: u8 = 13;
 pub const BMO_ERROR_DELIVERY_MODE_NOT_SUPPORTED: u8 = 14;
 
 /// BMO result status codes
@@ -376,6 +378,166 @@ fn unwrap_bmo_signed(data: &[u8], owner_key_point: Option<&[u8]>, expected_ct: &
     }
 }
 
+// ===== Meta-payload support (delivery_mode 2) =====
+
+/// Parsed meta-payload descriptor.
+///
+/// CBOR map with integer keys per `fdo.bmo.md` MetaPayload CDDL:
+/// ```text
+/// MetaPayload = {
+///   0: tstr,          ; mime_type (required)
+///   1: tstr,          ; url       (required)
+///   ? 2: bstr,        ; tls_ca
+///   ? 3: tstr,        ; hash_alg
+///   ? 4: bstr,        ; expected_hash
+///   ? 5: tstr,        ; boot_args
+///   ? 6: tstr,        ; name
+///   ? 7: tstr,        ; version
+///   ? 8: tstr,        ; description
+/// }
+/// ```
+#[derive(Debug)]
+pub struct MetaPayload {
+    pub mime_type: String,
+    pub url: String,
+    pub tls_ca: Option<Vec<u8>>,
+    pub hash_alg: Option<String>,
+    pub expected_hash: Option<Vec<u8>>,
+    pub boot_args: Option<String>,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Parse a MetaPayload CBOR map from raw bytes.
+///
+/// Returns `None` if the bytes are not a valid CBOR map or if the required
+/// fields (0: mime_type, 1: url) are missing.
+pub fn parse_meta_payload(data: &[u8]) -> Option<MetaPayload> {
+    let mut dec = CborDecoder::new(data);
+
+    let map_len = dec.read_map_header().ok()?;
+
+    let mut mime_type: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut tls_ca: Option<Vec<u8>> = None;
+    let mut hash_alg: Option<String> = None;
+    let mut expected_hash: Option<Vec<u8>> = None;
+    let mut boot_args: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut description: Option<String> = None;
+
+    for _ in 0..map_len {
+        let key = dec.read_uint().ok()?;
+        match key {
+            0 => mime_type = Some(dec.read_text().ok()?),
+            1 => url = Some(dec.read_text().ok()?),
+            2 => tls_ca = Some(dec.read_bytes().ok()?),
+            3 => hash_alg = Some(dec.read_text().ok()?),
+            4 => expected_hash = Some(dec.read_bytes().ok()?),
+            5 => boot_args = Some(dec.read_text().ok()?),
+            6 => name = Some(dec.read_text().ok()?),
+            7 => version = Some(dec.read_text().ok()?),
+            8 => description = Some(dec.read_text().ok()?),
+            _ => { dec.skip_value().ok()?; }
+        }
+    }
+
+    Some(MetaPayload {
+        mime_type: mime_type?,
+        url: url?,
+        tls_ca,
+        hash_alg,
+        expected_hash,
+        boot_args,
+        name,
+        version,
+        description,
+    })
+}
+
+/// Extract an uncompressed P-256 point (65 bytes: 0x04 || x || y) from a
+/// standalone COSE_Key CBOR byte slice.
+///
+/// The COSE_Key is a CBOR map with labels -2 (x) and -3 (y), each 32 bytes.
+/// This is the format used for `image-begin[-10]` (meta_signer).
+pub fn parse_cose_key_p256(data: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0usize;
+    let b = *data.get(pos)?;
+    pos += 1;
+    if (b >> 5) != 5 {
+        return None; // not a CBOR map
+    }
+    let map_len = crate::cose::cbor_read_uint_arg(data, &mut pos, b & 0x1f)?;
+
+    let mut x: Option<&[u8]> = None;
+    let mut y: Option<&[u8]> = None;
+    for _ in 0..map_len {
+        let key = crate::cose::cbor_read_int_value(data, &mut pos)?;
+        match key {
+            -2 => x = crate::cose::cbor_read_bstr(data, &mut pos),
+            -3 => y = crate::cose::cbor_read_bstr(data, &mut pos),
+            _ => { crate::cose::cbor_skip(data, &mut pos)?; }
+        }
+    }
+
+    match (x, y) {
+        (Some(xb), Some(yb)) if xb.len() == 32 && yb.len() == 32 => {
+            let mut point = Vec::with_capacity(65);
+            point.push(0x04);
+            point.extend_from_slice(xb);
+            point.extend_from_slice(yb);
+            Some(point)
+        }
+        _ => None,
+    }
+}
+
+/// Verify a signed meta-payload (COSE_Sign1) and extract the inner MetaPayload CBOR.
+///
+/// If `meta_signer` is `Some`, the data must be a tagged COSE_Sign1, verified with
+/// the supplied COSE_Key using AAD `"FDO-FSIM-MetaPayload-v1"`.
+///
+/// If `meta_signer` is `None`, the data is treated as raw (unsigned) MetaPayload CBOR.
+///
+/// Returns the raw inner payload bytes on success, or an error code on failure.
+pub fn verify_and_extract_meta(data: &[u8], meta_signer: Option<&[u8]>) -> Result<Vec<u8>, u8> {
+    match meta_signer {
+        Some(signer_cose_key) => {
+            // Signed meta-payload: must be COSE_Sign1 tag 18
+            let point = parse_cose_key_p256(signer_cose_key).ok_or_else(|| {
+                error!("BMO meta: failed to parse meta_signer COSE_Key");
+                BMO_ERROR_META_SIGNATURE_INVALID
+            })?;
+
+            let s1 = crate::cose::parse_cose_sign1(data).ok_or_else(|| {
+                error!("BMO meta: downloaded meta-payload is not a valid COSE_Sign1");
+                BMO_ERROR_META_SIGNATURE_INVALID
+            })?;
+
+            // Verify with meta-payload domain AAD (always FDO 2.0 style)
+            let aad = crate::cose::domain_aad(
+                crate::cose::AAD_TAG_META_PAYLOAD,
+                crate::cose::FDO_VERSION_200,
+            );
+
+            if !crate::cose::verify_sign1(&s1, &aad, &point) {
+                error!("BMO meta: COSE_Sign1 signature verification FAILED");
+                return Err(BMO_ERROR_META_SIGNATURE_INVALID);
+            }
+
+            info!("BMO meta: Meta-payload signature VERIFIED");
+            Ok(s1.payload.to_vec())
+        }
+        None => {
+            // Unsigned meta-payload: raw CBOR
+            debug!("BMO meta: No meta_signer — treating as unsigned meta-payload");
+            Ok(data.to_vec())
+        }
+    }
+}
+
 /// Result of BMO authorization check.
 #[derive(Debug, PartialEq)]
 pub enum BmoAuthResult {
@@ -564,11 +726,39 @@ pub fn process_bmo_message(
                         }
                     }
                     BMO_DELIVERY_META_URL => {
-                        // Mode 2: Device fetches signed meta-payload
-                        error!("BMO: Meta-URL delivery mode not yet supported");
-                        session.state = BmoState::Error;
-                        let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("Meta-URL mode not supported"));
-                        return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                        // Mode 2: Device fetches signed meta-payload, then actual image
+                        debug!("BMO: Using meta-URL delivery mode");
+                        if let Some(meta_url) = &begin.url {
+                            info!("BMO: Meta-URL delivery: {}", meta_url);
+                            match process_bmo_meta_url_delivery(session, &mut begin) {
+                                Ok(()) => {
+                                    session.begin = Some(begin);
+                                    session.state = BmoState::Complete;
+                                    let result = build_bmo_image_result(
+                                        BMO_STATUS_SUCCESS,
+                                        Some("Meta-payload resolved, image fetched"),
+                                    );
+                                    return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                                }
+                                Err(error_code) => {
+                                    session.state = BmoState::Error;
+                                    let msg = match error_code {
+                                        BMO_ERROR_URL_FETCH_FAILED => "Meta-payload fetch failed",
+                                        BMO_ERROR_META_SIGNATURE_INVALID => "Meta-payload signature invalid",
+                                        BMO_ERROR_META_PARSE_ERROR => "Meta-payload parse error",
+                                        BMO_ERROR_HASH_MISMATCH => "Image hash mismatch",
+                                        _ => "Meta-URL delivery failed",
+                                    };
+                                    let result = build_bmo_image_result(BMO_STATUS_ERROR, Some(msg));
+                                    return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                                }
+                            }
+                        } else {
+                            error!("BMO: Meta-URL delivery mode requested but no URL (-7) provided");
+                            session.state = BmoState::Error;
+                            let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("Meta-URL mode but no URL"));
+                            return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                        }
                     }
                     _ => {
                         error!("BMO: Unknown delivery mode: {}", begin.delivery_mode);
@@ -824,6 +1014,108 @@ fn process_bmo_url_delivery(session: &mut BmoSession, begin: &mut BmoImageBegin)
     
     info!("BMO: Image ready for boot ({} bytes, integrity verified)", session.image_buffer.len());
     
+    Ok(())
+}
+
+/// Process BMO meta-URL delivery mode (delivery_mode = 2).
+///
+/// 1. Fetch the meta-payload from the URL in `begin.url`.
+/// 2. If `begin.meta_signer` is set, verify the COSE_Sign1 signature.
+/// 3. Parse the inner MetaPayload CBOR to get the actual image URL and hash.
+/// 4. Fetch the actual image from `meta.url`.
+/// 5. Verify the SHA-256 hash if `meta.expected_hash` is present.
+/// 6. Store the image in `session.image_buffer`.
+#[cfg(target_os = "uefi")]
+fn process_bmo_meta_url_delivery(
+    session: &mut BmoSession,
+    begin: &mut BmoImageBegin,
+) -> Result<(), u8> {
+    let meta_url = match &begin.url {
+        Some(u) => u.clone(),
+        None => {
+            error!("BMO meta: No meta-payload URL (-7) provided");
+            return Err(BMO_ERROR_URL_FETCH_FAILED);
+        }
+    };
+
+    // Step 1: Fetch meta-payload
+    info!("BMO meta: Fetching meta-payload from {}", meta_url);
+    let meta_data = match crate::http_api::http_get(&meta_url) {
+        Some(data) => {
+            info!("BMO meta: Downloaded {} bytes of meta-payload", data.len());
+            data
+        }
+        None => {
+            error!("BMO meta: HTTP GET failed for meta-payload URL: {}", meta_url);
+            return Err(BMO_ERROR_URL_FETCH_FAILED);
+        }
+    };
+
+    // Step 2: Verify signature (if meta_signer is present)
+    let meta_cbor = verify_and_extract_meta(
+        &meta_data,
+        begin.meta_signer.as_deref(),
+    )?;
+
+    // Step 3: Parse MetaPayload
+    let meta = parse_meta_payload(&meta_cbor).ok_or_else(|| {
+        error!("BMO meta: Failed to parse MetaPayload CBOR");
+        BMO_ERROR_META_PARSE_ERROR
+    })?;
+
+    info!("BMO meta: Resolved → mime={}, url={}", meta.mime_type, meta.url);
+    if let Some(ref name) = meta.name {
+        info!("BMO meta: name={}", name);
+    }
+    if let Some(ref version) = meta.version {
+        info!("BMO meta: version={}", version);
+    }
+    if meta.expected_hash.is_some() {
+        info!("BMO meta: hash_alg={}, hash present",
+            meta.hash_alg.as_deref().unwrap_or("sha256"));
+    }
+
+    // Step 4: Fetch actual image
+    info!("BMO meta: Fetching actual image from {}", meta.url);
+    let image_data = match crate::http_api::http_get(&meta.url) {
+        Some(data) => {
+            info!("BMO meta: Downloaded {} bytes of actual image", data.len());
+            data
+        }
+        None => {
+            error!("BMO meta: HTTP GET failed for image URL: {}", meta.url);
+            return Err(BMO_ERROR_URL_FETCH_FAILED);
+        }
+    };
+
+    // Step 5: Verify hash if present in meta-payload
+    if let Some(expected_hash) = &meta.expected_hash {
+        let mut hasher = Sha256::new();
+        hasher.update(&image_data);
+        let computed = hasher.finalize();
+        let computed_bytes = computed.as_slice();
+
+        debug!("BMO meta: SHA256 verification:");
+        debug!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
+        debug!("  Computed: {:02x?}", &computed_bytes[..16]);
+
+        if computed_bytes != expected_hash.as_slice() {
+            error!("BMO meta: SHA256 MISMATCH! Downloaded image is CORRUPTED.");
+            error!("BMO meta: REFUSING to chainload — data integrity check FAILED.");
+            return Err(BMO_ERROR_HASH_MISMATCH);
+        }
+        info!("BMO meta: Image hash VERIFIED");
+    } else {
+        warn!("BMO meta: No expected_hash in meta-payload — cannot verify image integrity");
+        warn!("BMO meta: Proceeding without hash verification");
+    }
+
+    // Step 6: Store in session buffer
+    session.image_buffer = image_data;
+    session.bytes_received = session.image_buffer.len() as u64;
+
+    info!("BMO meta: Image ready for boot ({} bytes)", session.image_buffer.len());
+
     Ok(())
 }
 
@@ -1380,5 +1672,290 @@ mod tests {
         );
         assert_eq!(result, BmoAuthResult::SignedFailed,
             "delegate chain not rooted in owner must be rejected");
+    }
+
+    // ===== Meta-payload tests =====
+
+    /// Build a MetaPayload CBOR map from the given fields.
+    fn build_test_meta_payload(
+        mime: &str,
+        url: &str,
+        hash_alg: Option<&str>,
+        expected_hash: Option<&[u8]>,
+        name: Option<&str>,
+    ) -> Vec<u8> {
+        let mut count = 2u8; // mime + url are required
+        if hash_alg.is_some() { count += 1; }
+        if expected_hash.is_some() { count += 1; }
+        if name.is_some() { count += 1; }
+
+        let mut enc = CborEncoder::new();
+        enc.encode_map(count as usize);
+        enc.uint(0); enc.text(mime);
+        enc.uint(1); enc.text(url);
+        if let Some(ha) = hash_alg {
+            enc.uint(3); enc.text(ha);
+        }
+        if let Some(eh) = expected_hash {
+            enc.uint(4); enc.bytes(eh);
+        }
+        if let Some(n) = name {
+            enc.uint(6); enc.text(n);
+        }
+        enc.into_bytes()
+    }
+
+    /// Build a COSE_Key CBOR map for a P-256 public key (uncompressed point).
+    fn build_test_cose_key(point: &[u8]) -> Vec<u8> {
+        assert_eq!(point.len(), 65);
+        assert_eq!(point[0], 0x04);
+        let x = &point[1..33];
+        let y = &point[33..65];
+
+        let mut enc = CborEncoder::new();
+        // COSE_Key map: { 1: 2 (kty=EC2), -1: 1 (crv=P-256), -2: x, -3: y }
+        enc.encode_map(4);
+        enc.uint(1); enc.uint(2);            // kty = EC2
+        enc.neg_int(-1); enc.uint(1);        // crv = P-256
+        enc.neg_int(-2); enc.bytes(x);       // x coordinate
+        enc.neg_int(-3); enc.bytes(y);       // y coordinate
+        enc.into_bytes()
+    }
+
+    #[test]
+    fn test_parse_meta_payload_basic() {
+        let cbor = build_test_meta_payload(
+            "application/efi",
+            "http://10.0.0.1/image.efi",
+            None, None, None,
+        );
+        let meta = parse_meta_payload(&cbor).expect("should parse");
+        assert_eq!(meta.mime_type, "application/efi");
+        assert_eq!(meta.url, "http://10.0.0.1/image.efi");
+        assert!(meta.expected_hash.is_none());
+        assert!(meta.name.is_none());
+    }
+
+    #[test]
+    fn test_parse_meta_payload_all_fields() {
+        let hash = [0xAA; 32];
+        let cbor = build_test_meta_payload(
+            "application/x-raw-disk-image",
+            "http://cdn.example.com/image.dd.gz",
+            Some("sha256"),
+            Some(&hash),
+            Some("test-image"),
+        );
+        let meta = parse_meta_payload(&cbor).expect("should parse");
+        assert_eq!(meta.mime_type, "application/x-raw-disk-image");
+        assert_eq!(meta.url, "http://cdn.example.com/image.dd.gz");
+        assert_eq!(meta.hash_alg.as_deref(), Some("sha256"));
+        assert_eq!(meta.expected_hash.as_deref(), Some(&hash[..]));
+        assert_eq!(meta.name.as_deref(), Some("test-image"));
+    }
+
+    #[test]
+    fn test_parse_meta_payload_missing_mime() {
+        // Map with only key 1 (url), missing key 0 (mime)
+        let mut enc = CborEncoder::new();
+        enc.encode_map(1);
+        enc.uint(1); enc.text("http://example.com/img");
+        let result = parse_meta_payload(&enc.into_bytes());
+        assert!(result.is_none(), "missing mime_type must fail");
+    }
+
+    #[test]
+    fn test_parse_meta_payload_missing_url() {
+        let mut enc = CborEncoder::new();
+        enc.encode_map(1);
+        enc.uint(0); enc.text("application/efi");
+        let result = parse_meta_payload(&enc.into_bytes());
+        assert!(result.is_none(), "missing url must fail");
+    }
+
+    #[test]
+    fn test_parse_meta_payload_empty_map() {
+        let result = parse_meta_payload(&[0xa0]); // map(0)
+        assert!(result.is_none(), "empty map must fail");
+    }
+
+    #[test]
+    fn test_parse_meta_payload_garbage() {
+        let result = parse_meta_payload(&[0xFF, 0x00, 0x01]);
+        assert!(result.is_none(), "garbage must fail");
+    }
+
+    #[test]
+    fn test_parse_meta_payload_unknown_fields_ignored() {
+        // Keys 0, 1, 99 — key 99 should be skipped
+        let mut enc = CborEncoder::new();
+        enc.encode_map(3);
+        enc.uint(0); enc.text("application/efi");
+        enc.uint(1); enc.text("http://example.com/img");
+        enc.uint(99); enc.text("unknown value");
+        let meta = parse_meta_payload(&enc.into_bytes()).expect("should parse");
+        assert_eq!(meta.mime_type, "application/efi");
+        assert_eq!(meta.url, "http://example.com/img");
+    }
+
+    // --- COSE_Key parsing ---
+
+    #[test]
+    fn test_parse_cose_key_p256_valid() {
+        let (_, point) = gen_test_keypair();
+        let cose_key = build_test_cose_key(&point);
+        let parsed = parse_cose_key_p256(&cose_key).expect("should parse");
+        assert_eq!(parsed, point);
+    }
+
+    #[test]
+    fn test_parse_cose_key_p256_garbage() {
+        let result = parse_cose_key_p256(&[0xFF, 0x00]);
+        assert!(result.is_none(), "garbage must fail");
+    }
+
+    #[test]
+    fn test_parse_cose_key_p256_empty() {
+        let result = parse_cose_key_p256(&[]);
+        assert!(result.is_none(), "empty must fail");
+    }
+
+    #[test]
+    fn test_parse_cose_key_p256_not_a_map() {
+        let result = parse_cose_key_p256(&[0x83, 0x01, 0x02, 0x03]); // array
+        assert!(result.is_none(), "array must fail");
+    }
+
+    // --- Signed meta-payload verification ---
+
+    #[test]
+    fn test_verify_and_extract_meta_unsigned() {
+        let cbor = build_test_meta_payload(
+            "application/efi", "http://10.0.0.1/img.efi", None, None, None,
+        );
+        let result = verify_and_extract_meta(&cbor, None).expect("unsigned should pass");
+        assert_eq!(result, cbor);
+    }
+
+    #[test]
+    fn test_verify_and_extract_meta_signed_valid() {
+        let (sk, point) = gen_test_keypair();
+        let cose_key = build_test_cose_key(&point);
+
+        let meta_cbor = build_test_meta_payload(
+            "application/efi", "http://cdn.example.com/img.efi",
+            Some("sha256"), Some(&[0xBB; 32]), Some("signed-test"),
+        );
+
+        // Sign with meta-payload AAD
+        let protected = build_test_protected_header(None);
+        let aad = crate::cose::domain_aad(
+            crate::cose::AAD_TAG_META_PAYLOAD,
+            crate::cose::FDO_VERSION_200,
+        );
+        let envelope = build_test_cose_sign1(
+            &protected, &meta_cbor, &aad, &[0xa0], &sk,
+        );
+
+        let result = verify_and_extract_meta(&envelope, Some(&cose_key))
+            .expect("valid signature should pass");
+        assert_eq!(result, meta_cbor);
+
+        // Parse the extracted payload to confirm it's intact
+        let meta = parse_meta_payload(&result).expect("should parse");
+        assert_eq!(meta.url, "http://cdn.example.com/img.efi");
+        assert_eq!(meta.name.as_deref(), Some("signed-test"));
+    }
+
+    #[test]
+    fn test_verify_and_extract_meta_signed_wrong_key() {
+        let (sk, _) = gen_test_keypair();
+        let (_, wrong_point) = gen_test_keypair_b();
+        let wrong_cose_key = build_test_cose_key(&wrong_point);
+
+        let meta_cbor = build_test_meta_payload(
+            "application/efi", "http://example.com/img", None, None, None,
+        );
+        let protected = build_test_protected_header(None);
+        let aad = crate::cose::domain_aad(
+            crate::cose::AAD_TAG_META_PAYLOAD,
+            crate::cose::FDO_VERSION_200,
+        );
+        let envelope = build_test_cose_sign1(
+            &protected, &meta_cbor, &aad, &[0xa0], &sk,
+        );
+
+        let result = verify_and_extract_meta(&envelope, Some(&wrong_cose_key));
+        assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
+            "wrong signer key must fail");
+    }
+
+    #[test]
+    fn test_verify_and_extract_meta_signed_tampered() {
+        let (sk, point) = gen_test_keypair();
+        let cose_key = build_test_cose_key(&point);
+
+        let meta_cbor = build_test_meta_payload(
+            "application/efi", "http://example.com/img", None, None, None,
+        );
+        let protected = build_test_protected_header(None);
+        let aad = crate::cose::domain_aad(
+            crate::cose::AAD_TAG_META_PAYLOAD,
+            crate::cose::FDO_VERSION_200,
+        );
+        let mut envelope = build_test_cose_sign1(
+            &protected, &meta_cbor, &aad, &[0xa0], &sk,
+        );
+        // Tamper with the last byte (in the signature)
+        let last = envelope.len() - 1;
+        envelope[last] ^= 0xFF;
+
+        let result = verify_and_extract_meta(&envelope, Some(&cose_key));
+        assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
+            "tampered signature must fail");
+    }
+
+    #[test]
+    fn test_verify_and_extract_meta_signed_wrong_aad() {
+        // Sign with BMO_PROVISION AAD instead of META_PAYLOAD AAD
+        let (sk, point) = gen_test_keypair();
+        let cose_key = build_test_cose_key(&point);
+
+        let meta_cbor = build_test_meta_payload(
+            "application/efi", "http://example.com/img", None, None, None,
+        );
+        let protected = build_test_protected_header(None);
+        let wrong_aad = crate::cose::domain_aad(
+            crate::cose::AAD_TAG_BMO_PROVISION,
+            crate::cose::FDO_VERSION_200,
+        );
+        let envelope = build_test_cose_sign1(
+            &protected, &meta_cbor, &wrong_aad, &[0xa0], &sk,
+        );
+
+        let result = verify_and_extract_meta(&envelope, Some(&cose_key));
+        assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
+            "wrong domain AAD must fail");
+    }
+
+    #[test]
+    fn test_verify_and_extract_meta_bad_cose_key() {
+        // Garbage COSE_Key
+        let result = verify_and_extract_meta(&[0xD2, 0x83, 0x40, 0xa0, 0x40], Some(&[0xFF, 0x00]));
+        assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
+            "garbage COSE_Key must fail");
+    }
+
+    #[test]
+    fn test_verify_and_extract_meta_not_cose_sign1() {
+        // Raw CBOR map (not COSE_Sign1) when signer is expected
+        let (_, point) = gen_test_keypair();
+        let cose_key = build_test_cose_key(&point);
+        let meta_cbor = build_test_meta_payload(
+            "application/efi", "http://example.com/img", None, None, None,
+        );
+        let result = verify_and_extract_meta(&meta_cbor, Some(&cose_key));
+        assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
+            "raw CBOR when signed expected must fail");
     }
 }

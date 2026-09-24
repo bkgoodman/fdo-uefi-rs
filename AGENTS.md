@@ -18,6 +18,10 @@ Test scripts (on the test machine):
   85 = OVNextEntry. `OFFSET` picks the byte (default last = inside the signature).
   Always run a control (e.g. `./start6-negative.sh 99`, a type that never occurs) to
   prove failures come from the tampering and not from the proxy.
+- `start15-meta-url.sh [unsigned|signed|all]` — **meta-URL delivery** tests.
+  Creates a test image + meta-payload, hosts both on a Python HTTP server,
+  runs FDO TO2 with `delivery_mode=2`. Tests unsigned meta, signed meta
+  (COSE_Sign1 with ES256), and hash verification.
 
 `quick-di-tpm` is **self-contained** — it does DI locally and needs no DI server, so
 it runs before the FDO server is started. It has no `-di` flag.
@@ -39,7 +43,7 @@ went unnoticed through multiple "FULLY TESTED" sign-offs.
 
 About commands such as `apt` and others which require user-interaction as they may hang agent work.
 
-## Native Unit Tests (157 tests)
+## Native Unit Tests (175 tests)
 
 ```bash
 make test          # Runs cargo test on native Linux (no UEFI, no QEMU, ~0.15s)
@@ -79,7 +83,9 @@ Test helpers (all `#[cfg(test)]`):
 - `delegate.rs`: `build_test_cert()`, OID constants (`pub(crate)`)
 - `voucher.rs`: `build_test_ov_header()`, `build_test_fdo_public_key()`,
   `build_ov_entry_payload()`, `hmac_sha256()` (pub)
-- `bmo.rs`: `check_bmo_authorization()` (pub)
+- `bmo.rs`: `check_bmo_authorization()`, `parse_meta_payload()`,
+  `parse_cose_key_p256()`, `verify_and_extract_meta()` (all pub),
+  test helpers: `build_test_meta_payload()`, `build_test_cose_key()`
 
 ## Build & Ship
 

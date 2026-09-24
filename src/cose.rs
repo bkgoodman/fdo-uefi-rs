@@ -37,6 +37,9 @@ pub const AAD_TAG_OV_ENTRY: &str = "FDO-OVEntry-v1";
 // BMO provisioning domain separation. Must match go-fdo/fsim/bmo_provision.go.
 pub const AAD_TAG_BMO_PROVISION: &str = "FDO-FSIM-BmoProvision-v1";
 
+// BMO meta-payload domain separation. Must match go-fdo/cose/aad.go.
+pub const AAD_TAG_META_PAYLOAD: &str = "FDO-FSIM-MetaPayload-v1";
+
 // BMO COSE protected header content_type values (label 3).
 pub const BMO_CONTENT_TYPE_IMAGE_BEGIN: &str = "application/cbor+fdo.bmo.image-begin";
 pub const BMO_CONTENT_TYPE_SET: &str = "application/cbor+fdo.bmo.set";

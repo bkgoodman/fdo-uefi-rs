@@ -213,7 +213,12 @@ fn x5chain_leaf_der(cbor: &[u8]) -> Result<&[u8], VoucherError> {
 /// Like X5CHAIN, go-fdo embeds pkBody as `cbor.RawBytes`, so the third
 /// element of `[pkType, pkEnc, pkBody]` is a raw CBOR map — not a bstr
 /// wrapping one.
-fn cose_key_p256_point(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, VoucherError> {
+/// Extract uncompressed P-256 point (65 bytes: 0x04 || x || y) from a
+/// COSE_Key map starting at `data[*pos]`.  Advances `*pos` past the map.
+///
+/// This is also available as the free function [`crate::bmo::parse_cose_key_p256`]
+/// which takes a standalone byte slice (for BMO meta-payload signer keys).
+pub(crate) fn cose_key_p256_point(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, VoucherError> {
     let body = &data[*pos..];
 
     let mut p = 0usize;

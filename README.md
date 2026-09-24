@@ -475,7 +475,7 @@ Boot
 
 ## Testing
 
-### Native Unit Tests (157 tests)
+### Native Unit Tests (175 tests)
 
 ```bash
 make test    # Runs on native Linux — no UEFI, no QEMU, no swtpm (~0.15s)

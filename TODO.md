@@ -11,14 +11,14 @@ UEFI dependencies (`uefi`, `uefi-raw`) are target-conditional, and UEFI-specific
 is gated with `#[cfg(target_os = "uefi")]`. This lets `make test` / `cargo test` run
 on native Linux with no QEMU or swtpm.
 
-**157 tests** across 6 modules, ~0.15s:
+**175 tests** across 6 modules, ~0.15s:
 
 | Module | Tests | Key coverage |
 |--------|-------|-------------|
 | `cose.rs` | 49 | COSE_Sign1 parse/verify, ES256 +/-, domain AAD (v101 vs v200, cross-tag), scope (GUID/combined/fail-closed/empty), BMO signed verify (Model 3/4, no content_type, delegate missing PERM.7), malformed inputs |
 | `delegate.rs` | 19 | 1/2/3-cert chains, permission inheritance (intermediate/root missing), self-signed rejected, all 5 OID flags, redirect-only/onboard-only, reuse-cred vs new-cred |
 | `fdo.rs` | 41 | CBOR encoder/decoder, AES-GCM (wrong key/nonce/AAD/tampered), KDF (128 vs 256), COSE_Encrypt0 (tampered), encrypted message parsing (wrong tag/no tag/missing IV/empty/truncated), SetupDevice parsing, session key derivation |
-| `bmo.rs` | 27 | Full Model 1-4 authorization matrix, delegate-signed x5chain (positive + wrong-owner negative), image-begin parse, result/ack/set builders |
+| `bmo.rs` | 45 | Full Model 1-4 authorization matrix, delegate-signed x5chain, meta-payload parse (basic/all-fields/missing/garbage/unknown), COSE_Key P-256 parse, signed meta verify (valid/wrong-key/tampered/wrong-AAD/bad-key/not-COSE), unsigned meta passthrough |
 | `voucher.rs` | 20 | OVHeader/PublicKey parse, HMAC (RFC 4231), 0/1/2-entry chains, entry swap/reorder, cross-device injection, wrong domain AAD (v2.0), chain break at entry 1, GUID mismatch |
 | `di/mfginfo.rs` | 1 | DeviceMfgInfo encoding |
 
@@ -29,6 +29,44 @@ Test helpers in `cose.rs` (`gen_test_keypair`, `build_test_cose_sign1`),
 `delegate.rs` (`build_test_cert`), and `voucher.rs` (`build_test_ov_header`,
 `build_ov_entry_payload`, `hmac_sha256`) generate P-256 keys, X.509 certs,
 and voucher structures for testing.
+
+## Meta-Payload Delivery (delivery_mode 2) — implemented 2026-09-24
+
+BMO meta-URL delivery allows image downloads from external servers with
+security anchored in the FDO trust chain:
+
+1. Owner sends signed `image-begin` with `delivery_mode=2`, meta-URL, and
+   optional vendor COSE_Key (`-10`).
+2. Device fetches meta-payload from URL over HTTP.
+3. If COSE_Key present: verify COSE_Sign1 with AAD `"FDO-FSIM-MetaPayload-v1"`.
+4. Parse MetaPayload CBOR: `{0: mime, 1: image_url, 3: hash_alg, 4: hash, ...}`.
+5. Fetch actual image from `meta.url`.
+6. Verify SHA-256 hash against `meta.expected_hash`.
+7. Store in session buffer; chainload after TO2 DoneAck.
+
+**Security model:** TLS is not required — meta-payload signature binds URL +
+hash to the vendor's key, and image hash covers the downloaded bytes. An
+attacker on the wire can observe but not substitute content.
+
+Key functions: `parse_meta_payload()`, `parse_cose_key_p256()`,
+`verify_and_extract_meta()`, `process_bmo_meta_url_delivery()` (all in `bmo.rs`).
+AAD constant `AAD_TAG_META_PAYLOAD` in `cose.rs`.
+
+QEMU-verified: both unsigned and signed meta-payload delivery tested
+end-to-end against go-fdo server (`start15-meta-url.sh` on pe2).
+
+### Future: TLS/HTTPS and IPv6
+
+- **TLS/HTTPS:** Not currently feasible — UEFI firmware does not readily
+  support TLS in our TCP4 HTTP stack. If a UEFI TLS stack becomes available,
+  the `tls_ca` field (meta key 2 / image-begin key -8) is already parsed and
+  stored but unused. Security is not compromised because meta-payload signing
+  and image hashing provide integrity without transport encryption.
+- **IPv6:** TCP4 backend only supports literal IPv4 addresses. DNS hostname
+  resolution is also not available. Both are UEFI platform limitations.
+- **Streaming hash:** Currently the entire image is buffered before hashing.
+  For very large images, streaming download + incremental SHA-256 would reduce
+  peak memory usage.
 
 ## Current Status
 
