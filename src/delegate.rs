@@ -24,26 +24,34 @@ use crate::cose;
 // OID constants (DER encoded, without the tag/length)
 // ---------------------------------------------------------------------------
 
-/// OIDPermitProvision = 1.3.6.1.4.1.45724.3.1.7 (PERM.7)
-/// DER encoding: 06 0C 2B 06 01 04 01 82 E5 1C 03 01 07
-/// The raw OID bytes (after the 06 0C tag+length):
-const OID_PERMIT_PROVISION: &[u8] = &[
-    0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xE5, 0x1C, 0x03, 0x01, 0x07,
-];
-
-/// OIDPermitOnboardNewCred = 1.3.6.1.4.1.45724.3.1.1
-const OID_PERMIT_ONBOARD_NEWCRED: &[u8] = &[
+/// OIDPermitRedirect = 1.3.6.1.4.1.45724.3.1.1 (PERM.1)
+/// Required for TO0/TO1 redirect operations.
+pub(crate) const OID_PERMIT_REDIRECT: &[u8] = &[
     0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xE5, 0x1C, 0x03, 0x01, 0x01,
 ];
 
-/// OIDPermitOnboardReuseCred = 1.3.6.1.4.1.45724.3.1.2
-const OID_PERMIT_ONBOARD_REUSECRED: &[u8] = &[
+/// OIDPermitOnboardNewCred = 1.3.6.1.4.1.45724.3.1.2 (PERM.2)
+/// Allows onboarding with new credentials.
+pub(crate) const OID_PERMIT_ONBOARD_NEWCRED: &[u8] = &[
     0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xE5, 0x1C, 0x03, 0x01, 0x02,
 ];
 
-/// OIDPermitOnboardFdoDisable = 1.3.6.1.4.1.45724.3.1.3
-const OID_PERMIT_ONBOARD_FDODISABLE: &[u8] = &[
+/// OIDPermitOnboardReuseCred = 1.3.6.1.4.1.45724.3.1.3 (PERM.3)
+/// Allows onboarding with credential reuse.
+pub(crate) const OID_PERMIT_ONBOARD_REUSECRED: &[u8] = &[
     0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xE5, 0x1C, 0x03, 0x01, 0x03,
+];
+
+/// OIDPermitOnboardFdoDisable = 1.3.6.1.4.1.45724.3.1.4 (PERM.4)
+/// Allows FDO disable during onboarding.
+pub(crate) const OID_PERMIT_ONBOARD_FDODISABLE: &[u8] = &[
+    0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xE5, 0x1C, 0x03, 0x01, 0x04,
+];
+
+/// OIDPermitProvision = 1.3.6.1.4.1.45724.3.1.7 (PERM.7)
+/// Allows signing BMO provisioning payloads.
+pub(crate) const OID_PERMIT_PROVISION: &[u8] = &[
+    0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xE5, 0x1C, 0x03, 0x01, 0x07,
 ];
 
 /// ExtendedKeyUsage extension OID = 2.5.29.37
@@ -62,20 +70,32 @@ pub struct ParsedCert<'a> {
     pub public_key_point: Vec<u8>,
     /// Signature bytes (r || s, 64 bytes for ES256)
     pub signature_rs: Vec<u8>,
-    /// Whether this certificate has OIDPermitProvision (PERM.7)
+    /// PERM.1 — OIDPermitRedirect (required for TO0/TO1)
+    pub has_permit_redirect: bool,
+    /// PERM.7 — OIDPermitProvision (required for BMO signing)
     pub has_permit_provision: bool,
     /// Whether this certificate has any fdo-ekt-permit-onboard-* permission
+    /// (PERM.2 new-cred, PERM.3 reuse-cred, PERM.4 fdo-disable)
     pub has_permit_onboard: bool,
+    /// PERM.3 — OIDPermitOnboardReuseCred (credential reuse specifically)
+    pub has_permit_reuse_cred: bool,
 }
 
 /// Result of delegate chain validation.
+///
+/// Permissions are the **intersection** of all certificates in the chain.
+/// A leaf cannot claim a permission that any certificate above it lacks.
 pub struct DelegateChainResult {
     /// The leaf certificate's P-256 public key point (for verifying ProveOVHdr).
     pub leaf_key_point: Vec<u8>,
-    /// Whether the leaf certificate has OIDPermitProvision (PERM.7).
+    /// PERM.1 — redirect permission (all certs in chain must carry it).
+    pub has_redirect: bool,
+    /// PERM.7 — provision permission (all certs in chain must carry it).
     pub has_provision: bool,
-    /// Whether the leaf certificate has any onboard permission.
+    /// Any onboard permission (PERM.2/3/4) — all certs must carry at least one.
     pub has_onboard: bool,
+    /// PERM.3 — credential reuse (all certs must carry it).
+    pub has_reuse_cred: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,13 +164,28 @@ pub fn verify_delegate_chain(
         }
     }
 
-    info!("delegate: chain verified ({} cert(s)), leaf has provision={}, onboard={}",
-        parsed.len(), parsed[0].has_permit_provision, parsed[0].has_permit_onboard);
+    // Step 3: compute permission intersection across all certs in the chain.
+    // A leaf cannot claim a permission that any certificate above it lacks.
+    let mut chain_redirect = true;
+    let mut chain_provision = true;
+    let mut chain_onboard = true;
+    let mut chain_reuse_cred = true;
+    for cert in &parsed {
+        chain_redirect &= cert.has_permit_redirect;
+        chain_provision &= cert.has_permit_provision;
+        chain_onboard &= cert.has_permit_onboard;
+        chain_reuse_cred &= cert.has_permit_reuse_cred;
+    }
+
+    info!("delegate: chain verified ({} cert(s)), intersection: redirect={}, provision={}, onboard={}, reuse_cred={}",
+        parsed.len(), chain_redirect, chain_provision, chain_onboard, chain_reuse_cred);
 
     Some(DelegateChainResult {
         leaf_key_point: parsed[0].public_key_point.clone(),
-        has_provision: parsed[0].has_permit_provision,
-        has_onboard: parsed[0].has_permit_onboard,
+        has_redirect: chain_redirect,
+        has_provision: chain_provision,
+        has_onboard: chain_onboard,
+        has_reuse_cred: chain_reuse_cred,
     })
 }
 
@@ -230,8 +265,7 @@ fn parse_x509_cert(der: &[u8]) -> Option<ParsedCert<'_>> {
     tbs_pos = spki_end;
 
     // Extensions — look for [3] (tag 0xA3)
-    let mut has_permit_provision = false;
-    let mut has_permit_onboard = false;
+    let mut eku = EkuFlags { redirect: false, onboard: false, reuse_cred: false, provision: false };
 
     // There might be issuerUniqueID [1] or subjectUniqueID [2] before extensions
     while tbs_pos < tbs_raw.len() + tbs_start {
@@ -264,7 +298,7 @@ fn parse_x509_cert(der: &[u8]) -> Option<ParsedCert<'_>> {
                         }
                         // OCTET STRING wrapping the EKU SEQUENCE
                         let eku_wrapper = read_octet_string(der, &mut ext_pos)?;
-                        check_eku_oids(eku_wrapper, &mut has_permit_provision, &mut has_permit_onboard);
+                        eku = check_eku_oids(eku_wrapper);
                     }
                 }
                 ext_pos = ext_end;
@@ -283,32 +317,54 @@ fn parse_x509_cert(der: &[u8]) -> Option<ParsedCert<'_>> {
         tbs_raw,
         public_key_point,
         signature_rs,
-        has_permit_provision,
-        has_permit_onboard,
+        has_permit_redirect: eku.redirect,
+        has_permit_provision: eku.provision,
+        has_permit_onboard: eku.onboard,
+        has_permit_reuse_cred: eku.reuse_cred,
     })
 }
 
+/// Parsed EKU permission flags from a single certificate.
+struct EkuFlags {
+    redirect: bool,
+    onboard: bool,
+    reuse_cred: bool,
+    provision: bool,
+}
+
 /// Check an ExtendedKeyUsage SEQUENCE for FDO permission OIDs.
-fn check_eku_oids(data: &[u8], has_provision: &mut bool, has_onboard: &mut bool) {
+fn check_eku_oids(data: &[u8]) -> EkuFlags {
+    let mut flags = EkuFlags {
+        redirect: false, onboard: false, reuse_cred: false, provision: false,
+    };
     let mut pos = 0usize;
     // SEQUENCE of OIDs
     let (_, seq_end) = match read_sequence_header(data, &mut pos) {
         Some(v) => v,
-        None => return,
+        None => return flags,
     };
     while pos < seq_end {
         if let Some(oid) = read_oid(data, &mut pos) {
             if oid == OID_PERMIT_PROVISION {
-                *has_provision = true;
+                flags.provision = true;
                 debug!("delegate: found OIDPermitProvision (PERM.7)");
-            } else if oid == OID_PERMIT_ONBOARD_NEWCRED
-                || oid == OID_PERMIT_ONBOARD_REUSECRED
-                || oid == OID_PERMIT_ONBOARD_FDODISABLE
-            {
-                *has_onboard = true;
+            } else if oid == OID_PERMIT_REDIRECT {
+                flags.redirect = true;
+                debug!("delegate: found OIDPermitRedirect (PERM.1)");
+            } else if oid == OID_PERMIT_ONBOARD_NEWCRED {
+                flags.onboard = true;
+                debug!("delegate: found OIDPermitOnboardNewCred (PERM.2)");
+            } else if oid == OID_PERMIT_ONBOARD_REUSECRED {
+                flags.reuse_cred = true;
+                flags.onboard = true;
+                debug!("delegate: found OIDPermitOnboardReuseCred (PERM.3)");
+            } else if oid == OID_PERMIT_ONBOARD_FDODISABLE {
+                flags.onboard = true;
+                debug!("delegate: found OIDPermitOnboardFdoDisable (PERM.4)");
             }
         }
     }
+    flags
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +641,200 @@ fn parse_x5chain_value(data: &[u8], pos: &mut usize) -> Option<Vec<Vec<u8>>> {
     }
 }
 
+/// Build a minimal self-signed X.509 certificate for testing.
+///
+/// The cert is signed by `issuer_sk` and contains the public key from `subject_pk_point`.
+/// `eku_oids` is a list of OID raw bytes to place in the ExtendedKeyUsage extension.
+#[cfg(test)]
+pub(crate) fn build_test_cert(
+    issuer_sk: &p256::ecdsa::SigningKey,
+    subject_pk_point: &[u8],
+    eku_oids: &[&[u8]],
+) -> Vec<u8> {
+    use p256::ecdsa::{signature::Signer, Signature};
+
+    // Build TBS certificate
+    let tbs = build_test_tbs(subject_pk_point, eku_oids);
+
+    // Sign TBS with issuer key
+    let sig: Signature = issuer_sk.sign(&tbs);
+    let sig_der = ecdsa_rs_to_der(sig.to_bytes().as_slice());
+
+    // Certificate = SEQUENCE { tbs, signatureAlgorithm, signatureValue }
+    let mut cert = Vec::new();
+
+    // signatureAlgorithm = ecdsaWithSHA256 (1.2.840.10045.4.3.2)
+    let sig_alg = &[
+        0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce,
+        0x3d, 0x04, 0x03, 0x02,
+    ];
+
+    // signatureValue BIT STRING
+    let mut sig_bs = Vec::new();
+    sig_bs.push(0x03); // BIT STRING tag
+    der_write_length(&mut sig_bs, sig_der.len() + 1);
+    sig_bs.push(0x00); // unused bits
+    sig_bs.extend_from_slice(&sig_der);
+
+    let inner_len = tbs.len() + sig_alg.len() + sig_bs.len();
+    cert.push(0x30); // SEQUENCE
+    der_write_length(&mut cert, inner_len);
+    cert.extend_from_slice(&tbs);
+    cert.extend_from_slice(sig_alg);
+    cert.extend_from_slice(&sig_bs);
+
+    cert
+}
+
+/// Build a minimal TBS certificate for testing.
+#[cfg(test)]
+fn build_test_tbs(subject_pk_point: &[u8], eku_oids: &[&[u8]]) -> Vec<u8> {
+    let mut tbs_inner = Vec::new();
+
+    // version [0] EXPLICIT INTEGER 2 (v3)
+    tbs_inner.extend_from_slice(&[0xa0, 0x03, 0x02, 0x01, 0x02]);
+
+    // serialNumber INTEGER 1
+    tbs_inner.extend_from_slice(&[0x02, 0x01, 0x01]);
+
+    // signature algorithm (ecdsaWithSHA256)
+    tbs_inner.extend_from_slice(&[
+        0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce,
+        0x3d, 0x04, 0x03, 0x02,
+    ]);
+
+    // issuer: CN=test
+    let issuer_name = &[
+        0x30, 0x0f, 0x31, 0x0d, 0x30, 0x0b, 0x06, 0x03,
+        0x55, 0x04, 0x03, 0x0c, 0x04, 0x74, 0x65, 0x73, 0x74,
+    ];
+    tbs_inner.extend_from_slice(issuer_name);
+
+    // validity: not before/after (generous)
+    let validity = &[
+        0x30, 0x1e,
+        0x17, 0x0d, 0x32, 0x35, 0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x5a,
+        0x17, 0x0d, 0x33, 0x35, 0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x5a,
+    ];
+    tbs_inner.extend_from_slice(validity);
+
+    // subject: CN=test
+    tbs_inner.extend_from_slice(issuer_name);
+
+    // subjectPublicKeyInfo for P-256
+    let mut spki = Vec::new();
+    // algorithm: ecPublicKey + prime256v1
+    let spki_alg = &[
+        0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce,
+        0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48,
+        0xce, 0x3d, 0x03, 0x01, 0x07,
+    ];
+    spki.extend_from_slice(spki_alg);
+    // BIT STRING containing the uncompressed point
+    spki.push(0x03); // BIT STRING
+    der_write_length(&mut spki, subject_pk_point.len() + 1);
+    spki.push(0x00); // unused bits
+    spki.extend_from_slice(subject_pk_point);
+
+    let mut spki_seq = Vec::new();
+    spki_seq.push(0x30);
+    der_write_length(&mut spki_seq, spki.len());
+    spki_seq.extend_from_slice(&spki);
+    tbs_inner.extend_from_slice(&spki_seq);
+
+    // Extensions [3] EXPLICIT { SEQUENCE { ... } }
+    if !eku_oids.is_empty() {
+        let mut eku_inner = Vec::new();
+        for oid in eku_oids {
+            eku_inner.push(0x06); // OID tag
+            der_write_length(&mut eku_inner, oid.len());
+            eku_inner.extend_from_slice(oid);
+        }
+
+        let mut eku_seq = Vec::new();
+        eku_seq.push(0x30); // SEQUENCE
+        der_write_length(&mut eku_seq, eku_inner.len());
+        eku_seq.extend_from_slice(&eku_inner);
+
+        let mut eku_os = Vec::new();
+        eku_os.push(0x04); // OCTET STRING
+        der_write_length(&mut eku_os, eku_seq.len());
+        eku_os.extend_from_slice(&eku_seq);
+
+        let mut ext_entry = Vec::new();
+        ext_entry.push(0x30); // SEQUENCE (Extension)
+        // extnID = 2.5.29.37 (EKU)
+        let eku_oid_tlv = &[0x06, 0x03, 0x55, 0x1d, 0x25];
+        der_write_length(&mut ext_entry, eku_oid_tlv.len() + eku_os.len());
+        ext_entry.extend_from_slice(eku_oid_tlv);
+        ext_entry.extend_from_slice(&eku_os);
+
+        let mut ext_seq = Vec::new();
+        ext_seq.push(0x30); // SEQUENCE of extensions
+        der_write_length(&mut ext_seq, ext_entry.len());
+        ext_seq.extend_from_slice(&ext_entry);
+
+        // [3] EXPLICIT
+        tbs_inner.push(0xa3);
+        der_write_length(&mut tbs_inner, ext_seq.len());
+        tbs_inner.extend_from_slice(&ext_seq);
+    }
+
+    // Wrap in SEQUENCE
+    let mut tbs = Vec::new();
+    tbs.push(0x30);
+    der_write_length(&mut tbs, tbs_inner.len());
+    tbs.extend_from_slice(&tbs_inner);
+    tbs
+}
+
+/// Write a DER length.
+#[cfg(test)]
+fn der_write_length(out: &mut Vec<u8>, len: usize) {
+    if len < 128 {
+        out.push(len as u8);
+    } else if len < 256 {
+        out.push(0x81);
+        out.push(len as u8);
+    } else {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    }
+}
+
+/// Convert fixed-width r||s (64 bytes) to DER SEQUENCE { INTEGER r, INTEGER s }.
+#[cfg(test)]
+fn ecdsa_rs_to_der(rs: &[u8]) -> Vec<u8> {
+    fn der_integer(val: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(0x02); // INTEGER
+        // Trim leading zeros but keep at least one byte
+        let trimmed = match val.iter().position(|&b| b != 0) {
+            Some(i) => &val[i..],
+            None => &[0u8],
+        };
+        // Add leading zero if high bit set (to keep positive)
+        if trimmed[0] & 0x80 != 0 {
+            out.push((trimmed.len() + 1) as u8);
+            out.push(0x00);
+        } else {
+            out.push(trimmed.len() as u8);
+        }
+        out.extend_from_slice(trimmed);
+        out
+    }
+
+    let r = der_integer(&rs[..32]);
+    let s = der_integer(&rs[32..]);
+    let mut seq = Vec::new();
+    seq.push(0x30); // SEQUENCE
+    seq.push((r.len() + s.len()) as u8);
+    seq.extend_from_slice(&r);
+    seq.extend_from_slice(&s);
+    seq
+}
+
 /// Parse an FDO PublicKey as X5CHAIN and return the DER cert bytes.
 fn parse_fdo_public_key_x5chain(data: &[u8], pos: &mut usize) -> Option<Vec<Vec<u8>>> {
     // [pkType, pkEnc, pkBody]
@@ -638,5 +888,460 @@ fn parse_fdo_public_key_x5chain(data: &[u8], pos: &mut usize) -> Option<Vec<Vec<
     } else {
         error!("delegate: X5CHAIN pkBody is neither array nor bstr (major={})", major);
         None
+    }
+}
+
+// =========================================================================
+// Unit tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cose::{gen_test_keypair, gen_test_keypair_b};
+
+    /// Third deterministic key pair for 3-cert chain tests.
+    fn gen_test_keypair_c() -> (p256::ecdsa::SigningKey, Vec<u8>) {
+        use p256::ecdsa::SigningKey;
+        use p256::EncodedPoint;
+        let secret = p256::SecretKey::from_bytes(
+            &[
+                0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+                0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+                0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+                0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+            ].into(),
+        ).unwrap();
+        let sk = SigningKey::from(secret.clone());
+        let pk = secret.public_key();
+        let point = EncodedPoint::from(pk);
+        (sk, point.as_bytes().to_vec())
+    }
+
+    // ===== Single-cert chain =====
+
+    #[test]
+    fn test_single_cert_chain_with_provision() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (_delegate_sk, delegate_point) = gen_test_keypair_b();
+
+        let cert_der = build_test_cert(
+            &owner_sk, &delegate_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED],
+        );
+
+        let certs = [cert_der.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point)
+            .expect("1-cert chain should verify");
+
+        assert!(result.has_provision, "must have provision");
+        assert!(result.has_onboard, "must have onboard");
+        assert_eq!(result.leaf_key_point, delegate_point);
+    }
+
+    #[test]
+    fn test_single_cert_chain_no_provision() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (_delegate_sk, delegate_point) = gen_test_keypair_b();
+
+        let cert_der = build_test_cert(
+            &owner_sk, &delegate_point,
+            &[OID_PERMIT_ONBOARD_NEWCRED],
+        );
+
+        let certs = [cert_der.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point)
+            .expect("chain should verify (permissions checked by caller)");
+
+        assert!(!result.has_provision, "must NOT have provision");
+        assert!(result.has_onboard, "must have onboard");
+    }
+
+    // ===== Negative: wrong signer =====
+
+    #[test]
+    fn test_chain_wrong_signer_rejected() {
+        let (_owner_sk, owner_point) = gen_test_keypair();
+        let (attacker_sk, _) = gen_test_keypair_b();
+
+        let cert_der = build_test_cert(
+            &attacker_sk, &owner_point, &[OID_PERMIT_PROVISION],
+        );
+
+        let certs = [cert_der.as_slice()];
+        assert!(verify_delegate_chain(&certs, &owner_point).is_none(),
+            "cert signed by unrelated key must be rejected");
+    }
+
+    // ===== Self-signed delegate rejected (Go: TestSelfSignedDelegateRejected) =====
+
+    #[test]
+    fn test_self_signed_delegate_rejected() {
+        let (_owner_sk, owner_point) = gen_test_keypair();
+        let (attacker_sk, attacker_point) = gen_test_keypair_b();
+
+        // Attacker creates a cert signing their own key — self-signed root
+        let cert_der = build_test_cert(
+            &attacker_sk, &attacker_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT],
+        );
+
+        let certs = [cert_der.as_slice()];
+        assert!(verify_delegate_chain(&certs, &owner_point).is_none(),
+            "self-signed delegate must be rejected when verified against legitimate owner");
+    }
+
+    // ===== Empty chain =====
+
+    #[test]
+    fn test_empty_chain_rejected() {
+        let (_, owner_point) = gen_test_keypair();
+        let certs: [&[u8]; 0] = [];
+        assert!(verify_delegate_chain(&certs, &owner_point).is_none(),
+            "empty chain must be rejected");
+    }
+
+    // ===== 2-cert chain =====
+
+    #[test]
+    fn test_two_cert_chain() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (intermediate_sk, intermediate_point) = gen_test_keypair_b();
+        let (_leaf_sk, leaf_point) = gen_test_keypair_c();
+
+        let root_cert = build_test_cert(
+            &owner_sk, &intermediate_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED],
+        );
+        let leaf_cert = build_test_cert(
+            &intermediate_sk, &leaf_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED],
+        );
+
+        let certs = [leaf_cert.as_slice(), root_cert.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point)
+            .expect("2-cert chain should verify");
+
+        assert!(result.has_provision);
+        assert!(result.has_onboard);
+        assert_eq!(result.leaf_key_point, leaf_point);
+    }
+
+    #[test]
+    fn test_two_cert_chain_broken_middle() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (_intermediate_sk, intermediate_point) = gen_test_keypair_b();
+        let (attacker_sk, _) = gen_test_keypair_c();
+
+        let root_cert = build_test_cert(
+            &owner_sk, &intermediate_point, &[OID_PERMIT_PROVISION],
+        );
+        // Leaf signed by attacker, not intermediate
+        let leaf_cert = build_test_cert(
+            &attacker_sk, &intermediate_point, &[OID_PERMIT_PROVISION],
+        );
+
+        let certs = [leaf_cert.as_slice(), root_cert.as_slice()];
+        assert!(verify_delegate_chain(&certs, &owner_point).is_none(),
+            "broken chain must be rejected");
+    }
+
+    // ===== 3-cert chain =====
+
+    #[test]
+    fn test_three_cert_chain_valid() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (root_sk, root_point) = gen_test_keypair_b();
+        let (intermediate_sk, intermediate_point) = gen_test_keypair_c();
+        // Fourth key for leaf
+        let leaf_secret = p256::SecretKey::from_bytes(
+            &[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+              0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+              0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+              0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01].into(),
+        ).unwrap();
+        let leaf_point = {
+            let pk = leaf_secret.public_key();
+            p256::EncodedPoint::from(pk).as_bytes().to_vec()
+        };
+
+        let root_cert = build_test_cert(
+            &owner_sk, &root_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT],
+        );
+        let inter_cert = build_test_cert(
+            &root_sk, &intermediate_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT],
+        );
+        let leaf_cert = build_test_cert(
+            &intermediate_sk, &leaf_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT],
+        );
+
+        // Leaf-first: [leaf, intermediate, root]
+        let certs = [leaf_cert.as_slice(), inter_cert.as_slice(), root_cert.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point)
+            .expect("3-cert chain should verify");
+
+        assert!(result.has_provision);
+        assert!(result.has_onboard);
+        assert!(result.has_redirect);
+        assert_eq!(result.leaf_key_point, leaf_point);
+    }
+
+    // ===== Permission inheritance (Go: TestDelegateChainIntermediateMissingPermission) =====
+
+    #[test]
+    fn test_intermediate_missing_permission() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (intermediate_sk, intermediate_point) = gen_test_keypair_b();
+        let (_leaf_sk, leaf_point) = gen_test_keypair_c();
+
+        // Root has onboard + redirect + provision
+        let root_cert = build_test_cert(
+            &owner_sk, &intermediate_point,
+            &[OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT, OID_PERMIT_PROVISION],
+        );
+        // Intermediate has ONLY redirect (no onboard, no provision)
+        let leaf_cert = build_test_cert(
+            &intermediate_sk, &leaf_point,
+            &[OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT, OID_PERMIT_PROVISION],
+        );
+
+        let certs = [leaf_cert.as_slice(), root_cert.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point)
+            .expect("chain verifies (permissions are intersected, not rejected)");
+
+        // Leaf claims onboard+provision but root has them too, so intersection passes.
+        // Now test the ACTUAL intermediate-missing case:
+        // Root: redirect only. Leaf: onboard + redirect.
+        let root_redirect_only = build_test_cert(
+            &owner_sk, &intermediate_point,
+            &[OID_PERMIT_REDIRECT],
+        );
+        let leaf_onboard_redirect = build_test_cert(
+            &intermediate_sk, &leaf_point,
+            &[OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT],
+        );
+
+        let certs2 = [leaf_onboard_redirect.as_slice(), root_redirect_only.as_slice()];
+        let result2 = verify_delegate_chain(&certs2, &owner_point)
+            .expect("chain verifies structurally");
+
+        // Intersection: redirect passes (both have it), onboard fails (root lacks it)
+        assert!(result2.has_redirect, "redirect must pass (both have it)");
+        assert!(!result2.has_onboard, "onboard must fail (root lacks it)");
+        assert!(!result2.has_provision, "provision must fail (neither has it)");
+    }
+
+    // ===== Root missing permission (Go: TestDelegateChainRootMissingPermission) =====
+
+    #[test]
+    fn test_root_missing_permission() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (root_sk, root_point) = gen_test_keypair_b();
+        let (intermediate_sk, intermediate_point) = gen_test_keypair_c();
+        let leaf_secret = p256::SecretKey::from_bytes(
+            &[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+              0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+              0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+              0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01].into(),
+        ).unwrap();
+        let leaf_point = {
+            let pk = leaf_secret.public_key();
+            p256::EncodedPoint::from(pk).as_bytes().to_vec()
+        };
+
+        // Root: redirect only (no onboard, no provision)
+        let root_cert = build_test_cert(
+            &owner_sk, &root_point, &[OID_PERMIT_REDIRECT],
+        );
+        // Intermediate: onboard + redirect
+        let inter_cert = build_test_cert(
+            &root_sk, &intermediate_point,
+            &[OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT],
+        );
+        // Leaf: onboard + redirect + provision
+        let leaf_cert = build_test_cert(
+            &intermediate_sk, &leaf_point,
+            &[OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT, OID_PERMIT_PROVISION],
+        );
+
+        let certs = [leaf_cert.as_slice(), inter_cert.as_slice(), root_cert.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point)
+            .expect("chain verifies structurally");
+
+        // Intersection across all 3:
+        assert!(result.has_redirect, "redirect: all 3 have it");
+        assert!(!result.has_onboard, "onboard: root lacks it → false");
+        assert!(!result.has_provision, "provision: root+intermediate lack it → false");
+    }
+
+    // ===== Redirect-only cannot onboard (Go: TestDelegateCannotOnboardWithRedirectOnly) =====
+
+    #[test]
+    fn test_redirect_only_cannot_onboard() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (_delegate_sk, delegate_point) = gen_test_keypair_b();
+
+        let cert_der = build_test_cert(
+            &owner_sk, &delegate_point, &[OID_PERMIT_REDIRECT],
+        );
+
+        let certs = [cert_der.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point).unwrap();
+
+        assert!(result.has_redirect, "redirect must be true");
+        assert!(!result.has_onboard, "onboard must be false");
+        assert!(!result.has_provision, "provision must be false");
+    }
+
+    // ===== Onboard-only cannot redirect (Go: TestDelegateCannotRedirectWithOnboardOnly) =====
+
+    #[test]
+    fn test_onboard_only_cannot_redirect() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (_delegate_sk, delegate_point) = gen_test_keypair_b();
+
+        let cert_der = build_test_cert(
+            &owner_sk, &delegate_point, &[OID_PERMIT_ONBOARD_NEWCRED],
+        );
+
+        let certs = [cert_der.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point).unwrap();
+
+        assert!(!result.has_redirect, "redirect must be false");
+        assert!(result.has_onboard, "onboard must be true");
+    }
+
+    // ===== Reuse-credential vs new-credential (Go: TestDelegateCannotReuseCred/WithReuseCred) =====
+
+    #[test]
+    fn test_new_cred_cannot_reuse() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (_, delegate_point) = gen_test_keypair_b();
+
+        // PERM.2 only (onboard-new-cred)
+        let cert_der = build_test_cert(
+            &owner_sk, &delegate_point, &[OID_PERMIT_ONBOARD_NEWCRED],
+        );
+
+        let certs = [cert_der.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point).unwrap();
+
+        assert!(result.has_onboard, "onboard true (new-cred implies onboard)");
+        assert!(!result.has_reuse_cred, "reuse_cred must be false");
+    }
+
+    #[test]
+    fn test_reuse_cred_implies_onboard() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (_, delegate_point) = gen_test_keypair_b();
+
+        // PERM.3 (onboard-reuse-cred)
+        let cert_der = build_test_cert(
+            &owner_sk, &delegate_point, &[OID_PERMIT_ONBOARD_REUSECRED],
+        );
+
+        let certs = [cert_der.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point).unwrap();
+
+        assert!(result.has_onboard, "onboard true (reuse-cred implies onboard)");
+        assert!(result.has_reuse_cred, "reuse_cred must be true");
+    }
+
+    // ===== All permissions (Go: TestDelegateWithAllPermissions) =====
+
+    #[test]
+    fn test_all_permissions() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (_, delegate_point) = gen_test_keypair_b();
+
+        let cert_der = build_test_cert(
+            &owner_sk, &delegate_point,
+            &[OID_PERMIT_REDIRECT, OID_PERMIT_ONBOARD_NEWCRED,
+              OID_PERMIT_ONBOARD_REUSECRED, OID_PERMIT_PROVISION],
+        );
+
+        let certs = [cert_der.as_slice()];
+        let result = verify_delegate_chain(&certs, &owner_point).unwrap();
+
+        assert!(result.has_redirect);
+        assert!(result.has_onboard);
+        assert!(result.has_reuse_cred);
+        assert!(result.has_provision);
+    }
+
+    // ===== DER parsing =====
+
+    #[test]
+    fn test_parse_x509_cert_extracts_key() {
+        let (owner_sk, _) = gen_test_keypair();
+        let (_, delegate_point) = gen_test_keypair_b();
+
+        let cert_der = build_test_cert(&owner_sk, &delegate_point, &[]);
+        let parsed = parse_x509_cert(&cert_der)
+            .expect("should parse generated cert");
+
+        assert_eq!(parsed.public_key_point, delegate_point);
+        assert_eq!(parsed.signature_rs.len(), 64);
+    }
+
+    #[test]
+    fn test_parse_x509_cert_eku_flags() {
+        let (sk, _) = gen_test_keypair();
+        let (_, point) = gen_test_keypair_b();
+
+        // Provision only
+        let cert = build_test_cert(&sk, &point, &[OID_PERMIT_PROVISION]);
+        let parsed = parse_x509_cert(&cert).unwrap();
+        assert!(parsed.has_permit_provision);
+        assert!(!parsed.has_permit_onboard);
+        assert!(!parsed.has_permit_redirect);
+
+        // Onboard-reuse only
+        let cert2 = build_test_cert(&sk, &point, &[OID_PERMIT_ONBOARD_REUSECRED]);
+        let parsed2 = parse_x509_cert(&cert2).unwrap();
+        assert!(!parsed2.has_permit_provision);
+        assert!(parsed2.has_permit_onboard);
+        assert!(parsed2.has_permit_reuse_cred);
+        assert!(!parsed2.has_permit_redirect);
+
+        // Redirect only
+        let cert3 = build_test_cert(&sk, &point, &[OID_PERMIT_REDIRECT]);
+        let parsed3 = parse_x509_cert(&cert3).unwrap();
+        assert!(!parsed3.has_permit_provision);
+        assert!(!parsed3.has_permit_onboard);
+        assert!(parsed3.has_permit_redirect);
+
+        // All permissions
+        let cert4 = build_test_cert(&sk, &point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED,
+              OID_PERMIT_ONBOARD_REUSECRED, OID_PERMIT_ONBOARD_FDODISABLE,
+              OID_PERMIT_REDIRECT]);
+        let parsed4 = parse_x509_cert(&cert4).unwrap();
+        assert!(parsed4.has_permit_provision);
+        assert!(parsed4.has_permit_onboard);
+        assert!(parsed4.has_permit_reuse_cred);
+        assert!(parsed4.has_permit_redirect);
+    }
+
+    #[test]
+    fn test_parse_x509_cert_garbage() {
+        let result = parse_x509_cert(&[0x00, 0x01, 0x02]);
+        assert!(result.is_none(), "garbage input must fail");
+    }
+
+    #[test]
+    fn test_ecdsa_der_to_rs() {
+        let der = &[
+            0x30, 0x06,
+            0x02, 0x01, 0x01, // INTEGER 1
+            0x02, 0x01, 0x02, // INTEGER 2
+        ];
+        let rs = ecdsa_der_to_rs(der).expect("should parse");
+        assert_eq!(rs.len(), 64);
+        assert_eq!(rs[31], 1);
+        assert_eq!(rs[63], 2);
     }
 }

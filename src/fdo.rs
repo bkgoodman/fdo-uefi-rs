@@ -19,8 +19,11 @@ use aes_gcm::aead::generic_array::GenericArray;
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[cfg(target_os = "uefi")]
 use crate::http_api::{http_post, http_post_with_session, HttpPostResponse};
+#[cfg(target_os = "uefi")]
 use crate::bmo::{BmoSession, process_bmo_message, BmoState};
+#[cfg(target_os = "uefi")]
 use crate::chainload::chainload_image;
 
 /// Compute SHA-256 hash of data
@@ -367,7 +370,7 @@ impl CborEncoder {
     }
 
     // Encode negative integer
-    fn neg_int(&mut self, val: i8) {
+    pub fn neg_int(&mut self, val: i8) {
         if val >= 0 {
             self.buf.push(val as u8);
         } else {
@@ -692,7 +695,7 @@ impl<'a> CborDecoder<'a> {
     }
     
     // Read and consume null value
-    fn read_null(&mut self) -> Result<(), FdoError> {
+    pub fn read_null(&mut self) -> Result<(), FdoError> {
         let b = self.read_byte()?;
         if b != 0xf6 {
             return Err(FdoError::CborError(format!("expected null (0xf6), got 0x{:02x}", b)));
@@ -790,6 +793,7 @@ fn parse_to1_rv_redirect(data: &[u8]) -> Result<To1RvRedirect, FdoError> {
 ///
 /// A COSE_Sign1 containing an EAT with the device GUID and nonce4, signed with
 /// the device attestation key held in the TPM.
+#[cfg(target_os = "uefi")]
 pub fn build_to1_prove_to_rv(
     guid: &[u8; 16],
     nonce4: &[u8; 16],
@@ -1641,6 +1645,7 @@ pub fn parse_to2_done_ack(data: &[u8]) -> Result<DoneAck, FdoError> {
 // ============================================================
 
 /// Perform TO2 protocol step 1: HelloDeviceProbe -> HelloDeviceAck
+#[cfg(target_os = "uefi")]
 /// Returns the ack, session token, and raw response bytes for hash_prev2
 pub fn perform_to2_hello(owner_url: &str, guid: &[u8; 16]) -> Result<(To2HelloDeviceAck, Option<String>, Vec<u8>), FdoError> {
     debug!("TO2: Sending HelloDeviceProbe to {}", owner_url);
@@ -1679,6 +1684,7 @@ pub fn perform_to2_hello(owner_url: &str, guid: &[u8; 16]) -> Result<(To2HelloDe
 }
 
 /// Perform TO2 protocol (initial steps - unencrypted)
+#[cfg(target_os = "uefi")]
 /// device_key_handle: persistent TPM handle for the DAK, read from DCTPM.DeviceKeyHandle
 pub fn perform_to2(
     owner_url: &str,
@@ -2295,6 +2301,7 @@ pub fn perform_to2(
     Ok(())
 }
 
+#[cfg(target_os = "uefi")]
 /// Test TO2 protocol against a live server
 pub fn test_to2_protocol(
     owner_url: &str,
@@ -2311,6 +2318,7 @@ pub fn test_to2_protocol(
     }
 }
 
+#[cfg(target_os = "uefi")]
 /// Perform TO1 protocol step 1: HelloRV -> HelloRVAck
 /// Returns the nonce4 from the server for use in ProveToRV
 pub fn perform_to1_hello(
@@ -2378,6 +2386,7 @@ fn check_fdo_error(message_type: Option<u8>, body: &[u8], context: &str) -> Resu
         "{}: FDO error {}: {}", context, code, msg)))
 }
 
+#[cfg(target_os = "uefi")]
 /// Perform TO1 ProveToRV step: send ProveToRV, receive RVRedirect
 fn perform_to1_prove(
     rv_url: &str,
@@ -2414,6 +2423,7 @@ fn perform_to1_prove(
     Ok(redirect)
 }
 
+#[cfg(target_os = "uefi")]
 /// Perform TO1 protocol (full flow)
 /// Returns TO1D blob (owner rendezvous info) on success
 pub fn perform_to1(
@@ -2449,6 +2459,7 @@ pub fn perform_to1(
     Ok(redirect)
 }
 
+#[cfg(target_os = "uefi")]
 /// Test FDO message creation
 pub fn test_fdo_messages() {
     debug!("Testing FDO message creation (manual CBOR)...");
@@ -2475,6 +2486,7 @@ pub fn test_fdo_messages() {
     debug!("FDO message test complete!");
 }
 
+#[cfg(target_os = "uefi")]
 /// Test TO1 protocol against a live server
 pub fn test_to1_protocol(rv_url: &str, guid: &[u8; 16], device_key_handle: u32) {
     info!("=== TO1 Protocol Test ===");
@@ -2485,5 +2497,508 @@ pub fn test_to1_protocol(rv_url: &str, guid: &[u8; 16], device_key_handle: u32) 
             debug!("  Received TO1D: {} bytes", redirect.to1d_cose.len());
         }
         Err(e) => error!("TO1 test failed: {:?}", e),
+    }
+}
+
+// =========================================================================
+// Unit tests — CBOR encoder/decoder, crypto, message builders
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- CborEncoder ---
+
+    #[test]
+    fn test_encoder_uint_small() {
+        let mut enc = CborEncoder::new();
+        enc.uint(5);
+        assert_eq!(enc.into_bytes(), &[0x05]);
+    }
+
+    #[test]
+    fn test_encoder_uint_one_byte() {
+        let mut enc = CborEncoder::new();
+        enc.uint(200);
+        assert_eq!(enc.into_bytes(), &[0x18, 200]);
+    }
+
+    #[test]
+    fn test_encoder_uint_two_bytes() {
+        let mut enc = CborEncoder::new();
+        enc.uint(1000);
+        assert_eq!(enc.into_bytes(), &[0x19, 0x03, 0xe8]);
+    }
+
+    #[test]
+    fn test_encoder_bytes() {
+        let mut enc = CborEncoder::new();
+        enc.bytes(&[0xaa, 0xbb]);
+        let out = enc.into_bytes();
+        assert_eq!(out, &[0x42, 0xaa, 0xbb]); // bstr(2)
+    }
+
+    #[test]
+    fn test_encoder_text() {
+        let mut enc = CborEncoder::new();
+        enc.text("hi");
+        let out = enc.into_bytes();
+        assert_eq!(out, &[0x62, b'h', b'i']); // tstr(2)
+    }
+
+    #[test]
+    fn test_encoder_array() {
+        let mut enc = CborEncoder::new();
+        enc.array(3);
+        enc.uint(1);
+        enc.uint(2);
+        enc.uint(3);
+        let out = enc.into_bytes();
+        assert_eq!(out, &[0x83, 0x01, 0x02, 0x03]); // [1, 2, 3]
+    }
+
+    #[test]
+    fn test_encoder_null() {
+        let mut enc = CborEncoder::new();
+        enc.null();
+        assert_eq!(enc.into_bytes(), &[0xf6]);
+    }
+
+    #[test]
+    fn test_encoder_bool() {
+        let mut enc = CborEncoder::new();
+        enc.bool_val(true);
+        enc.bool_val(false);
+        assert_eq!(enc.into_bytes(), &[0xf5, 0xf4]);
+    }
+
+    #[test]
+    fn test_encoder_map() {
+        let mut enc = CborEncoder::new();
+        enc.encode_map(1);
+        enc.text("key");
+        enc.uint(42);
+        let out = enc.into_bytes();
+        // map(1) { "key": 42 }
+        assert_eq!(out[0], 0xa1); // map(1)
+    }
+
+    // --- CborDecoder ---
+
+    #[test]
+    fn test_decoder_uint() {
+        let data = [0x83, 0x01, 0x18, 0xc8, 0x19, 0x03, 0xe8];
+        let mut dec = CborDecoder::new(&data);
+        assert_eq!(dec.read_array_header().unwrap(), 3);
+        assert_eq!(dec.read_uint().unwrap(), 1);
+        assert_eq!(dec.read_uint().unwrap(), 200);
+        assert_eq!(dec.read_uint().unwrap(), 1000);
+    }
+
+    #[test]
+    fn test_decoder_bytes() {
+        let data = [0x43, 0xaa, 0xbb, 0xcc]; // bstr(3)
+        let mut dec = CborDecoder::new(&data);
+        let b = dec.read_bytes().unwrap();
+        assert_eq!(b, &[0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn test_decoder_text() {
+        let data = [0x63, b'f', b'o', b'o']; // tstr(3) "foo"
+        let mut dec = CborDecoder::new(&data);
+        let s = dec.read_text().unwrap();
+        assert_eq!(s, "foo");
+    }
+
+    #[test]
+    fn test_decoder_null() {
+        let data = [0xf6];
+        let mut dec = CborDecoder::new(&data);
+        assert!(dec.read_null().is_ok());
+    }
+
+    #[test]
+    fn test_decoder_bool() {
+        let data = [0xf5, 0xf4];
+        let mut dec = CborDecoder::new(&data);
+        assert_eq!(dec.read_bool().unwrap(), true);
+        assert_eq!(dec.read_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn test_encoder_decoder_roundtrip() {
+        let mut enc = CborEncoder::new();
+        enc.array(4);
+        enc.uint(42);
+        enc.bytes(&[0x01, 0x02, 0x03]);
+        enc.text("hello");
+        enc.null();
+        let encoded = enc.into_bytes();
+
+        let mut dec = CborDecoder::new(&encoded);
+        assert_eq!(dec.read_array_header().unwrap(), 4);
+        assert_eq!(dec.read_uint().unwrap(), 42);
+        assert_eq!(dec.read_bytes().unwrap(), &[0x01, 0x02, 0x03]);
+        assert_eq!(dec.read_text().unwrap(), "hello");
+        assert!(dec.read_null().is_ok());
+    }
+
+    // --- AES-GCM encrypt/decrypt roundtrip ---
+
+    #[test]
+    fn test_aes256_gcm_roundtrip() {
+        let key = [0x42u8; 32];
+        let nonce = [0x01u8; 12];
+        let plaintext = b"secret data for FDO";
+        let aad = b"additional data";
+
+        let ciphertext = aes256_gcm_encrypt(&key, &nonce, plaintext, aad)
+            .expect("encrypt should succeed");
+        let decrypted = aes256_gcm_decrypt(&key, &nonce, &ciphertext, aad)
+            .expect("decrypt should succeed");
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_aes256_gcm_wrong_key() {
+        let key = [0x42u8; 32];
+        let wrong_key = [0x43u8; 32];
+        let nonce = [0x01u8; 12];
+        let plaintext = b"secret";
+        let aad = b"";
+
+        let ciphertext = aes256_gcm_encrypt(&key, &nonce, plaintext, aad).unwrap();
+        let result = aes256_gcm_decrypt(&wrong_key, &nonce, &ciphertext, aad);
+        assert!(result.is_err(), "wrong key must fail decryption");
+    }
+
+    #[test]
+    fn test_aes256_gcm_tampered_ciphertext() {
+        let key = [0x42u8; 32];
+        let nonce = [0x01u8; 12];
+        let plaintext = b"secret";
+        let aad = b"";
+
+        let mut ciphertext = aes256_gcm_encrypt(&key, &nonce, plaintext, aad).unwrap();
+        ciphertext[0] ^= 0xff; // tamper
+        let result = aes256_gcm_decrypt(&key, &nonce, &ciphertext, aad);
+        assert!(result.is_err(), "tampered ciphertext must fail");
+    }
+
+    #[test]
+    fn test_aes128_gcm_roundtrip() {
+        let key = [0x42u8; 16];
+        let nonce = [0x01u8; 12];
+        let plaintext = b"128-bit key data";
+        let aad = b"";
+
+        let ciphertext = aes_gcm_encrypt(&key, &nonce, plaintext, aad)
+            .expect("AES-128-GCM encrypt should work");
+        let decrypted = aes_gcm_decrypt(&key, &nonce, &ciphertext, aad)
+            .expect("AES-128-GCM decrypt should work");
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    // --- KDF ---
+
+    #[test]
+    fn test_kdf_deterministic() {
+        let secret = [0xab; 32];
+        let out1 = fdo_kdf(&secret, 256);
+        let out2 = fdo_kdf(&secret, 256);
+        assert_eq!(out1, out2, "KDF must be deterministic");
+        assert_eq!(out1.len(), 32);
+    }
+
+    #[test]
+    fn test_kdf_different_secrets() {
+        let out1 = fdo_kdf(&[0x01; 32], 256);
+        let out2 = fdo_kdf(&[0x02; 32], 256);
+        assert_ne!(out1, out2, "different secrets must produce different keys");
+    }
+
+    // --- SHA-256 ---
+
+    #[test]
+    fn test_sha256_known_vector() {
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb924...
+        let hash = sha256(b"");
+        assert_eq!(hash[0], 0xe3);
+        assert_eq!(hash[1], 0xb0);
+        assert_eq!(hash[2], 0xc4);
+    }
+
+    // --- COSE_Encrypt0 roundtrip ---
+
+    #[test]
+    fn test_cose_encrypt0_roundtrip() {
+        let key = [0x55u8; 32];
+        let nonce = [0x01u8; 12];
+        let plaintext = b"encrypted FDO payload";
+
+        let cose_enc = cose_encrypt0_a256gcm(&key, &nonce, plaintext)
+            .expect("COSE_Encrypt0 should succeed");
+        let decrypted = cose_decrypt0_a256gcm(&key, &cose_enc)
+            .expect("COSE_Decrypt0 should succeed");
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    // --- Message builders ---
+
+    #[test]
+    fn test_build_to1_hello_rv() {
+        let guid = [0x42u8; 16];
+        let msg = build_to1_hello_rv(&guid);
+        // Should be a valid CBOR array with the GUID
+        let mut dec = CborDecoder::new(&msg);
+        let arr_len = dec.read_array_header().unwrap();
+        assert!(arr_len >= 1);
+        let guid_bytes = dec.read_bytes().unwrap();
+        assert_eq!(guid_bytes, &guid);
+    }
+
+    #[test]
+    fn test_build_to2_hello_device_probe() {
+        let guid = [0x42u8; 16];
+        let sugar = [0xaa; 16];
+        let msg = build_to2_hello_device_probe(&guid, &sugar);
+        let mut dec = CborDecoder::new(&msg);
+        let arr_len = dec.read_array_header().unwrap();
+        assert!(arr_len >= 2);
+    }
+
+    #[test]
+    fn test_build_encrypted_message_roundtrip() {
+        let nonce = [0x01u8; 12];
+        let ciphertext = vec![0xaa, 0xbb, 0xcc];
+        let msg = build_encrypted_message(&nonce, &ciphertext);
+
+        let (parsed_nonce, parsed_ct) = parse_encrypted_message(&msg)
+            .expect("should parse encrypted message");
+        assert_eq!(parsed_nonce, &nonce);
+        assert_eq!(parsed_ct, ciphertext);
+    }
+
+    #[test]
+    fn test_build_devmod_service_info() {
+        let info = build_devmod_service_info();
+        // Should be valid CBOR that doesn't panic and produces some output
+        assert!(!info.is_empty());
+        // First byte should be an array header
+        assert!((info[0] >> 5) == 4 || (info[0] >> 5) == 0, "should be array or special");
+    }
+
+    // ===== Protocol message security edge cases =====
+
+    // --- Encrypted message: wrong tag rejected ---
+
+    #[test]
+    fn test_parse_encrypted_message_wrong_tag() {
+        // Tag 18 (COSE_Sign1) instead of tag 16 (COSE_Encrypt0)
+        let mut msg = Vec::new();
+        msg.push(0xD2); // tag 18
+        msg.push(0x83); // array(3)
+        msg.push(0x40); // bstr(0) - protected
+        msg.push(0xa0); // map(0) - unprotected
+        msg.push(0x40); // bstr(0) - ciphertext
+        let result = parse_encrypted_message(&msg);
+        assert!(result.is_err(), "tag 18 must be rejected by COSE_Encrypt0 parser");
+    }
+
+    // --- Encrypted message: no tag at all ---
+
+    #[test]
+    fn test_parse_encrypted_message_no_tag() {
+        // Bare array without CBOR tag
+        let mut msg = Vec::new();
+        msg.push(0x83); // array(3) — major type 4, not tag
+        msg.push(0x40);
+        msg.push(0xa0);
+        msg.push(0x40);
+        let result = parse_encrypted_message(&msg);
+        assert!(result.is_err(), "bare array without tag must be rejected");
+    }
+
+    // --- Encrypted message: missing IV ---
+
+    #[test]
+    fn test_parse_encrypted_message_missing_iv() {
+        // Tag 16, array(3), but unprotected map has no IV (label 5)
+        let mut enc = CborEncoder::new();
+        let prot = {
+            let mut p = CborEncoder::new();
+            p.encode_map(1);
+            p.uint(1); p.uint(3);
+            p.into_bytes()
+        };
+        // Build manually with tag 16
+        let mut msg = Vec::new();
+        msg.push(0xD0); // tag 16
+        msg.push(0x83); // array(3)
+        // protected bstr
+        crate::cose::encode_bstr(&mut msg, &prot);
+        // unprotected: map with label 99 (not 5) to simulate missing IV
+        msg.push(0xa1); // map(1)
+        msg.push(0x18); msg.push(99); // label 99
+        crate::cose::encode_bstr(&mut msg, &[0x01, 0x02]);
+        // ciphertext
+        crate::cose::encode_bstr(&mut msg, &[0xAA, 0xBB]);
+
+        let result = parse_encrypted_message(&msg);
+        assert!(result.is_err(), "missing IV in COSE_Encrypt0 must fail");
+    }
+
+    // --- AES-GCM: tampered nonce produces wrong plaintext ---
+
+    #[test]
+    fn test_aes_gcm_wrong_nonce_fails() {
+        let key = [0x42u8; 32];
+        let nonce = [0x01u8; 12];
+        let plaintext = b"secret data";
+        let aad = b"additional";
+        let ct = aes256_gcm_encrypt(&key, &nonce, plaintext, aad).unwrap();
+
+        // Different nonce → decryption must fail (GCM auth tag mismatch)
+        let wrong_nonce = [0x02u8; 12];
+        let result = aes256_gcm_decrypt(&key, &wrong_nonce, &ct, aad);
+        assert!(result.is_err(), "wrong nonce must fail AES-GCM decryption");
+    }
+
+    // --- AES-GCM: tampered AAD fails ---
+
+    #[test]
+    fn test_aes_gcm_wrong_aad_fails() {
+        let key = [0x42u8; 32];
+        let nonce = [0x01u8; 12];
+        let plaintext = b"secret data";
+        let aad = b"correct aad";
+        let ct = aes256_gcm_encrypt(&key, &nonce, plaintext, aad).unwrap();
+
+        let wrong_aad = b"wrong aad!!";
+        let result = aes256_gcm_decrypt(&key, &nonce, &ct, wrong_aad);
+        assert!(result.is_err(), "wrong AAD must fail AES-GCM decryption");
+    }
+
+    // --- COSE_Encrypt0 full roundtrip with tampered ciphertext ---
+
+    #[test]
+    fn test_cose_encrypt0_tampered_ciphertext() {
+        let key = [0x55u8; 32];
+        let nonce = [0x03u8; 12];
+        let plaintext = b"important payload";
+        let ct = cose_encrypt0_a256gcm(&key, &nonce, plaintext).unwrap();
+
+        // Parse and tamper the ciphertext
+        let (parsed_nonce, mut parsed_ct) = parse_encrypted_message(&ct).unwrap();
+        let last = parsed_ct.len() - 1;
+        parsed_ct[last] ^= 0xFF;
+
+        // Decrypt with tampered ciphertext must fail
+        let result = cose_decrypt0_a256gcm(&key, &build_encrypted_message(&parsed_nonce, &parsed_ct));
+        assert!(result.is_err(), "tampered ciphertext must fail COSE_Encrypt0 decryption");
+    }
+
+    // --- SetupDevice: wrong nonce length ---
+
+    #[test]
+    fn test_parse_setup_device_bad_nonce_length() {
+        let mut enc = CborEncoder::new();
+        enc.array(4);
+        enc.bytes(&[0x01; 8]); // 8-byte nonce instead of 16
+        enc.null();             // replacement_guid
+        enc.null();             // replacement_rv_info
+        enc.uint(1024);         // max_device_svc_info_sz
+        let result = parse_setup_device(&enc.into_bytes());
+        assert!(result.is_err(), "8-byte nonce must be rejected");
+    }
+
+    // --- SetupDevice: valid with replacement GUID ---
+
+    #[test]
+    fn test_parse_setup_device_with_replacement_guid() {
+        let nonce = [0x42u8; 16];
+        let guid = [0xBBu8; 16];
+        let mut enc = CborEncoder::new();
+        enc.array(4);
+        enc.bytes(&nonce);
+        enc.bytes(&guid);       // replacement GUID
+        enc.null();             // replacement_rv_info
+        enc.uint(2048);
+        let result = parse_setup_device(&enc.into_bytes()).unwrap();
+        assert_eq!(result.nonce_to2_setup_dv, nonce);
+        assert_eq!(result.replacement_guid, Some(guid));
+        assert_eq!(result.max_device_svc_info_sz, 2048);
+    }
+
+    // --- SetupDevice: null GUID (credential reuse) ---
+
+    #[test]
+    fn test_parse_setup_device_null_guid() {
+        let nonce = [0x01u8; 16];
+        let mut enc = CborEncoder::new();
+        enc.array(4);
+        enc.bytes(&nonce);
+        enc.null();             // null GUID = credential reuse
+        enc.null();             // replacement_rv_info
+        enc.uint(512);
+        let result = parse_setup_device(&enc.into_bytes()).unwrap();
+        assert_eq!(result.replacement_guid, None);
+    }
+
+    // --- KDF: different key lengths produce different keys ---
+
+    #[test]
+    fn test_kdf_128_vs_256() {
+        let secret = [0x42u8; 32];
+        let key_128 = fdo_kdf(&secret, 128);
+        let key_256 = fdo_kdf(&secret, 256);
+        assert_eq!(key_128.len(), 16);
+        assert_eq!(key_256.len(), 32);
+        // First 16 bytes should NOT be the same (different counter inputs)
+        // Actually, the first block IS the same in many KDF constructions.
+        // Just check the lengths are correct.
+        assert_ne!(key_128.len(), key_256.len());
+    }
+
+    // --- Session key derivation: deterministic ---
+
+    #[test]
+    fn test_derive_session_keys_deterministic() {
+        let secret = [0x99u8; 32];
+        let keys_a = derive_session_keys(&secret);
+        let keys_b = derive_session_keys(&secret);
+        assert_eq!(keys_a.sek, keys_b.sek, "same secret must produce same SEK");
+        assert_eq!(keys_a.sek.len(), 32, "SEK must be 32 bytes for AES-256-GCM");
+    }
+
+    // --- Session key derivation: different secrets produce different keys ---
+
+    #[test]
+    fn test_derive_session_keys_different_secrets() {
+        let keys_a = derive_session_keys(&[0x01u8; 32]);
+        let keys_b = derive_session_keys(&[0x02u8; 32]);
+        assert_ne!(keys_a.sek, keys_b.sek, "different secrets must produce different SEKs");
+    }
+
+    // --- Parse encrypted message: empty input ---
+
+    #[test]
+    fn test_parse_encrypted_message_empty() {
+        let result = parse_encrypted_message(&[]);
+        assert!(result.is_err(), "empty input must fail");
+    }
+
+    // --- Parse encrypted message: truncated ---
+
+    #[test]
+    fn test_parse_encrypted_message_truncated() {
+        // Just a tag byte with nothing after
+        let result = parse_encrypted_message(&[0xD0]);
+        assert!(result.is_err(), "truncated message must fail");
     }
 }

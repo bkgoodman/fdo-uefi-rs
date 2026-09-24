@@ -376,6 +376,66 @@ fn unwrap_bmo_signed(data: &[u8], owner_key_point: Option<&[u8]>, expected_ct: &
     }
 }
 
+/// Result of BMO authorization check.
+#[derive(Debug, PartialEq)]
+pub enum BmoAuthResult {
+    /// Signed payload verified — inner bytes returned by caller from unwrap_bmo_signed
+    SignedOk,
+    /// Signed payload failed verification
+    SignedFailed,
+    /// Unsigned accepted via Model 1 (Owner-direct channel authority)
+    UnsignedModel1,
+    /// Unsigned accepted via Model 2 (delegate channel authority with PERM.7)
+    UnsignedModel2,
+    /// Unsigned accepted — legacy/test mode (no Owner key)
+    UnsignedLegacy,
+}
+
+/// Check whether a BMO provisioning payload should be accepted.
+///
+/// This is the pure authorization logic extracted from `process_bmo_message`.
+/// It handles the full security model matrix:
+///
+/// - **Model 1:** Owner-direct channel authority. Owner proved identity via TO2.
+///   Unsigned payloads accepted when `owner_key_point` is `Some` and
+///   `delegate_has_provision` is false.
+/// - **Model 2:** Delegate channel authority. Delegate with PERM.7.
+///   Unsigned payloads accepted when `delegate_has_provision` is true.
+/// - **Model 3:** Owner artifact authority. Payload is COSE_Sign1 (tag 18)
+///   signed by Owner key.
+/// - **Model 4:** Delegate artifact authority. Payload is COSE_Sign1 with
+///   x5chain, verified against delegate chain rooted in Owner key.
+/// - **Legacy/test:** No Owner key available. Unsigned payloads accepted.
+pub fn check_bmo_authorization(
+    data: &[u8],
+    owner_key_point: Option<&[u8]>,
+    delegate_has_provision: bool,
+    expected_ct: &str,
+    device_guid: Option<&[u8]>,
+) -> (BmoAuthResult, Option<Vec<u8>>) {
+    if is_cbor_tag18(data) {
+        // Signed envelope — try to verify
+        let inner = unwrap_bmo_signed(data, owner_key_point, expected_ct, device_guid);
+        if inner.is_some() {
+            (BmoAuthResult::SignedOk, inner)
+        } else {
+            (BmoAuthResult::SignedFailed, None)
+        }
+    } else {
+        // Unsigned — check channel authority
+        if owner_key_point.is_some() && !delegate_has_provision {
+            info!("BMO: accepting unsigned image-begin via Owner channel authority (Model 1)");
+            (BmoAuthResult::UnsignedModel1, None)
+        } else if delegate_has_provision {
+            info!("BMO: accepting unsigned image-begin via delegate channel authority (Model 2)");
+            (BmoAuthResult::UnsignedModel2, None)
+        } else {
+            debug!("BMO: image-begin is unsigned (no Owner key — legacy/test mode)");
+            (BmoAuthResult::UnsignedLegacy, None)
+        }
+    }
+}
+
 /// Process BMO ServiceInfo message from owner.
 ///
 /// `owner_key_point` is the TO2-proven Owner public key (P-256, 65 bytes).
@@ -387,6 +447,7 @@ fn unwrap_bmo_signed(data: &[u8], owner_key_point: Option<&[u8]>, expected_ct: &
 /// delegate with OIDPermitProvision (PERM.7). In that case, unsigned
 /// provisioning messages are acceptable via channel authority (Model 2).
 ///
+#[cfg(target_os = "uefi")]
 /// Returns optional response ServiceInfo to send back.
 pub fn process_bmo_message(
     session: &mut BmoSession,
@@ -704,6 +765,7 @@ pub fn process_bmo_message(
 /// Process BMO URL delivery mode (delivery_mode = 1)
 /// Fetches the image from the provided URL and stores it in the session buffer.
 /// Returns Ok(()) on success, or Err(error_code) on failure.
+#[cfg(target_os = "uefi")]
 fn process_bmo_url_delivery(session: &mut BmoSession, begin: &mut BmoImageBegin) -> Result<(), u8> {
     let url = match &begin.url {
         Some(u) => u,
@@ -815,6 +877,7 @@ fn parse_image_end_hash(data: &[u8]) -> Option<Vec<u8>> {
 
 /// Test BMO state machine with mock data
 /// This can be called to verify BMO handling without a real server
+#[cfg(target_os = "uefi")]
 pub fn test_bmo_handling() {
     debug!("=== BMO Test: Starting mock BMO message test ===");
     
@@ -863,4 +926,459 @@ pub fn test_bmo_handling() {
     debug!("  Image buffer size: {} bytes", session.image_buffer.len());
     
     debug!("=== BMO Test: Complete ===");
+}
+
+// =========================================================================
+// Unit tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_service_info_kv ---
+
+    #[test]
+    fn test_parse_service_info_kv() {
+        let data = build_service_info_kv("fdo.bmo:image-begin", &[0xa0]); // key + empty map
+        let (key, value) = parse_service_info_kv(&data).expect("should parse");
+        assert_eq!(key, "fdo.bmo:image-begin");
+        assert_eq!(value, &[0xa0]);
+    }
+
+    #[test]
+    fn test_parse_service_info_kv_roundtrip() {
+        let payload = vec![0x01, 0x02, 0x03, 0x04];
+        let data = build_service_info_kv("test:key", &payload);
+        let (key, value) = parse_service_info_kv(&data).unwrap();
+        assert_eq!(key, "test:key");
+        assert_eq!(value, payload);
+    }
+
+    // --- parse_bmo_image_begin ---
+
+    fn build_image_begin_cbor(total_size: u64, image_type: &str, delivery_mode: u8) -> Vec<u8> {
+        let mut enc = CborEncoder::new();
+        enc.encode_map(3);
+        // key 0 = total_size
+        enc.uint(CHUNK_FIELD_TOTAL_SIZE as u16);
+        enc.uint(total_size as u16);
+        // key -1 = image_type
+        enc.neg_int(BMO_FIELD_IMAGE_TYPE as i8);
+        enc.text(image_type);
+        // key -6 = delivery_mode
+        enc.neg_int(BMO_FIELD_DELIVERY_MODE as i8);
+        enc.uint(delivery_mode as u16);
+        enc.into_bytes()
+    }
+
+    #[test]
+    fn test_parse_image_begin_basic() {
+        let data = build_image_begin_cbor(1024, "application/x-uefi-image", BMO_DELIVERY_INLINE);
+        let begin = parse_bmo_image_begin(&data).expect("should parse");
+        assert_eq!(begin.total_size, 1024);
+        assert_eq!(begin.image_type.as_deref(), Some("application/x-uefi-image"));
+        assert_eq!(begin.delivery_mode, BMO_DELIVERY_INLINE);
+    }
+
+    #[test]
+    fn test_parse_image_begin_with_all_fields() {
+        let mut enc = CborEncoder::new();
+        enc.encode_map(8);
+        // total_size
+        enc.uint(0); enc.uint(2048);
+        // hash_alg
+        enc.uint(1); enc.text("SHA-256");
+        // require_ack
+        enc.uint(3); enc.bool_val(true);
+        // est_duration
+        enc.uint(4); enc.uint(300);
+        // image_type
+        enc.neg_int(-1); enc.text("application/efi");
+        // boot_args
+        enc.neg_int(-2); enc.text("console=ttyS0");
+        // name
+        enc.neg_int(-3); enc.text("test-image");
+        // delivery_mode
+        enc.neg_int(-6); enc.uint(0);
+        let data = enc.into_bytes();
+
+        let begin = parse_bmo_image_begin(&data).unwrap();
+        assert_eq!(begin.total_size, 2048);
+        assert_eq!(begin.hash_alg.as_deref(), Some("SHA-256"));
+        assert!(begin.require_ack);
+        assert_eq!(begin.estimated_duration, 300);
+        assert_eq!(begin.image_type.as_deref(), Some("application/efi"));
+        assert_eq!(begin.boot_args.as_deref(), Some("console=ttyS0"));
+        assert_eq!(begin.name.as_deref(), Some("test-image"));
+        assert_eq!(begin.delivery_mode, 0);
+    }
+
+    #[test]
+    fn test_parse_image_begin_url_delivery() {
+        let mut enc = CborEncoder::new();
+        enc.encode_map(3);
+        enc.uint(0); enc.uint(0); // total_size unknown
+        enc.neg_int(-1); enc.text("application/x-uefi-image");
+        enc.neg_int(-6); enc.uint(BMO_DELIVERY_URL as u16);
+        let data = enc.into_bytes();
+
+        let begin = parse_bmo_image_begin(&data).unwrap();
+        assert_eq!(begin.delivery_mode, BMO_DELIVERY_URL);
+    }
+
+    #[test]
+    fn test_parse_image_begin_empty_map() {
+        let data = [0xa0]; // empty map
+        let begin = parse_bmo_image_begin(&data).unwrap();
+        assert_eq!(begin.total_size, 0);
+        assert!(begin.image_type.is_none());
+    }
+
+    // --- build_bmo_image_result ---
+
+    #[test]
+    fn test_build_image_result_success() {
+        let result = build_bmo_image_result(BMO_STATUS_SUCCESS, None);
+        let mut dec = CborDecoder::new(&result);
+        assert_eq!(dec.read_array_header().unwrap(), 1);
+        assert_eq!(dec.read_uint().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_build_image_result_error_with_message() {
+        let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("bad image"));
+        let mut dec = CborDecoder::new(&result);
+        assert_eq!(dec.read_array_header().unwrap(), 2);
+        assert_eq!(dec.read_uint().unwrap(), BMO_STATUS_ERROR as u64);
+        assert_eq!(dec.read_text().unwrap(), "bad image");
+    }
+
+    // --- build_bmo_image_ack ---
+
+    #[test]
+    fn test_build_image_ack_accepted() {
+        let ack = build_bmo_image_ack(true, None, None);
+        let mut dec = CborDecoder::new(&ack);
+        assert_eq!(dec.read_array_header().unwrap(), 1);
+        assert_eq!(dec.read_bool().unwrap(), true);
+    }
+
+    #[test]
+    fn test_build_image_ack_rejected_with_reason() {
+        let ack = build_bmo_image_ack(false, Some(3), Some("size exceeded"));
+        let mut dec = CborDecoder::new(&ack);
+        assert_eq!(dec.read_array_header().unwrap(), 3);
+        assert_eq!(dec.read_bool().unwrap(), false);
+        assert_eq!(dec.read_uint().unwrap(), 3);
+        assert_eq!(dec.read_text().unwrap(), "size exceeded");
+    }
+
+    // --- build_bmo_set_response ---
+
+    #[test]
+    fn test_build_set_response() {
+        let resp = build_bmo_set_response(BMO_STATUS_SUCCESS, None);
+        let mut dec = CborDecoder::new(&resp);
+        assert_eq!(dec.read_array_header().unwrap(), 1);
+        assert_eq!(dec.read_uint().unwrap(), 0);
+    }
+
+    // --- is_cbor_tag18 ---
+
+    #[test]
+    fn test_is_cbor_tag18() {
+        assert!(is_cbor_tag18(&[0xD2, 0x84])); // tag(18) array(4)
+        assert!(!is_cbor_tag18(&[0xa1]));       // map(1) — not tagged
+        assert!(!is_cbor_tag18(&[]));            // empty
+    }
+
+    // --- unwrap_bmo_signed ---
+
+    #[test]
+    fn test_unwrap_bmo_signed_valid_model3() {
+        use crate::cose::{gen_test_keypair, build_test_cose_sign1, build_test_protected_header,
+                         domain_aad, AAD_TAG_BMO_PROVISION, BMO_CONTENT_TYPE_IMAGE_BEGIN};
+
+        let (sk, point) = gen_test_keypair();
+        let protected = build_test_protected_header(Some(BMO_CONTENT_TYPE_IMAGE_BEGIN));
+        let payload = b"\xa1\x00\x0a"; // map(1) { 0: 10 }
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+        let envelope = build_test_cose_sign1(&protected, payload, &aad, &[0xa0], &sk);
+
+        let result = unwrap_bmo_signed(&envelope, Some(&point), BMO_CONTENT_TYPE_IMAGE_BEGIN, None);
+        assert!(result.is_some(), "valid signed BMO should unwrap");
+        assert_eq!(result.unwrap(), payload);
+    }
+
+    #[test]
+    fn test_unwrap_bmo_signed_no_tag18() {
+        // Bare map — not signed
+        let data = [0xa1, 0x00, 0x0a]; // map(1) { 0: 10 }
+        let result = unwrap_bmo_signed(&data, None, "x", None);
+        assert!(result.is_none(), "bare map should return None (not signed)");
+    }
+
+    #[test]
+    fn test_unwrap_bmo_signed_no_owner_key() {
+        use crate::cose::{gen_test_keypair, build_test_cose_sign1, build_test_protected_header,
+                         domain_aad, AAD_TAG_BMO_PROVISION, BMO_CONTENT_TYPE_IMAGE_BEGIN};
+
+        let (sk, _) = gen_test_keypair();
+        let protected = build_test_protected_header(Some(BMO_CONTENT_TYPE_IMAGE_BEGIN));
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+        let envelope = build_test_cose_sign1(&protected, b"\xa0", &aad, &[0xa0], &sk);
+
+        // No owner key → must reject
+        let result = unwrap_bmo_signed(&envelope, None, BMO_CONTENT_TYPE_IMAGE_BEGIN, None);
+        assert!(result.is_none(), "no owner key must reject signed BMO");
+    }
+
+    // --- BmoSession ---
+
+    #[test]
+    fn test_bmo_session_reset() {
+        let mut session = BmoSession::new();
+        session.state = BmoState::AwaitingData;
+        session.bytes_received = 1000;
+        session.chunks_received = 5;
+        session.image_buffer = vec![0u8; 100];
+        session.reset();
+
+        assert_eq!(session.state, BmoState::Idle);
+        assert_eq!(session.bytes_received, 0);
+        assert_eq!(session.chunks_received, 0);
+        assert!(session.image_buffer.is_empty());
+    }
+
+    // --- parse_bmo_set ---
+
+    #[test]
+    fn test_parse_bmo_set() {
+        // array(1) [ array(2) ["param_name", "param_value"] ]
+        let mut enc = CborEncoder::new();
+        enc.array(1);
+        enc.array(2);
+        enc.text("bios_setting");
+        enc.text("enabled");
+        let data = enc.into_bytes();
+
+        let (name, value) = parse_bmo_set(&data).expect("should parse set");
+        assert_eq!(name, "bios_setting");
+        assert_eq!(value, "enabled");
+    }
+
+    // ===== BMO authorization policy matrix (Go: bmo_provision_test.go) =====
+
+    use crate::cose::{gen_test_keypair, gen_test_keypair_b,
+        build_test_cose_sign1, build_test_protected_header, domain_aad,
+        BMO_CONTENT_TYPE_IMAGE_BEGIN, BMO_CONTENT_TYPE_SET,
+        AAD_TAG_BMO_PROVISION};
+
+    /// Build a minimal unsigned image-begin (bare CBOR map, no tag 18).
+    fn build_unsigned_image_begin() -> Vec<u8> {
+        let mut enc = CborEncoder::new();
+        enc.encode_map(2);
+        enc.uint(0); enc.uint(52);   // total_size = 52
+        enc.uint(3); enc.uint(0);    // delivery_mode = inline
+        enc.into_bytes()
+    }
+
+    /// Build a signed image-begin (COSE_Sign1 tag 18) with the given key.
+    fn build_signed_image_begin(sk: &p256::ecdsa::SigningKey) -> Vec<u8> {
+        let ct = BMO_CONTENT_TYPE_IMAGE_BEGIN;
+        let protected = build_test_protected_header(Some(ct));
+        let payload = b"\xa1\x00\x18\x34"; // map(1) { 0: 52 }
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+        build_test_cose_sign1(&protected, payload, &aad, &[0xa0], sk)
+    }
+
+    // --- Model 1: Owner-direct, unsigned ---
+
+    #[test]
+    fn test_bmo_auth_unsigned_owner_direct_model1() {
+        let (_, owner_point) = gen_test_keypair();
+        let data = build_unsigned_image_begin();
+        let (result, inner) = check_bmo_authorization(
+            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::UnsignedModel1);
+        assert!(inner.is_none(), "unsigned returns no inner payload");
+    }
+
+    // --- Model 2: Delegate with PERM.7, unsigned ---
+
+    #[test]
+    fn test_bmo_auth_unsigned_delegate_model2() {
+        let (_, owner_point) = gen_test_keypair();
+        let data = build_unsigned_image_begin();
+        let (result, _) = check_bmo_authorization(
+            &data, Some(&owner_point), true, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::UnsignedModel2);
+    }
+
+    // --- Unsigned with no owner key (legacy/test mode) ---
+
+    #[test]
+    fn test_bmo_auth_unsigned_no_owner_key() {
+        let data = build_unsigned_image_begin();
+        let (result, _) = check_bmo_authorization(
+            &data, None, false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::UnsignedLegacy);
+    }
+
+    // --- Model 3: Owner-signed, correct key ---
+
+    #[test]
+    fn test_bmo_auth_signed_owner_key_valid() {
+        let (sk, owner_point) = gen_test_keypair();
+        let data = build_signed_image_begin(&sk);
+        let (result, inner) = check_bmo_authorization(
+            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::SignedOk);
+        assert!(inner.is_some(), "signed OK must return inner payload");
+    }
+
+    // --- Model 3: Owner-signed, wrong key ---
+
+    #[test]
+    fn test_bmo_auth_signed_wrong_key() {
+        let (sk, _) = gen_test_keypair();
+        let (_, wrong_point) = gen_test_keypair_b();
+        let data = build_signed_image_begin(&sk);
+        let (result, inner) = check_bmo_authorization(
+            &data, Some(&wrong_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::SignedFailed);
+        assert!(inner.is_none());
+    }
+
+    // --- Model 3: Signed but no owner key available ---
+
+    #[test]
+    fn test_bmo_auth_signed_no_owner_key() {
+        let (sk, _) = gen_test_keypair();
+        let data = build_signed_image_begin(&sk);
+        let (result, inner) = check_bmo_authorization(
+            &data, None, false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::SignedFailed);
+        assert!(inner.is_none());
+    }
+
+    // --- Signed with wrong content-type ---
+
+    #[test]
+    fn test_bmo_auth_signed_wrong_content_type() {
+        let (sk, owner_point) = gen_test_keypair();
+        let data = build_signed_image_begin(&sk);
+        // Expect BMO_CONTENT_TYPE_SET but got IMAGE_BEGIN
+        let (result, _) = check_bmo_authorization(
+            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_SET, None,
+        );
+        assert_eq!(result, BmoAuthResult::SignedFailed);
+    }
+
+    // --- Signed with tampered payload ---
+
+    #[test]
+    fn test_bmo_auth_signed_tampered() {
+        let (sk, owner_point) = gen_test_keypair();
+        let mut data = build_signed_image_begin(&sk);
+        let last = data.len() - 1;
+        data[last] ^= 0x01; // flip last byte (signature)
+        let (result, _) = check_bmo_authorization(
+            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::SignedFailed);
+    }
+
+    // --- Model 4: Delegate-signed with x5chain ---
+
+    #[test]
+    fn test_bmo_auth_delegate_signed_model4() {
+        use crate::delegate::{build_test_cert, OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED};
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (delegate_sk, delegate_point) = gen_test_keypair_b();
+
+        // Build delegate cert signed by owner
+        let cert_der = build_test_cert(
+            &owner_sk, &delegate_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED],
+        );
+
+        // Build COSE_Sign1 with x5chain in unprotected header
+        let ct = BMO_CONTENT_TYPE_IMAGE_BEGIN;
+        let protected = build_test_protected_header(Some(ct));
+        let payload = b"\xa1\x00\x18\x34"; // map(1) { 0: 52 }
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+
+        // Build unprotected header: map(1) { 33: [cert_der] }
+        let mut unhdr = Vec::new();
+        unhdr.push(0xa1); // map(1)
+        unhdr.push(0x18); unhdr.push(33); // label 33 (x5chain)
+        // Single cert as bstr (not wrapped in array since go-fdo sends bare bstr for 1-cert)
+        crate::cose::encode_bstr(&mut unhdr, &cert_der);
+
+        let data = build_test_cose_sign1(
+            &protected, payload, &aad, &unhdr, &delegate_sk,
+        );
+
+        let (result, inner) = check_bmo_authorization(
+            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::SignedOk,
+            "delegate-signed Model 4 with x5chain must verify");
+        assert!(inner.is_some());
+    }
+
+    // --- Model 4 negative: delegate chain not rooted in owner ---
+
+    #[test]
+    fn test_bmo_auth_delegate_signed_wrong_owner() {
+        use crate::delegate::{build_test_cert, OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED};
+        let (_, owner_point) = gen_test_keypair();
+        let (attacker_sk, _) = gen_test_keypair_b();
+        // Third key for delegate leaf
+        let delegate_secret = p256::SecretKey::from_bytes(
+            &[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+              0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+              0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+              0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01].into(),
+        ).unwrap();
+        let delegate_sk = p256::ecdsa::SigningKey::from(delegate_secret.clone());
+        let delegate_point = {
+            let pk = delegate_secret.public_key();
+            p256::EncodedPoint::from(pk).as_bytes().to_vec()
+        };
+
+        // Cert signed by ATTACKER, not owner
+        let cert_der = build_test_cert(
+            &attacker_sk, &delegate_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED],
+        );
+
+        let ct = BMO_CONTENT_TYPE_IMAGE_BEGIN;
+        let protected = build_test_protected_header(Some(ct));
+        let payload = b"\xa1\x00\x18\x34";
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+
+        let mut unhdr = Vec::new();
+        unhdr.push(0xa1);
+        unhdr.push(0x18); unhdr.push(33);
+        crate::cose::encode_bstr(&mut unhdr, &cert_der);
+
+        let data = build_test_cose_sign1(
+            &protected, payload, &aad, &unhdr, &delegate_sk,
+        );
+
+        let (result, _) = check_bmo_authorization(
+            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::SignedFailed,
+            "delegate chain not rooted in owner must be rejected");
+    }
 }

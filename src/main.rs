@@ -1,51 +1,36 @@
 // Copyright 2026 Dell Technologies, All Rights Reserved
 // Author: Brad Goodman <bradley.goodman@dell.com>
 // SPDX-License-Identifier: Apache-2.0
+//
+// UEFI binary entry point. All protocol logic lives in the library crate
+// (src/lib.rs). This file is the thin UEFI shell that parses arguments,
+// checks TPM presence, and dispatches to the protocol state machines.
 
-#![no_main]
-#![no_std]
+#![cfg_attr(target_os = "uefi", no_main)]
+#![cfg_attr(target_os = "uefi", no_std)]
 
+#[cfg(target_os = "uefi")]
 extern crate alloc;
 
+#[cfg(target_os = "uefi")]
 use alloc::string::String;
+#[cfg(target_os = "uefi")]
 use alloc::vec::Vec;
+#[cfg(target_os = "uefi")]
 use core::time::Duration;
+#[cfg(target_os = "uefi")]
 use log::{debug, info, error, warn};
+#[cfg(target_os = "uefi")]
 use uefi::prelude::*;
+#[cfg(target_os = "uefi")]
 use uefi::boot;
+#[cfg(target_os = "uefi")]
 use uefi::proto::loaded_image::LoadedImage;
 
-mod tpm;
-mod http_api;
-#[cfg(feature = "uefi-http")]
-mod http;
-#[cfg(feature = "tcp4-http")]
-mod tcp4_http;
-#[cfg(feature = "fdo-installer")]
-mod fdo;
-#[cfg(feature = "fdo-installer")]
-mod bmo;
-// Shared COSE_Sign1 verification, used by TO1/TO2/voucher and (later) BMO.
-#[cfg(any(feature = "fdo-installer", feature = "rv-firmware"))]
-mod cose;
-// Ownership Voucher verification — establishes the TO2-proven Owner key.
-#[cfg(feature = "fdo-installer")]
-mod voucher;
-// Delegate certificate chain validation — FDO 2.0 delegate support.
-#[cfg(feature = "fdo-installer")]
-mod delegate;
-mod chainload;
-#[cfg(feature = "di")]
-mod di;
-#[cfg(feature = "rv-firmware")]
-mod rv_firmware;
+#[cfg(target_os = "uefi")]
+use fdo_uefi::WATCHDOG_TIMEOUT_SECS;
 
-/// Global watchdog timeout, in seconds.
-///
-/// Armed at entry and re-armed after a chainloaded image returns, so a hang
-/// anywhere in the run auto-reboots instead of requiring a lab visit.
-pub const WATCHDOG_TIMEOUT_SECS: usize = 1800; // 30 minutes (106MB UKI at 65KB MTU ~1670 rounds)
-
+#[cfg(target_os = "uefi")]
 /// Parsed command-line options
 struct FdoOptions {
     /// Override DI (manufacturing) server URL
@@ -62,13 +47,14 @@ struct FdoOptions {
     /// existing GUID has no voucher in the new server's database.
     force_di: bool,
     /// Pin the chainload LoadImage source (buffer vs ESP file)
-    load_mode: chainload::LoadMode,
+    load_mode: fdo_uefi::chainload::LoadMode,
     /// Enable the pre-StartImage network teardown (diagnostic; off by default)
     teardown: bool,
     /// Re-enable the per-round transport logging suppressed by default
     verbose: bool,
 }
 
+#[cfg(target_os = "uefi")]
 /// Well-known FDO manufacturing server DNS names (per fdo-appnote-device-mfg-info.bs)
 /// Devices try these in order when no explicit DI server URL is provided.
 const WELL_KNOWN_DI_NAMES: &[&str] = &[
@@ -76,9 +62,11 @@ const WELL_KNOWN_DI_NAMES: &[&str] = &[
     "fdo-mfg",          // Simple well-known hostname
 ];
 
+#[cfg(target_os = "uefi")]
 /// Default DI server port
 const DEFAULT_DI_PORT: u16 = 8080;
 
+#[cfg(target_os = "uefi")]
 /// Parse command-line arguments from EFI shell load options.
 /// Supports:  -di <url>   Override DI server URL
 ///            -rv <url>   Override RV/Owner server URL
@@ -90,7 +78,7 @@ fn parse_args() -> FdoOptions {
         watchdog_test: None,
         chainload_file: None,
         force_di: false,
-        load_mode: chainload::LoadMode::Buffer,
+        load_mode: fdo_uefi::chainload::LoadMode::Buffer,
         teardown: false,
         verbose: false,
     };
@@ -173,11 +161,11 @@ fn parse_args() -> FdoOptions {
             "-load-mode" => {
                 if i + 1 < tokens.len() {
                     opts.load_mode = match tokens[i + 1] {
-                        "buffer" => chainload::LoadMode::Buffer,
-                        "file" => chainload::LoadMode::File,
+                        "buffer" => fdo_uefi::chainload::LoadMode::Buffer,
+                        "file" => fdo_uefi::chainload::LoadMode::File,
                         other => {
                             error!("CLI: unknown -load-mode '{}' (use buffer|file)", other);
-                            chainload::LoadMode::Buffer
+                            fdo_uefi::chainload::LoadMode::Buffer
                         }
                     };
                     debug!("CLI: Chainload load mode = {:?}", opts.load_mode);
@@ -247,6 +235,7 @@ fn parse_args() -> FdoOptions {
     opts
 }
 
+#[cfg(target_os = "uefi")]
 /// Read a file from the ESP that this application was loaded from.
 ///
 /// Used by the `-chainload` control test so we can feed a known-good PE to
@@ -282,6 +271,7 @@ fn load_file_from_esp(path: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+#[cfg(target_os = "uefi")]
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
@@ -310,8 +300,8 @@ fn main() -> Status {
     
     // Apply the chainload source override to every chainload site (control
     // test, BMO, and RV firmware) so a single flag pins the behaviour.
-    chainload::set_load_mode(opts.load_mode);
-    chainload::set_teardown(opts.teardown);
+    fdo_uefi::chainload::set_load_mode(opts.load_mode);
+    fdo_uefi::chainload::set_teardown(opts.teardown);
     
     if opts.verbose {
         log::set_max_level(log::LevelFilter::Trace);
@@ -346,7 +336,7 @@ fn main() -> Status {
         match load_file_from_esp(path) {
             Some(data) => {
                 info!("Read {} bytes from {}", data.len(), path);
-                match chainload::chainload_image(&data) {
+                match fdo_uefi::chainload::chainload_image(&data) {
                     Ok(()) => info!("Control test: chainload returned successfully"),
                     Err(e) => error!("Control test: chainload FAILED: {:?}", e.status()),
                 }
@@ -359,7 +349,7 @@ fn main() -> Status {
     }
     
     // Check for TPM presence first
-    if !tpm::tpm_is_present() {
+    if !fdo_uefi::tpm::tpm_is_present() {
         error!("No TPM found! TCG2 protocol not available in this UEFI environment.");
         error!("Please enable TPM in BIOS (e.g. Intel PTT under System Security).");
         info!("");
@@ -385,17 +375,17 @@ fn main() -> Status {
         info!("Skipping RV firmware check (-force-di: re-provisioning first)");
     } else {
         info!("Checking for RV-based firmware update...");
-        match rv_firmware::check_and_deliver() {
-            rv_firmware::DeliveryResult::Chainloaded => {
+        match fdo_uefi::rv_firmware::check_and_deliver() {
+            fdo_uefi::rv_firmware::DeliveryResult::Chainloaded => {
                 info!("Firmware image was chainloaded and returned.");
                 info!("FDO UEFI Client exiting.");
                 boot::stall(Duration::from_secs(2));
                 return Status::SUCCESS;
             }
-            rv_firmware::DeliveryResult::NoUpdate => {
+            fdo_uefi::rv_firmware::DeliveryResult::NoUpdate => {
                 info!("No firmware update available, continuing to onboarding...");
             }
-            rv_firmware::DeliveryResult::Error => {
+            fdo_uefi::rv_firmware::DeliveryResult::Error => {
                 info!("Firmware delivery error, continuing to onboarding...");
             }
         }
@@ -414,7 +404,7 @@ fn main() -> Status {
             info!("Force DI requested — ignoring any existing TPM credentials");
             None
         } else {
-            tpm::read_fdo_credentials()
+            fdo_uefi::tpm::read_fdo_credentials()
         };
 
         match existing {
@@ -438,7 +428,7 @@ fn main() -> Status {
                     info!("No credentials found in TPM.");
                     info!("Attempting Device Initialization (DI)...");
                     
-                    match di::run_di_protocol(opts.di_url.as_deref()) {
+                    match fdo_uefi::di::run_di_protocol(opts.di_url.as_deref()) {
                         Status::SUCCESS => {
                             info!("Device Initialization completed successfully.");
                             info!("Reboot required to proceed with onboarding.");
@@ -472,17 +462,17 @@ fn main() -> Status {
     Status::SUCCESS
 }
 
-#[cfg(feature = "fdo-installer")]
+#[cfg(all(target_os = "uefi", feature = "fdo-installer"))]
 /// Run TO1/TO2 onboarding protocols.
 /// Per securing-fdo-in-tpm.bs spec, the device key handle is read from
 /// DCTPM.DeviceKeyHandle — never hardcoded.
-fn run_onboarding(creds: &tpm::FdoCredentials, opts: &FdoOptions) {
+fn run_onboarding(creds: &fdo_uefi::tpm::FdoCredentials, opts: &FdoOptions) {
     // RV URL priority: 1) CLI -rv flag, 2) parsed from TPM credential, 3) error
     let owner_url = if let Some(ref url) = opts.rv_url {
         debug!("Using CLI-provided RV/Owner URL");
         url.clone()
     } else {
-        match tpm::read_fdo_rv_info() {
+        match fdo_uefi::tpm::read_fdo_rv_info() {
             Some(url) => {
                 debug!("Using RV URL from device credential");
                 url
@@ -502,7 +492,7 @@ fn run_onboarding(creds: &tpm::FdoCredentials, opts: &FdoOptions) {
     // so it is verified inside TO2 rather than here.
     info!("");
     info!("--- TO1 Protocol ---");
-    let to1d = match fdo::perform_to1(&owner_url, &creds.guid, creds.device_key_handle) {
+    let to1d = match fdo_uefi::fdo::perform_to1(&owner_url, &creds.guid, creds.device_key_handle) {
         Ok(redirect) => {
             info!("TO1 complete: to1d blob {} bytes (verified in TO2)", redirect.to1d_cose.len());
             Some(redirect.to1d_cose)
@@ -516,11 +506,18 @@ fn run_onboarding(creds: &tpm::FdoCredentials, opts: &FdoOptions) {
     // Run TO2 protocol (pass device_key_handle from DCTPM per spec)
     info!("");
     info!("--- TO2 Protocol ---");
-    fdo::test_to2_protocol(
+    fdo_uefi::fdo::test_to2_protocol(
         &owner_url,
         &creds.guid,
         creds.device_key_handle,
         creds.hmac_key_handle,
         to1d.as_deref(),
     );
+}
+
+// On non-UEFI targets, provide a dummy main so `cargo test` can compile
+// the binary crate without errors.
+#[cfg(not(target_os = "uefi"))]
+fn main() {
+    eprintln!("This binary targets UEFI. Use `cargo test --lib` for native tests.");
 }

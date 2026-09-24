@@ -3,9 +3,16 @@
 # Build and test UEFI application using Rust + uefi-rs
 #
 
+# UEFI build flags (build-std is needed for no_std UEFI target)
+UEFI_TARGET = x86_64-unknown-uefi
+UEFI_FLAGS = --target $(UEFI_TARGET) -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
+
+# Native test flags (no build-std — use pre-built std)
+TEST_TARGET = x86_64-unknown-linux-gnu
+
 # Output binary
-TARGET = target/x86_64-unknown-uefi/debug/fdo-uefi.efi
-TARGET_RELEASE = target/x86_64-unknown-uefi/release/fdo-uefi.efi
+TARGET = target/$(UEFI_TARGET)/debug/fdo-uefi.efi
+TARGET_RELEASE = target/$(UEFI_TARGET)/release/fdo-uefi.efi
 
 # QEMU settings (Ubuntu 25.04+ uses 4M variant)
 OVMF_CODE = /usr/share/OVMF/OVMF_CODE_4M.fd
@@ -23,15 +30,25 @@ BUILDDIR = build
 .PHONY: all
 all: build
 
-# Build debug
+# Build debug (UEFI target)
 .PHONY: build
 build:
-	cargo +nightly build
+	cargo +nightly build $(UEFI_FLAGS)
 
-# Build release
+# Build release (UEFI target)
 .PHONY: release
 release:
-	cargo +nightly build --release
+	cargo +nightly build --release $(UEFI_FLAGS)
+
+# Build release with specific features (UEFI target)
+.PHONY: release-installer
+release-installer:
+	cargo +nightly build --release --features fdo-installer $(UEFI_FLAGS)
+
+# Native unit tests (no UEFI, no QEMU, no TPM)
+.PHONY: test
+test:
+	cargo +nightly test --lib --target $(TEST_TARGET)
 
 # Create FAT disk image for QEMU
 $(BUILDDIR)/efi-disk.img: $(TARGET)

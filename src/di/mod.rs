@@ -10,4 +10,5 @@
 pub mod mfginfo;
 pub mod protocol;
 
+#[cfg(target_os = "uefi")]
 pub use protocol::run_di_protocol;

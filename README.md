@@ -475,7 +475,22 @@ Boot
 
 ## Testing
 
-### Test Architecture
+### Native Unit Tests (157 tests)
+
+```bash
+make test    # Runs on native Linux — no UEFI, no QEMU, no swtpm (~0.15s)
+```
+
+The crate is structured as lib + bin so pure-logic modules compile on native
+Linux. All UEFI-dependent code is gated with `#[cfg(target_os = "uefi")]`.
+Tests cover COSE signature verification, delegate chain validation (permission
+inheritance, self-signed rejection), voucher chain verification (multi-entry,
+reordering attacks, cross-device injection), BMO authorization (all 4 security
+models), AES-GCM transport tampering, and protocol message parsing edge cases.
+
+See `TODO_TEST.md` for the full test plan, coverage table, and remaining items.
+
+### Integration Test Architecture
 
 Tests are **evidence-based**: each test checks for specific observable artifacts
 (log messages, server responses, TPM NV writes) rather than just exit codes.

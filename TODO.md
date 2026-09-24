@@ -4,6 +4,32 @@
 
 # TODO - FDO UEFI Client
 
+## Native Unit Tests (2026-09-24)
+
+The crate is split into `src/lib.rs` (all modules) and `src/main.rs` (UEFI entry point).
+UEFI dependencies (`uefi`, `uefi-raw`) are target-conditional, and UEFI-specific code
+is gated with `#[cfg(target_os = "uefi")]`. This lets `make test` / `cargo test` run
+on native Linux with no QEMU or swtpm.
+
+**157 tests** across 6 modules, ~0.15s:
+
+| Module | Tests | Key coverage |
+|--------|-------|-------------|
+| `cose.rs` | 49 | COSE_Sign1 parse/verify, ES256 +/-, domain AAD (v101 vs v200, cross-tag), scope (GUID/combined/fail-closed/empty), BMO signed verify (Model 3/4, no content_type, delegate missing PERM.7), malformed inputs |
+| `delegate.rs` | 19 | 1/2/3-cert chains, permission inheritance (intermediate/root missing), self-signed rejected, all 5 OID flags, redirect-only/onboard-only, reuse-cred vs new-cred |
+| `fdo.rs` | 41 | CBOR encoder/decoder, AES-GCM (wrong key/nonce/AAD/tampered), KDF (128 vs 256), COSE_Encrypt0 (tampered), encrypted message parsing (wrong tag/no tag/missing IV/empty/truncated), SetupDevice parsing, session key derivation |
+| `bmo.rs` | 27 | Full Model 1-4 authorization matrix, delegate-signed x5chain (positive + wrong-owner negative), image-begin parse, result/ack/set builders |
+| `voucher.rs` | 20 | OVHeader/PublicKey parse, HMAC (RFC 4231), 0/1/2-entry chains, entry swap/reorder, cross-device injection, wrong domain AAD (v2.0), chain break at entry 1, GUID mismatch |
+| `di/mfginfo.rs` | 1 | DeviceMfgInfo encoding |
+
+See `TODO_TEST.md` for the full test plan and remaining items.
+
+To add more tests: `#[cfg(test)] mod tests { ... }` at the bottom of the module.
+Test helpers in `cose.rs` (`gen_test_keypair`, `build_test_cose_sign1`),
+`delegate.rs` (`build_test_cert`), and `voucher.rs` (`build_test_ov_header`,
+`build_ov_entry_payload`, `hmac_sha256`) generate P-256 keys, X.509 certs,
+and voucher structures for testing.
+
 ## Current Status
 
 ### Completed
@@ -88,6 +114,7 @@ to the ECDH x-coordinate result before passing to KDF.
 - [ ] URL delivery mode (mode 1) - device fetches image from URL
 - [ ] Meta-URL delivery mode with COSE signature verification (mode 2)
 - [ ] dd image mode - write raw disk image to storage device instead of executing EFI app
+- [ ] dd image mode - Delay write of INITIAL blocks until rest of image is complete (to ihibit boot of incomplete images)
 - [ ] BIOS parameter setting (fdo.bmo:set) - enroll/change BIOS config (e.g. enable Secure Boot, EFI DB keys)
 - [ ] **Secure Boot + BMO** - allow unsigned BMO payloads to execute when Secure Boot is on (owner-signed via FDO = sufficient trust)
 - [x] **109MB UKI inline transfer** - Ubuntu UKI (kernel+initrd) delivered in ~1,670 rounds, SHA256 verified, chainloaded into Linux 7.0.0-14 (2026-09-03)
@@ -232,6 +259,10 @@ tampering and not by having a proxy in the path.
 
 ### Remaining
 
+- [ ] **TPM transient handle cleanup on network error** — if a network error occurs
+  mid-protocol, transient TPM handles may leak. Needs a cleanup/flush path.
+- [ ] **DI wait-and-retry** — if DI fails (e.g. server not ready), retry a few times
+  before giving up. Possibly a compile-time option. Preferable to manual reboot.
 - [ ] Delegate support (X.509) — see the BMO section below; currently refused loudly.
 - [ ] SHA-384 / P-384 vouchers are refused, not supported.
 - [ ] Re-run the full BMO path (`start4.sh`) — the verified runs above deliberately
@@ -813,7 +844,7 @@ first; the new firmware config takes effect on the next boot.
 
 ## Build Size Analysis — all 8 feature combinations
 
-### Current (2026-09-23)
+### Current (2026-09-24)
 
 Since the 2026-09-01 baseline, the `fdo-installer` feature gained:
 - Delegation support (x5chain X.509 chain validation in `delegate.rs`)
@@ -821,30 +852,36 @@ Since the 2026-09-01 baseline, the `fdo-installer` feature gained:
 - `fdo.bmo.scope` evaluation (guid, not_before, not_after, generation)
 - Signed `fdo.bmo:set` handling with BIOS parameter parsing
 
+Crate restructured into lib + bin (2026-09-24): `src/lib.rs` exports all
+modules, `src/main.rs` is a thin UEFI entry point. UEFI deps are
+target-conditional. `make test` runs 157 native unit tests on Linux
+(no UEFI, no QEMU). All test code is `#[cfg(test)]` — zero impact on
+UEFI binary size.
+
 Release builds, `x86_64-unknown-uefi`, all with `uefi-http,tcp4-http`:
 
 | `di` | `fdo-installer` | `rv-firmware` | Size | over base | Δ from Sep-01 |
 |:----:|:---------------:|:-------------:|---------:|----------:|-------------:|
 | | | | 51 KiB | base | +0 |
-| ✓ | | | 168 KiB | +117 KiB | +6 KiB |
-| | | ✓ | 168 KiB | +117 KiB | −10 KiB |
-| | ✓ | | 328 KiB | +277 KiB | +102 KiB |
-| ✓ | | ✓ | 328 KiB | +277 KiB | +89.5 KiB |
+| ✓ | | | 167 KiB | +116 KiB | +5 KiB |
+| | | ✓ | 167 KiB | +116 KiB | −11 KiB |
+| | ✓ | | 330 KiB | +279 KiB | +104 KiB |
+| ✓ | | ✓ | 330 KiB | +279 KiB | +91.5 KiB |
 | ✓ | ✓ | | 368 KiB | +317 KiB | +104 KiB |
-| | ✓ | ✓ | 375.5 KiB | +324.5 KiB | +69.5 KiB |
-| ✓ | ✓ | ✓ | 409 KiB | +358 KiB | +69 KiB |
+| | ✓ | ✓ | 376 KiB | +325 KiB | +70 KiB |
+| ✓ | ✓ | ✓ | 410 KiB | +359 KiB | +70 KiB |
 
 Marginal cost, alone vs added to a build that already has the other two:
 
 | Feature | alone | incremental |
 |---------|---------:|-----------:|
-| `di` | +117 KiB | +33.5 KiB |
-| `fdo-installer` | +277 KiB | +81 KiB |
-| `rv-firmware` | +117 KiB | +41 KiB |
+| `di` | +116 KiB | +34 KiB |
+| `fdo-installer` | +279 KiB | +80 KiB |
+| `rv-firmware` | +116 KiB | +42 KiB |
 
 ### Where the growth went
 
-The `fdo-installer` feature grew **+102 KiB** (from 226→328 KiB). This is the
+The `fdo-installer` feature grew **+104 KiB** (from 226→330 KiB). This is the
 cost of the new security features:
 - **Delegation** (`delegate.rs`): X.509 chain validation, ASN.1 DER parsing,
   OID matching, signature verification for x5chain — replaces the need for an
@@ -854,6 +891,8 @@ cost of the new security features:
   verification against Owner or delegate keys.
 - **Signed BMO handlers** (`bmo.rs`): unwrap_bmo_signed for image-begin and set,
   BIOS parameter CBOR parsing, set-response builder.
+- **BMO authorization** (`bmo.rs`): `check_bmo_authorization()` extracted for
+  testability, `hmac_sha256()` software HMAC (+2 KiB).
 
 The non-`fdo-installer` features (`di`, `rv-firmware`, base) barely changed
 because the new code is gated behind `fdo-installer`.
@@ -884,9 +923,11 @@ because the new code is gated behind `fdo-installer`.
 ### Stripped sizes: still identical (verified, 2026-09-23)
 
 `RUSTFLAGS="-C strip=symbols"` produces byte-identical output:
+
 ```
 di,fdo-installer,rv-firmware  409 KiB   -> 409 KiB
 ```
+
 Same reasons as before: UEFI target puts debug info in `.pdb` (not in `.efi`),
 and `[profile.release]` already has `lto = true`, `opt-level = "z"`.
 

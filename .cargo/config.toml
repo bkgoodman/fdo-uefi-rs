@@ -1,9 +1,9 @@
-[build]
-target = "x86_64-unknown-uefi"
+# UEFI builds: cargo build --target x86_64-unknown-uefi -Z build-std=...
+# Native tests: cargo test --target x86_64-unknown-linux-gnu
+#
+# build-std and build.target are NOT set here — they are passed as flags
+# by the Makefile. This allows `cargo test` to work on native without
+# the duplicate lang-item conflicts that build-std causes.
 
 [target.x86_64-unknown-uefi]
 runner = "cargo run --package uefi-run --"
-
-[unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
-build-std-features = ["compiler-builtins-mem"]

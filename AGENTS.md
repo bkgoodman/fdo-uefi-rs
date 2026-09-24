@@ -39,11 +39,54 @@ went unnoticed through multiple "FULLY TESTED" sign-offs.
 
 About commands such as `apt` and others which require user-interaction as they may hang agent work.
 
+## Native Unit Tests (157 tests)
+
+```bash
+make test          # Runs cargo test on native Linux (no UEFI, no QEMU, ~0.15s)
+```
+
+The crate is structured as lib + bin: `src/lib.rs` exports all modules,
+`src/main.rs` is the UEFI entry point. UEFI deps (`uefi`, `uefi-raw`) are
+target-conditional. `#[cfg(target_os = "uefi")]` gates all UEFI-dependent
+code so it compiles out on native Linux.
+
+Tests cover:
+- **COSE** (49): Sign1 parse/verify, ES256 +/-, domain AAD (v101 vs v200,
+  cross-tag), scope (GUID/combined/fail-closed), BMO signed verify, delegate
+  PERM.7 check, malformed inputs
+- **Delegate** (19): 1/2/3-cert chains, permission inheritance, self-signed
+  rejection, all 5 OID flags
+- **FDO** (41): CBOR encoder/decoder, AES-GCM (wrong key/nonce/AAD/tampered),
+  KDF, COSE_Encrypt0, encrypted message parsing, SetupDevice parsing, session
+  key derivation
+- **BMO** (27): Image-begin parse, result/ack/set builders, full Model 1-4
+  authorization matrix, delegate-signed x5chain
+- **Voucher** (20): OVHeader/PublicKey parse, HMAC (RFC 4231), 0/1/2-entry
+  chains, entry swap/reorder, cross-device entry injection, wrong domain AAD,
+  chain break at arbitrary index
+- **DI** (1): DeviceMfgInfo encoding
+
+See `TODO_TEST.md` for the full test plan and remaining items.
+
+### Adding tests
+
+Put `#[cfg(test)] mod tests { ... }` at the bottom of the module.
+
+Test helpers (all `#[cfg(test)]`):
+- `cose.rs`: `gen_test_keypair()`, `gen_test_keypair_b()`,
+  `build_test_cose_sign1()`, `build_test_protected_header()`, `domain_aad()`,
+  `encode_bstr()`, `encode_tstr()`
+- `delegate.rs`: `build_test_cert()`, OID constants (`pub(crate)`)
+- `voucher.rs`: `build_test_ov_header()`, `build_test_fdo_public_key()`,
+  `build_ov_entry_payload()`, `hmac_sha256()` (pub)
+- `bmo.rs`: `check_bmo_authorization()` (pub)
+
 ## Build & Ship
 
 ```bash
-# Build (on dev machine)
-cargo build --release --features fdo-installer
+# Build UEFI binary (on dev machine)
+make release       # or: cargo build --release --features fdo-installer \
+                   #       --target x86_64-unknown-uefi -Z build-std=core,alloc
 
 # Create disk image
 rm -f build/efi-disk-release.img && make build/efi-disk-release.img

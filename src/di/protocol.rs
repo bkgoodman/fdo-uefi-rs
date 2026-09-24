@@ -20,9 +20,12 @@ use alloc::vec::Vec;
 use alloc::vec;
 use alloc::format;
 use log::{info, error, warn};
+#[cfg(target_os = "uefi")]
 use uefi::Status;
 
+#[cfg(target_os = "uefi")]
 use crate::http_api::{http_post_with_session, HttpPostResponse};
+#[cfg(target_os = "uefi")]
 use crate::tpm;
 use super::mfginfo::{DeviceMfgInfo, KEY_TYPE_SECP256R1};
 
@@ -44,6 +47,7 @@ const FDO_HMAC_HANDLE: u32 = 0x81020003;
 /// TPM NV index for DCTPM (per securing-fdo-in-tpm.bs)
 const FDO_NV_INDEX_DCTPM: u32 = 0x01D10001;
 
+#[cfg(target_os = "uefi")]
 /// Run the Device Initialization protocol
 /// If `cli_url` is Some, use that as the DI server URL (from -di flag).
 /// Otherwise, try well-known DNS names.
@@ -197,6 +201,7 @@ pub fn run_di_protocol(cli_url: Option<&str>) -> Status {
 /// TODO: Actually attempt DNS resolution and connectivity test for each
 ///       well-known name before returning it (currently returns first name
 ///       without verification — the HTTP POST will fail if unreachable).
+#[cfg(target_os = "uefi")]
 fn get_di_server_url(cli_url: Option<&str>) -> Option<String> {
     // 1) Explicit CLI override
     if let Some(url) = cli_url {
@@ -224,11 +229,13 @@ fn get_di_server_url(cli_url: Option<&str>) -> Option<String> {
 }
 
 /// Get device serial number (placeholder)
+#[cfg(target_os = "uefi")]
 fn get_device_serial() -> String {
     // TODO: Read from SMBIOS or UEFI variable
     String::from("UEFI-DI-TEST-001")
 }
 
+#[cfg(target_os = "uefi")]
 /// Get device model (placeholder)
 fn get_device_model() -> String {
     // TODO: Read from SMBIOS or UEFI variable
@@ -292,6 +299,7 @@ const MSG_TYPE_ERROR: u8 = 255;
 
 /// Send DI message with session token support
 /// Returns (actual_message_type, body, auth_token)
+#[cfg(target_os = "uefi")]
 fn send_di_message(server_url: &str, msg_type: u8, payload: &[u8], auth_token: Option<&str>) -> Option<(u8, Vec<u8>, Option<String>)> {
     let url = format!("{}/fdo/200/msg/{}", server_url, msg_type);
     
@@ -831,6 +839,7 @@ fn build_dctpm(ov_header: &OVHeader, dak_handle: u32, hmac_handle: u32) -> Vec<u
 
 /// Generate CSR (Certificate Signing Request) using TPM for signing
 /// Returns DER-encoded PKCS#10 CSR
+#[cfg(target_os = "uefi")]
 fn generate_csr(subject_cn: &str, public_x: &[u8], public_y: &[u8], sign_handle: u32) -> Option<Vec<u8>> {
     // Build CertificationRequestInfo (to-be-signed)
     let tbs = build_csr_tbs(subject_cn, public_x, public_y);

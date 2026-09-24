@@ -747,17 +747,17 @@ pub fn cbor_skip(data: &[u8], pos: &mut usize) -> Option<()> {
     }
 }
 
-fn encode_bstr(out: &mut Vec<u8>, data: &[u8]) {
+pub fn encode_bstr(out: &mut Vec<u8>, data: &[u8]) {
     encode_head(out, 2, data.len());
     out.extend_from_slice(data);
 }
 
-fn encode_tstr(out: &mut Vec<u8>, s: &str) {
+pub fn encode_tstr(out: &mut Vec<u8>, s: &str) {
     encode_head(out, 3, s.len());
     out.extend_from_slice(s.as_bytes());
 }
 
-fn encode_head(out: &mut Vec<u8>, major: u8, len: usize) {
+pub fn encode_head(out: &mut Vec<u8>, major: u8, len: usize) {
     let m = major << 5;
     if len < 24 {
         out.push(m | len as u8);
@@ -774,5 +774,789 @@ fn encode_head(out: &mut Vec<u8>, major: u8, len: usize) {
         out.push((len >> 16) as u8);
         out.push((len >> 8) as u8);
         out.push(len as u8);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Test helpers (available to other test modules via `pub(crate)`)
+// -------------------------------------------------------------------------
+
+/// Build a minimal COSE_Sign1 envelope, signed with the given P-256 key.
+///
+/// `protected_cbor` is the serialised protected header map.
+/// `payload` is the inner payload bytes.
+/// `external_aad` is the domain AAD bytes.
+/// `unprotected_cbor` is the serialised unprotected header map (may be empty map `a0`).
+///
+/// Returns the full COSE_Sign1 bytes (with CBOR tag 18).
+#[cfg(test)]
+pub(crate) fn build_test_cose_sign1(
+    protected_cbor: &[u8],
+    payload: &[u8],
+    external_aad: &[u8],
+    unprotected_cbor: &[u8],
+    signing_key: &p256::ecdsa::SigningKey,
+) -> Vec<u8> {
+    use p256::ecdsa::{signature::Signer, Signature};
+
+    let sig_structure = build_sig_structure(protected_cbor, external_aad, payload);
+    let sig: Signature = signing_key.sign(&sig_structure);
+    let sig_bytes = sig.to_bytes();
+
+    let mut out = Vec::new();
+    // CBOR tag 18 (COSE_Sign1) — shortest encoding: major 6 (0xC0) | 18 = 0xD2
+    out.push(0xd2);
+    out.push(0x84); // array(4)
+    encode_bstr(&mut out, protected_cbor);      // [0] protected
+    out.extend_from_slice(unprotected_cbor);     // [1] unprotected (pre-encoded map)
+    encode_bstr(&mut out, payload);              // [2] payload
+    encode_bstr(&mut out, sig_bytes.as_slice()); // [3] signature
+    out
+}
+
+/// Build the "standard" protected header for ES256 + optional content_type.
+#[cfg(test)]
+pub(crate) fn build_test_protected_header(content_type: Option<&str>) -> Vec<u8> {
+    let mut hdr = Vec::new();
+    let count = 1 + if content_type.is_some() { 1 } else { 0 };
+    encode_head(&mut hdr, 5, count); // map(count)
+    // alg = 1, ES256 = -7
+    hdr.push(0x01); // key 1
+    hdr.push(0x26); // value -7 (= 0x20 | 6)
+    if let Some(ct) = content_type {
+        hdr.push(0x03); // key 3 (content_type)
+        encode_tstr(&mut hdr, ct);
+    }
+    hdr
+}
+
+/// Generate a fresh P-256 key pair for testing. Returns (signing_key, uncompressed_point).
+#[cfg(test)]
+pub(crate) fn gen_test_keypair() -> (p256::ecdsa::SigningKey, Vec<u8>) {
+    use p256::ecdsa::SigningKey;
+    use p256::EncodedPoint;
+
+    // Deterministic key from a fixed seed (for reproducible tests)
+    let secret = p256::SecretKey::from_bytes(
+        &[
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+        ].into(),
+    ).unwrap();
+    let sk = SigningKey::from(secret.clone());
+    let pk = secret.public_key();
+    let point = EncodedPoint::from(pk);
+    (sk, point.as_bytes().to_vec())
+}
+
+/// Generate a SECOND distinct P-256 key pair (for "wrong key" tests).
+#[cfg(test)]
+pub(crate) fn gen_test_keypair_b() -> (p256::ecdsa::SigningKey, Vec<u8>) {
+    use p256::ecdsa::SigningKey;
+    use p256::EncodedPoint;
+
+    let secret = p256::SecretKey::from_bytes(
+        &[
+            0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8,
+            0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2, 0xf1, 0xf0,
+            0xef, 0xee, 0xed, 0xec, 0xeb, 0xea, 0xe9, 0xe8,
+            0xe7, 0xe6, 0xe5, 0xe4, 0xe3, 0xe2, 0xe1, 0xe0,
+        ].into(),
+    ).unwrap();
+    let sk = SigningKey::from(secret.clone());
+    let pk = secret.public_key();
+    let point = EncodedPoint::from(pk);
+    (sk, point.as_bytes().to_vec())
+}
+
+// =========================================================================
+// Unit tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- domain_aad ---
+
+    #[test]
+    fn test_domain_aad_v200() {
+        let aad = domain_aad(AAD_TAG_PROVE_OV_HDR, FDO_VERSION_200);
+        assert!(!aad.is_empty(), "FDO 2.0 must produce non-empty AAD");
+        // First byte = 0x81 (array of 1)
+        assert_eq!(aad[0], 0x81);
+        // Followed by the text string
+        let tag_bytes = AAD_TAG_PROVE_OV_HDR.as_bytes();
+        assert!(aad[2..].starts_with(tag_bytes));
+    }
+
+    #[test]
+    fn test_domain_aad_v101_empty() {
+        let aad = domain_aad(AAD_TAG_PROVE_OV_HDR, FDO_VERSION_101);
+        assert!(aad.is_empty(), "FDO 1.01 must produce empty AAD");
+    }
+
+    #[test]
+    fn test_domain_aad_all_tags() {
+        // Every tag must produce distinct AADs
+        let tags = [
+            AAD_TAG_OWNER_SIGN, AAD_TAG_PROVE_TO_RV, AAD_TAG_PROVE_DEVICE,
+            AAD_TAG_PROVE_OV_HDR, AAD_TAG_OV_ENTRY, AAD_TAG_BMO_PROVISION,
+        ];
+        let aads: Vec<Vec<u8>> = tags.iter().map(|t| domain_aad(t, 200)).collect();
+        for i in 0..aads.len() {
+            for j in (i+1)..aads.len() {
+                assert_ne!(aads[i], aads[j], "AAD tags must be distinct: {} vs {}", tags[i], tags[j]);
+            }
+        }
+    }
+
+    // --- parse_cose_sign1 ---
+
+    #[test]
+    fn test_parse_cose_sign1_roundtrip() {
+        let (sk, point) = gen_test_keypair();
+        let protected = build_test_protected_header(None);
+        let payload = b"test payload";
+        let aad = domain_aad(AAD_TAG_PROVE_OV_HDR, 200);
+        let unprotected = vec![0xa0]; // empty map
+
+        let envelope = build_test_cose_sign1(&protected, payload, &aad, &unprotected, &sk);
+
+        let s1 = parse_cose_sign1(&envelope).expect("parse should succeed");
+        assert_eq!(s1.algorithm, COSE_ALG_ES256);
+        assert_eq!(s1.payload, payload);
+        assert_eq!(s1.signature.len(), 64);
+        assert_eq!(s1.protected_header, &protected[..]);
+    }
+
+    #[test]
+    fn test_parse_cose_sign1_no_tag() {
+        // COSE_Sign1 without CBOR tag 18 should still parse
+        let (sk, _) = gen_test_keypair();
+        let protected = build_test_protected_header(None);
+        let payload = b"no tag";
+        let aad = vec![];
+        let unprotected = vec![0xa0];
+
+        let full = build_test_cose_sign1(&protected, payload, &aad, &unprotected, &sk);
+        // Strip the first byte (0xd2 = tag 18, shortest encoding)
+        let no_tag = &full[1..];
+        let s1 = parse_cose_sign1(no_tag).expect("should parse without tag");
+        assert_eq!(s1.payload, payload);
+    }
+
+    #[test]
+    fn test_parse_cose_sign1_truncated() {
+        let (sk, _) = gen_test_keypair();
+        let protected = build_test_protected_header(None);
+        let envelope = build_test_cose_sign1(&protected, b"x", &[], &[0xa0], &sk);
+        // Truncate at various points
+        for len in [0, 1, 2, 5, 10] {
+            if len < envelope.len() {
+                assert!(parse_cose_sign1(&envelope[..len]).is_none(),
+                    "truncated at {} should fail", len);
+            }
+        }
+    }
+
+    // --- verify_es256 / verify_sign1 ---
+
+    #[test]
+    fn test_verify_es256_valid() {
+        let (sk, point) = gen_test_keypair();
+        let msg = b"hello FDO";
+        let sig: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&sk, msg);
+        assert!(verify_es256(msg, sig.to_bytes().as_slice(), &point));
+    }
+
+    #[test]
+    fn test_verify_es256_wrong_key() {
+        let (sk, _point_a) = gen_test_keypair();
+        let (_sk_b, point_b) = gen_test_keypair_b();
+        let msg = b"signed by A";
+        let sig: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&sk, msg);
+        // Verify with key B — must fail
+        assert!(!verify_es256(msg, sig.to_bytes().as_slice(), &point_b),
+            "signature must not verify with wrong key");
+    }
+
+    #[test]
+    fn test_verify_es256_tampered_payload() {
+        let (sk, point) = gen_test_keypair();
+        let msg = b"original";
+        let sig: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&sk, msg);
+        assert!(!verify_es256(b"tampered", sig.to_bytes().as_slice(), &point),
+            "signature must not verify with tampered payload");
+    }
+
+    #[test]
+    fn test_verify_es256_tampered_signature() {
+        let (sk, point) = gen_test_keypair();
+        let msg = b"original";
+        let sig: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&sk, msg);
+        let mut bad_sig = sig.to_bytes().to_vec();
+        bad_sig[63] ^= 0x01; // flip last bit
+        assert!(!verify_es256(msg, &bad_sig, &point),
+            "tampered signature must not verify");
+    }
+
+    #[test]
+    fn test_verify_es256_short_signature() {
+        let (_, point) = gen_test_keypair();
+        assert!(!verify_es256(b"x", &[0u8; 32], &point), "short signature must fail");
+    }
+
+    #[test]
+    fn test_verify_es256_bad_point() {
+        let (sk, _) = gen_test_keypair();
+        let msg = b"x";
+        let sig: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&sk, msg);
+        assert!(!verify_es256(msg, sig.to_bytes().as_slice(), &[0u8; 65]),
+            "invalid point must fail");
+    }
+
+    #[test]
+    fn test_verify_sign1_roundtrip() {
+        let (sk, point) = gen_test_keypair();
+        let protected = build_test_protected_header(None);
+        let payload = b"signed payload";
+        let aad = domain_aad(AAD_TAG_PROVE_OV_HDR, 200);
+        let envelope = build_test_cose_sign1(&protected, payload, &aad, &[0xa0], &sk);
+
+        let s1 = parse_cose_sign1(&envelope).unwrap();
+        assert!(verify_sign1(&s1, &aad, &point), "valid COSE_Sign1 must verify");
+    }
+
+    #[test]
+    fn test_verify_sign1_wrong_aad() {
+        let (sk, point) = gen_test_keypair();
+        let protected = build_test_protected_header(None);
+        let payload = b"aad test";
+        let aad = domain_aad(AAD_TAG_PROVE_OV_HDR, 200);
+        let envelope = build_test_cose_sign1(&protected, payload, &aad, &[0xa0], &sk);
+
+        let s1 = parse_cose_sign1(&envelope).unwrap();
+        let wrong_aad = domain_aad(AAD_TAG_OV_ENTRY, 200); // different tag
+        assert!(!verify_sign1(&s1, &wrong_aad, &point),
+            "wrong domain AAD must fail verification");
+    }
+
+    // --- verify_bmo_signed ---
+
+    #[test]
+    fn test_verify_bmo_signed_model3_valid() {
+        let (sk, point) = gen_test_keypair();
+        let ct = BMO_CONTENT_TYPE_IMAGE_BEGIN;
+        let protected = build_test_protected_header(Some(ct));
+        let payload = b"\xa2\x01\x18\x0a\x02\x18\x0a"; // some CBOR
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+        let envelope = build_test_cose_sign1(&protected, payload, &aad, &[0xa0], &sk);
+
+        let result = verify_bmo_signed(&envelope, &point, ct, None);
+        assert!(result.is_some(), "valid Model 3 BMO must verify");
+        assert_eq!(result.unwrap(), payload);
+    }
+
+    #[test]
+    fn test_verify_bmo_signed_wrong_content_type() {
+        let (sk, point) = gen_test_keypair();
+        let ct = BMO_CONTENT_TYPE_IMAGE_BEGIN;
+        let protected = build_test_protected_header(Some(ct));
+        let payload = b"\xa0";
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+        let envelope = build_test_cose_sign1(&protected, payload, &aad, &[0xa0], &sk);
+
+        // Expect a different content_type
+        let result = verify_bmo_signed(&envelope, &point, BMO_CONTENT_TYPE_SET, None);
+        assert!(result.is_none(), "wrong content_type must be rejected");
+    }
+
+    #[test]
+    fn test_verify_bmo_signed_wrong_key() {
+        let (sk, _point_a) = gen_test_keypair();
+        let (_sk_b, point_b) = gen_test_keypair_b();
+        let ct = BMO_CONTENT_TYPE_IMAGE_BEGIN;
+        let protected = build_test_protected_header(Some(ct));
+        let payload = b"\xa0";
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+        let envelope = build_test_cose_sign1(&protected, payload, &aad, &[0xa0], &sk);
+
+        let result = verify_bmo_signed(&envelope, &point_b, ct, None);
+        assert!(result.is_none(), "BMO signed with key A must not verify with key B");
+    }
+
+    // --- scope evaluation ---
+
+    #[test]
+    fn test_scope_guid_match() {
+        let device_guid = [0x01u8; 16];
+        // Build scope map: { "guid": h'0101...01' }
+        let mut scope_cbor = Vec::new();
+        scope_cbor.push(0xa1); // map(1)
+        encode_tstr(&mut scope_cbor, "guid");
+        encode_bstr(&mut scope_cbor, &device_guid);
+
+        // Build protected header with scope
+        let mut hdr = Vec::new();
+        hdr.push(0xa2); // map(2)
+        hdr.push(0x01); hdr.push(0x26); // alg = -7
+        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        // scope value is a CBOR map, encoded as raw bytes
+        hdr.extend_from_slice(&scope_cbor);
+
+        assert!(evaluate_bmo_scope(&hdr, Some(&device_guid)));
+    }
+
+    #[test]
+    fn test_scope_guid_mismatch() {
+        let device_guid = [0x01u8; 16];
+        let wrong_guid = [0x02u8; 16];
+        let mut scope_cbor = Vec::new();
+        scope_cbor.push(0xa1); // map(1)
+        encode_tstr(&mut scope_cbor, "guid");
+        encode_bstr(&mut scope_cbor, &wrong_guid);
+
+        let mut hdr = Vec::new();
+        hdr.push(0xa2); // map(2)
+        hdr.push(0x01); hdr.push(0x26);
+        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        hdr.extend_from_slice(&scope_cbor);
+
+        assert!(!evaluate_bmo_scope(&hdr, Some(&device_guid)),
+            "GUID mismatch must fail");
+    }
+
+    #[test]
+    fn test_scope_guid_array_any_match() {
+        let device_guid = [0x02u8; 16];
+        let guid_a = [0x01u8; 16];
+        let guid_b = [0x02u8; 16]; // matches
+        let guid_c = [0x03u8; 16];
+
+        let mut scope_cbor = Vec::new();
+        scope_cbor.push(0xa1); // map(1)
+        encode_tstr(&mut scope_cbor, "guid");
+        scope_cbor.push(0x83); // array(3)
+        encode_bstr(&mut scope_cbor, &guid_a);
+        encode_bstr(&mut scope_cbor, &guid_b);
+        encode_bstr(&mut scope_cbor, &guid_c);
+
+        let mut hdr = Vec::new();
+        hdr.push(0xa2);
+        hdr.push(0x01); hdr.push(0x26);
+        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        hdr.extend_from_slice(&scope_cbor);
+
+        assert!(evaluate_bmo_scope(&hdr, Some(&device_guid)),
+            "any-match in GUID array must pass");
+    }
+
+    #[test]
+    fn test_scope_guid_array_none_match() {
+        let device_guid = [0x99u8; 16];
+        let guid_a = [0x01u8; 16];
+        let guid_b = [0x02u8; 16];
+
+        let mut scope_cbor = Vec::new();
+        scope_cbor.push(0xa1);
+        encode_tstr(&mut scope_cbor, "guid");
+        scope_cbor.push(0x82); // array(2)
+        encode_bstr(&mut scope_cbor, &guid_a);
+        encode_bstr(&mut scope_cbor, &guid_b);
+
+        let mut hdr = Vec::new();
+        hdr.push(0xa2);
+        hdr.push(0x01); hdr.push(0x26);
+        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        hdr.extend_from_slice(&scope_cbor);
+
+        assert!(!evaluate_bmo_scope(&hdr, Some(&device_guid)),
+            "no match in GUID array must fail");
+    }
+
+    #[test]
+    fn test_scope_no_scope_passes() {
+        // Protected header with just alg, no scope → passes
+        let hdr = build_test_protected_header(None);
+        assert!(evaluate_bmo_scope(&hdr, Some(&[0x01u8; 16])));
+    }
+
+    #[test]
+    fn test_scope_unknown_field_fails_closed() {
+        let mut scope_cbor = Vec::new();
+        scope_cbor.push(0xa1); // map(1)
+        encode_tstr(&mut scope_cbor, "evil_field");
+        scope_cbor.push(0x00); // uint(0)
+
+        let mut hdr = Vec::new();
+        hdr.push(0xa2);
+        hdr.push(0x01); hdr.push(0x26);
+        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        hdr.extend_from_slice(&scope_cbor);
+
+        assert!(!evaluate_bmo_scope(&hdr, None),
+            "unknown scope field must fail closed");
+    }
+
+    // --- CBOR helpers ---
+
+    #[test]
+    fn test_cbor_read_uint_arg_small() {
+        let data = [];
+        let mut pos = 0;
+        assert_eq!(cbor_read_uint_arg(&data, &mut pos, 5), Some(5));
+    }
+
+    #[test]
+    fn test_cbor_read_uint_arg_one_byte() {
+        let data = [0x42];
+        let mut pos = 0;
+        assert_eq!(cbor_read_uint_arg(&data, &mut pos, 24), Some(0x42));
+        assert_eq!(pos, 1);
+    }
+
+    #[test]
+    fn test_cbor_read_uint_arg_two_bytes() {
+        let data = [0x01, 0x00];
+        let mut pos = 0;
+        assert_eq!(cbor_read_uint_arg(&data, &mut pos, 25), Some(256));
+        assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn test_cbor_skip_nested() {
+        // array(2) [ uint(1), bstr(3) "abc" ]
+        let data = [0x82, 0x01, 0x43, 0x61, 0x62, 0x63];
+        let mut pos = 0;
+        assert!(cbor_skip(&data, &mut pos).is_some());
+        assert_eq!(pos, data.len());
+    }
+
+    #[test]
+    fn test_has_delegate_header_empty_map() {
+        assert!(!has_delegate_header(&[0xa0])); // empty map
+    }
+
+    #[test]
+    fn test_has_delegate_header_with_x5chain() {
+        // map(1) { 33: h'' }
+        let data = [0xa1, 0x18, 33, 0x40]; // label 33 (x5chain), empty bstr
+        assert!(has_delegate_header(&data));
+    }
+
+    #[test]
+    fn test_has_delegate_header_with_label_258() {
+        // map(1) { 258: h'' }
+        let data = [0xa1, 0x19, 0x01, 0x02, 0x40]; // label 258, empty bstr
+        assert!(has_delegate_header(&data));
+    }
+
+    #[test]
+    fn test_has_delegate_header_no_delegate() {
+        // map(1) { 1: -7 }  (alg header, not a delegate label)
+        let data = [0xa1, 0x01, 0x26];
+        assert!(!has_delegate_header(&data));
+    }
+
+    // --- Malformed input tests (Go: TestCoseSign1Verifier_Invalid*) ---
+
+    #[test]
+    fn test_verify_es256_empty_key() {
+        let (sk, _) = gen_test_keypair();
+        let msg = b"test";
+        let sig: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&sk, msg);
+        assert!(!verify_es256(msg, sig.to_bytes().as_slice(), &[]),
+            "empty key must fail");
+    }
+
+    #[test]
+    fn test_verify_es256_garbage_key() {
+        let (sk, _) = gen_test_keypair();
+        let msg = b"test";
+        let sig: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&sk, msg);
+        assert!(!verify_es256(msg, sig.to_bytes().as_slice(), &[0xDE, 0xAD, 0xBE, 0xEF]),
+            "garbage key must fail");
+    }
+
+    #[test]
+    fn test_parse_cose_sign1_empty() {
+        assert!(parse_cose_sign1(&[]).is_none(), "empty input must fail");
+    }
+
+    #[test]
+    fn test_parse_cose_sign1_garbage() {
+        assert!(parse_cose_sign1(&[0xDE, 0xAD, 0xBE, 0xEF]).is_none(),
+            "garbage bytes must fail");
+    }
+
+    #[test]
+    fn test_parse_cose_sign1_cbor_not_sign1() {
+        // Valid CBOR text string, but not a COSE_Sign1
+        let data = [0x65, b'h', b'e', b'l', b'l', b'o']; // text(5) "hello"
+        assert!(parse_cose_sign1(&data).is_none(),
+            "valid CBOR but not Sign1 must fail");
+    }
+
+    #[test]
+    fn test_verify_bmo_signed_empty_envelope() {
+        let (_, point) = gen_test_keypair();
+        let result = verify_bmo_signed(&[], &point, BMO_CONTENT_TYPE_IMAGE_BEGIN, None);
+        assert!(result.is_none(), "empty envelope must fail");
+    }
+
+    #[test]
+    fn test_verify_bmo_signed_garbage_envelope() {
+        let (_, point) = gen_test_keypair();
+        let result = verify_bmo_signed(
+            &[0xD2, 0xDE, 0xAD, 0xBE, 0xEF], // tag 18 + garbage
+            &point, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert!(result.is_none(), "garbage after tag 18 must fail");
+    }
+
+    #[test]
+    fn test_verify_bmo_signed_tampered_payload() {
+        let (sk, point) = gen_test_keypair();
+        let ct = BMO_CONTENT_TYPE_IMAGE_BEGIN;
+        let protected = build_test_protected_header(Some(ct));
+        let payload = b"\xa1\x00\x0a"; // map(1) { 0: 10 }
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+        let mut envelope = build_test_cose_sign1(&protected, payload, &aad, &[0xa0], &sk);
+
+        // Tamper the payload bytes inside the COSE structure
+        // Find the payload byte 0x0a and flip it
+        if let Some(pos) = envelope.windows(3).position(|w| w == [0xa1, 0x00, 0x0a]) {
+            envelope[pos + 2] ^= 0xFF;
+        }
+
+        let result = verify_bmo_signed(&envelope, &point, ct, None);
+        assert!(result.is_none(), "tampered payload must fail verification");
+    }
+
+    #[test]
+    fn test_verify_bmo_signed_tampered_signature() {
+        let (sk, point) = gen_test_keypair();
+        let ct = BMO_CONTENT_TYPE_IMAGE_BEGIN;
+        let protected = build_test_protected_header(Some(ct));
+        let payload = b"\xa0";
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+        let mut envelope = build_test_cose_sign1(&protected, payload, &aad, &[0xa0], &sk);
+
+        // Flip the last byte (inside the signature)
+        let last = envelope.len() - 1;
+        envelope[last] ^= 0x01;
+
+        let result = verify_bmo_signed(&envelope, &point, ct, None);
+        assert!(result.is_none(), "tampered signature must fail verification");
+    }
+
+    // --- Scope: combined fields, edge cases ---
+
+    #[test]
+    fn test_scope_combined_fields_all_valid() {
+        // Scope with guid + not_before + not_after + generation — all valid
+        let device_guid = [0x01u8; 16];
+        let mut scope_cbor = Vec::new();
+        scope_cbor.push(0xa4); // map(4)
+        encode_tstr(&mut scope_cbor, "guid");
+        encode_bstr(&mut scope_cbor, &device_guid);
+        encode_tstr(&mut scope_cbor, "not_before");
+        // uint 1735689600 (2025-01-01)
+        scope_cbor.push(0x1a);
+        scope_cbor.extend_from_slice(&1735689600u32.to_be_bytes());
+        encode_tstr(&mut scope_cbor, "not_after");
+        // uint 1893456000 (2030-01-01)
+        scope_cbor.push(0x1a);
+        scope_cbor.extend_from_slice(&1893456000u32.to_be_bytes());
+        encode_tstr(&mut scope_cbor, "generation");
+        scope_cbor.push(0x01); // uint 1
+
+        let mut hdr = Vec::new();
+        hdr.push(0xa2); // map(2)
+        hdr.push(0x01); hdr.push(0x26); // alg = -7
+        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        hdr.extend_from_slice(&scope_cbor);
+
+        assert!(evaluate_bmo_scope(&hdr, Some(&device_guid)),
+            "all valid scope fields must pass");
+    }
+
+    #[test]
+    fn test_scope_combined_guid_mismatch_fails_everything() {
+        // Even with valid time/generation, a GUID mismatch must fail
+        let device_guid = [0x01u8; 16];
+        let wrong_guid = [0x02u8; 16];
+        let mut scope_cbor = Vec::new();
+        scope_cbor.push(0xa3); // map(3)
+        encode_tstr(&mut scope_cbor, "generation");
+        scope_cbor.push(0x01);
+        encode_tstr(&mut scope_cbor, "not_before");
+        scope_cbor.push(0x1a);
+        scope_cbor.extend_from_slice(&1735689600u32.to_be_bytes());
+        encode_tstr(&mut scope_cbor, "guid");
+        encode_bstr(&mut scope_cbor, &wrong_guid);
+
+        let mut hdr = Vec::new();
+        hdr.push(0xa2);
+        hdr.push(0x01); hdr.push(0x26);
+        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        hdr.extend_from_slice(&scope_cbor);
+
+        assert!(!evaluate_bmo_scope(&hdr, Some(&device_guid)),
+            "GUID mismatch must fail even with valid other fields");
+    }
+
+    #[test]
+    fn test_scope_guid_no_device_guid_skips() {
+        // When device_guid is None, guid check is skipped (device doesn't know its GUID yet)
+        let scope_guid = [0xAA; 16];
+        let mut scope_cbor = Vec::new();
+        scope_cbor.push(0xa1);
+        encode_tstr(&mut scope_cbor, "guid");
+        encode_bstr(&mut scope_cbor, &scope_guid);
+
+        let mut hdr = Vec::new();
+        hdr.push(0xa2);
+        hdr.push(0x01); hdr.push(0x26);
+        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        hdr.extend_from_slice(&scope_cbor);
+
+        assert!(evaluate_bmo_scope(&hdr, None),
+            "no device GUID → guid check skipped → pass");
+    }
+
+    #[test]
+    fn test_scope_empty_map_passes() {
+        // Empty scope map {} — no constraints
+        let mut hdr = Vec::new();
+        hdr.push(0xa2);
+        hdr.push(0x01); hdr.push(0x26);
+        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        hdr.push(0xa0); // map(0)
+
+        assert!(evaluate_bmo_scope(&hdr, Some(&[0x01u8; 16])),
+            "empty scope map must pass");
+    }
+
+    #[test]
+    fn test_scope_multiple_unknown_fields_fail_closed() {
+        let mut scope_cbor = Vec::new();
+        scope_cbor.push(0xa2); // map(2)
+        encode_tstr(&mut scope_cbor, "generation");
+        scope_cbor.push(0x01);
+        encode_tstr(&mut scope_cbor, "evil_extension");
+        scope_cbor.push(0x00);
+
+        let mut hdr = Vec::new();
+        hdr.push(0xa2);
+        hdr.push(0x01); hdr.push(0x26);
+        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        hdr.extend_from_slice(&scope_cbor);
+
+        assert!(!evaluate_bmo_scope(&hdr, None),
+            "unknown field after valid field must still fail closed");
+    }
+
+    // --- Domain AAD cross-version ---
+
+    #[test]
+    fn test_domain_aad_v101_vs_v200() {
+        // v1.01 proof signed with empty AAD must fail when verified with v2.0 AAD
+        let (sk, point) = gen_test_keypair();
+        let protected = build_test_protected_header(None);
+        let payload = b"cross-version test";
+
+        // Sign with v1.01 AAD (empty)
+        let aad_v101 = domain_aad(AAD_TAG_PROVE_OV_HDR, FDO_VERSION_101);
+        assert!(aad_v101.is_empty());
+        let envelope = build_test_cose_sign1(&protected, payload, &aad_v101, &[0xa0], &sk);
+
+        let s1 = parse_cose_sign1(&envelope).unwrap();
+
+        // Verify with same empty AAD → must pass
+        assert!(verify_sign1(&s1, &aad_v101, &point),
+            "v1.01 proof with empty AAD must verify with empty AAD");
+
+        // Verify with v2.0 AAD → must FAIL
+        let aad_v200 = domain_aad(AAD_TAG_PROVE_OV_HDR, FDO_VERSION_200);
+        assert!(!aad_v200.is_empty());
+        assert!(!verify_sign1(&s1, &aad_v200, &point),
+            "v1.01 proof must fail when verified with v2.0 AAD");
+    }
+
+    #[test]
+    fn test_domain_aad_different_tags_not_interchangeable() {
+        // A proof signed with one tag must not verify with a different tag
+        let (sk, point) = gen_test_keypair();
+        let protected = build_test_protected_header(None);
+        let payload = b"tag test";
+
+        let aad_prove = domain_aad(AAD_TAG_PROVE_OV_HDR, FDO_VERSION_200);
+        let envelope = build_test_cose_sign1(&protected, payload, &aad_prove, &[0xa0], &sk);
+        let s1 = parse_cose_sign1(&envelope).unwrap();
+
+        // Correct AAD → pass
+        assert!(verify_sign1(&s1, &aad_prove, &point));
+
+        // Wrong AAD tag → fail
+        let aad_device = domain_aad(AAD_TAG_PROVE_DEVICE, FDO_VERSION_200);
+        assert!(!verify_sign1(&s1, &aad_device, &point),
+            "proof with PROVE_OV_HDR AAD must fail when verified with PROVE_DEVICE AAD");
+
+        let aad_bmo = domain_aad(AAD_TAG_BMO_PROVISION, FDO_VERSION_200);
+        assert!(!verify_sign1(&s1, &aad_bmo, &point),
+            "proof with PROVE_OV_HDR AAD must fail when verified with BMO_PROVISION AAD");
+    }
+
+    // --- COSE_Sign1: missing content_type ---
+
+    #[test]
+    fn test_verify_bmo_signed_no_content_type() {
+        // Protected header with alg but NO content_type
+        let (sk, point) = gen_test_keypair();
+        let protected = build_test_protected_header(None); // no content_type
+        let payload = b"\xa0";
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+        let envelope = build_test_cose_sign1(&protected, payload, &aad, &[0xa0], &sk);
+
+        let result = verify_bmo_signed(&envelope, &point, BMO_CONTENT_TYPE_IMAGE_BEGIN, None);
+        assert!(result.is_none(),
+            "BMO without content_type in protected header must be rejected");
+    }
+
+    // --- Delegate-signed BMO without PERM.7 ---
+
+    #[test]
+    fn test_verify_bmo_delegate_signed_missing_perm7() {
+        use crate::delegate::{build_test_cert, OID_PERMIT_ONBOARD_NEWCRED};
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (delegate_sk, delegate_point) = gen_test_keypair_b();
+
+        // Cert with onboard but NOT provision (PERM.7)
+        let cert_der = build_test_cert(
+            &owner_sk, &delegate_point,
+            &[OID_PERMIT_ONBOARD_NEWCRED],
+        );
+
+        let ct = BMO_CONTENT_TYPE_IMAGE_BEGIN;
+        let protected = build_test_protected_header(Some(ct));
+        let payload = b"\xa1\x00\x18\x34";
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+
+        let mut unhdr = Vec::new();
+        unhdr.push(0xa1);
+        unhdr.push(0x18); unhdr.push(33); // x5chain label
+        encode_bstr(&mut unhdr, &cert_der);
+
+        let envelope = build_test_cose_sign1(
+            &protected, payload, &aad, &unhdr, &delegate_sk,
+        );
+
+        let result = verify_bmo_signed(&envelope, &owner_point, ct, None);
+        assert!(result.is_none(),
+            "delegate without PERM.7 must be rejected for BMO signing");
     }
 }
