@@ -26,7 +26,11 @@ const DNS_RCODE_MASK: u16 = 0x000F;      // Response code mask
 
 /// DNS record types
 const DNS_TYPE_A: u16 = 1;               // IPv4 address
+const DNS_TYPE_CNAME: u16 = 5;           // Canonical name (alias)
 const DNS_CLASS_IN: u16 = 1;             // Internet
+
+/// Maximum CNAME chase depth (prevents infinite loops)
+const MAX_CNAME_DEPTH: usize = 8;
 
 /// DNS server port
 const DNS_PORT: u16 = 53;
@@ -207,6 +211,120 @@ fn skip_dns_name(data: &[u8], mut pos: usize) -> Option<usize> {
     }
 
     Some(end_pos.unwrap_or(pos))
+}
+
+/// Decode a DNS name at the given position into a dotted string.
+/// Handles label compression (pointer chasing). Returns the decoded name
+/// and the wire position immediately after the name encoding.
+/// Returns None if malformed.
+pub fn decode_dns_name(data: &[u8], mut pos: usize) -> Option<(String, usize)> {
+    let mut name = String::new();
+    let mut jumps = 0;
+    let mut end_pos: Option<usize> = None;
+
+    loop {
+        if pos >= data.len() {
+            return None;
+        }
+
+        let len = data[pos] as usize;
+
+        if len == 0 {
+            // Root label — done
+            pos += 1;
+            break;
+        } else if len & 0xC0 == 0xC0 {
+            // Compression pointer
+            if pos + 1 >= data.len() {
+                return None;
+            }
+            if end_pos.is_none() {
+                end_pos = Some(pos + 2);
+            }
+            let offset = ((len & 0x3F) << 8) | data[pos + 1] as usize;
+            pos = offset;
+            jumps += 1;
+            if jumps > 64 {
+                return None;
+            }
+        } else {
+            // Regular label
+            if pos + 1 + len > data.len() {
+                return None;
+            }
+            if !name.is_empty() {
+                name.push('.');
+            }
+            for &b in &data[pos + 1..pos + 1 + len] {
+                name.push(b as char);
+            }
+            pos += 1 + len;
+        }
+    }
+
+    Some((name, end_pos.unwrap_or(pos)))
+}
+
+/// Extract the first CNAME target from a DNS response.
+/// Used when no A record is found — the caller can re-query the CNAME target.
+/// Returns None if no CNAME is present or the response is malformed.
+pub fn extract_cname_target(data: &[u8], expected_id: u16) -> Option<String> {
+    if data.len() < 12 {
+        return None;
+    }
+
+    let id = u16::from_be_bytes([data[0], data[1]]);
+    let flags = u16::from_be_bytes([data[2], data[3]]);
+    let qdcount = u16::from_be_bytes([data[4], data[5]]);
+    let ancount = u16::from_be_bytes([data[6], data[7]]);
+
+    if id != expected_id || flags & DNS_FLAG_QR == 0 {
+        return None;
+    }
+    let rcode = flags & DNS_RCODE_MASK;
+    if rcode != 0 {
+        return None;
+    }
+
+    // Skip question section
+    let mut pos = 12;
+    for _ in 0..qdcount {
+        pos = skip_dns_name(data, pos)?;
+        pos += 4;
+        if pos > data.len() {
+            return None;
+        }
+    }
+
+    // Scan answer records for CNAME
+    for _ in 0..ancount {
+        if pos >= data.len() {
+            break;
+        }
+
+        pos = skip_dns_name(data, pos)?;
+        if pos + 10 > data.len() {
+            break;
+        }
+
+        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
+        pos += 10;
+
+        if pos + rdlength > data.len() {
+            break;
+        }
+
+        if rtype == DNS_TYPE_CNAME && rdlength > 0 {
+            // CNAME RDATA is a DNS name (may use compression)
+            let (cname, _) = decode_dns_name(data, pos)?;
+            return Some(cname);
+        }
+
+        pos += rdlength;
+    }
+
+    None
 }
 
 /// Check if a string looks like an IPv4 address (4 dot-separated decimal octets)
@@ -466,14 +584,47 @@ pub fn dns_resolve(hostname: &str) -> Option<[u8; 4]> {
     info!("DNS: resolving {} via {}.{}.{}.{}",
         hostname, dns_server[0], dns_server[1], dns_server[2], dns_server[3]);
 
-    let tx_id = DNS_TX_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let query = build_dns_query(hostname, tx_id);
+    // Chase CNAMEs: query → if CNAME, re-query target → repeat
+    let mut current_name = String::from(hostname);
+    let mut ip = None;
 
-    // Send query via UDP4 and get response
-    let response = udp4_dns_query(&query, dns_server)?;
+    for depth in 0..MAX_CNAME_DEPTH {
+        let tx_id = DNS_TX_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let query = build_dns_query(&current_name, tx_id);
 
-    // Parse response
-    let ip = parse_dns_response(&response, tx_id)?;
+        let response = match udp4_dns_query(&query, dns_server) {
+            Some(r) => r,
+            None => {
+                warn!("DNS: UDP query failed for {}", current_name);
+                break;
+            }
+        };
+
+        // Try A record first
+        if let Some(addr) = parse_dns_response(&response, tx_id) {
+            ip = Some(addr);
+            break;
+        }
+
+        // No A record — check for CNAME
+        if let Some(cname_target) = extract_cname_target(&response, tx_id) {
+            info!("DNS: {} → CNAME {} (depth {})", current_name, cname_target, depth);
+            current_name = cname_target;
+            continue;
+        }
+
+        // Neither A nor CNAME — give up
+        debug!("DNS: no A or CNAME record for {}", current_name);
+        break;
+    }
+
+    let ip = match ip {
+        Some(addr) => addr,
+        None => {
+            warn!("DNS: resolution failed for {} (after CNAME chase)", hostname);
+            return None;
+        }
+    };
 
     info!("DNS: {} → {}.{}.{}.{}",
         hostname, ip[0], ip[1], ip[2], ip[3]);
@@ -1029,5 +1180,237 @@ mod tests {
 
         let ip = parse_dns_response(&resp, 0x1234);
         assert_eq!(ip, Some([1, 2, 3, 4]));
+    }
+
+    // ─── decode_dns_name tests ───
+
+    #[test]
+    fn test_decode_dns_name_basic() {
+        let data = b"\x07example\x03com\x00";
+        let (name, pos) = decode_dns_name(data, 0).unwrap();
+        assert_eq!(name, "example.com");
+        assert_eq!(pos, data.len());
+    }
+
+    #[test]
+    fn test_decode_dns_name_with_compression() {
+        // Packet with "example.com" at offset 0, then a pointer to it at offset 13
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\x07example\x03com\x00"); // offset 0..13
+        data.extend_from_slice(&[0xC0, 0x00]);             // pointer to offset 0
+        let (name, pos) = decode_dns_name(&data, 13).unwrap();
+        assert_eq!(name, "example.com");
+        assert_eq!(pos, 15); // past the 2-byte pointer
+    }
+
+    #[test]
+    fn test_decode_dns_name_partial_compression() {
+        // "www" label followed by pointer to "example.com" at offset 0
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\x07example\x03com\x00"); // offset 0..13
+        data.extend_from_slice(b"\x03www");                  // offset 13..17
+        data.extend_from_slice(&[0xC0, 0x00]);              // pointer to 0
+        let (name, pos) = decode_dns_name(&data, 13).unwrap();
+        assert_eq!(name, "www.example.com");
+        assert_eq!(pos, 19); // past the pointer
+    }
+
+    #[test]
+    fn test_decode_dns_name_empty_input() {
+        let data = b"\x00"; // just root
+        let (name, pos) = decode_dns_name(data, 0).unwrap();
+        assert_eq!(name, "");
+        assert_eq!(pos, 1);
+    }
+
+    // ─── extract_cname_target tests ───
+
+    /// Helper: build a DNS response with only a CNAME record (no A).
+    fn build_cname_only_response(
+        id: u16,
+        qname: &str,
+        cname_target: &str,
+    ) -> Vec<u8> {
+        let mut resp = Vec::new();
+        // Header
+        resp.extend_from_slice(&id.to_be_bytes());
+        resp.extend_from_slice(&0x8180u16.to_be_bytes()); // QR=1, RD=1, RA=1
+        resp.extend_from_slice(&1u16.to_be_bytes());      // QDCOUNT
+        resp.extend_from_slice(&1u16.to_be_bytes());      // ANCOUNT = 1 (CNAME only)
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        // Question
+        resp.extend_from_slice(&encode_dns_name(qname));
+        resp.extend_from_slice(&1u16.to_be_bytes());  // QTYPE=A
+        resp.extend_from_slice(&1u16.to_be_bytes());  // QCLASS=IN
+        // Answer: CNAME
+        resp.extend_from_slice(&encode_dns_name(qname)); // full name (no compression for simplicity)
+        resp.extend_from_slice(&5u16.to_be_bytes());  // TYPE=CNAME
+        resp.extend_from_slice(&1u16.to_be_bytes());  // CLASS=IN
+        resp.extend_from_slice(&300u32.to_be_bytes()); // TTL
+        let cname_encoded = encode_dns_name(cname_target);
+        resp.extend_from_slice(&(cname_encoded.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&cname_encoded);
+        resp
+    }
+
+    #[test]
+    fn test_extract_cname_target_basic() {
+        let resp = build_cname_only_response(0x1234, "cdn.vendor.com", "d1234.cloudfront.net");
+        // parse_dns_response should find no A record
+        assert_eq!(parse_dns_response(&resp, 0x1234), None);
+        // extract_cname_target should find the CNAME
+        let cname = extract_cname_target(&resp, 0x1234);
+        assert_eq!(cname, Some("d1234.cloudfront.net".to_string()));
+    }
+
+    #[test]
+    fn test_extract_cname_target_wrong_id() {
+        let resp = build_cname_only_response(0x5678, "cdn.vendor.com", "d1234.cloudfront.net");
+        assert_eq!(extract_cname_target(&resp, 0x1234), None);
+    }
+
+    #[test]
+    fn test_extract_cname_target_no_cname() {
+        // Response with only an A record, no CNAME
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&0x1234u16.to_be_bytes());
+        resp.extend_from_slice(&0x8180u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes()); // 1 answer: A record
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(b"\x04test\x03com\x00");
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        // A record answer
+        resp.extend_from_slice(b"\x04test\x03com\x00");
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&60u32.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        resp.extend_from_slice(&[10, 0, 0, 1]);
+        assert_eq!(extract_cname_target(&resp, 0x1234), None);
+    }
+
+    #[test]
+    fn test_cname_chain_two_deep() {
+        // Simulates what dns_resolve would see across multiple queries:
+        // Query 1: cdn.vendor.com → CNAME d1234.cloudfront.net (no A)
+        // Query 2: d1234.cloudfront.net → A 13.225.1.100
+        //
+        // We can't test the full chase loop without UEFI, but we can verify
+        // that the parser correctly extracts from each response independently.
+
+        // Response 1: CNAME only
+        let resp1 = build_cname_only_response(0x0001, "cdn.vendor.com", "d1234.cloudfront.net");
+        assert_eq!(parse_dns_response(&resp1, 0x0001), None);
+        let cname1 = extract_cname_target(&resp1, 0x0001);
+        assert_eq!(cname1, Some("d1234.cloudfront.net".to_string()));
+
+        // Response 2: A record for the CNAME target
+        let mut resp2 = Vec::new();
+        resp2.extend_from_slice(&0x0002u16.to_be_bytes());
+        resp2.extend_from_slice(&0x8180u16.to_be_bytes());
+        resp2.extend_from_slice(&1u16.to_be_bytes());
+        resp2.extend_from_slice(&1u16.to_be_bytes());
+        resp2.extend_from_slice(&0u16.to_be_bytes());
+        resp2.extend_from_slice(&0u16.to_be_bytes());
+        resp2.extend_from_slice(&encode_dns_name("d1234.cloudfront.net"));
+        resp2.extend_from_slice(&1u16.to_be_bytes());
+        resp2.extend_from_slice(&1u16.to_be_bytes());
+        // A record
+        resp2.extend_from_slice(&encode_dns_name("d1234.cloudfront.net"));
+        resp2.extend_from_slice(&1u16.to_be_bytes());
+        resp2.extend_from_slice(&1u16.to_be_bytes());
+        resp2.extend_from_slice(&60u32.to_be_bytes());
+        resp2.extend_from_slice(&4u16.to_be_bytes());
+        resp2.extend_from_slice(&[13, 225, 1, 100]);
+
+        let ip = parse_dns_response(&resp2, 0x0002);
+        assert_eq!(ip, Some([13, 225, 1, 100]));
+    }
+
+    #[test]
+    fn test_cname_chain_three_deep() {
+        // Three-level chain: a → b → c → A record
+        // Each response is independent (as the resolver would see them)
+
+        let resp1 = build_cname_only_response(0x0001, "images.vendor.com", "cdn.vendor.com");
+        assert_eq!(parse_dns_response(&resp1, 0x0001), None);
+        assert_eq!(extract_cname_target(&resp1, 0x0001),
+            Some("cdn.vendor.com".to_string()));
+
+        let resp2 = build_cname_only_response(0x0002, "cdn.vendor.com", "d999.cloudfront.net");
+        assert_eq!(parse_dns_response(&resp2, 0x0002), None);
+        assert_eq!(extract_cname_target(&resp2, 0x0002),
+            Some("d999.cloudfront.net".to_string()));
+
+        // Final response: A record
+        let mut resp3 = Vec::new();
+        resp3.extend_from_slice(&0x0003u16.to_be_bytes());
+        resp3.extend_from_slice(&0x8180u16.to_be_bytes());
+        resp3.extend_from_slice(&1u16.to_be_bytes());
+        resp3.extend_from_slice(&1u16.to_be_bytes());
+        resp3.extend_from_slice(&0u16.to_be_bytes());
+        resp3.extend_from_slice(&0u16.to_be_bytes());
+        resp3.extend_from_slice(&encode_dns_name("d999.cloudfront.net"));
+        resp3.extend_from_slice(&1u16.to_be_bytes());
+        resp3.extend_from_slice(&1u16.to_be_bytes());
+        resp3.extend_from_slice(&encode_dns_name("d999.cloudfront.net"));
+        resp3.extend_from_slice(&1u16.to_be_bytes());
+        resp3.extend_from_slice(&1u16.to_be_bytes());
+        resp3.extend_from_slice(&60u32.to_be_bytes());
+        resp3.extend_from_slice(&4u16.to_be_bytes());
+        resp3.extend_from_slice(&[52, 84, 200, 10]);
+
+        assert_eq!(parse_dns_response(&resp3, 0x0003), Some([52, 84, 200, 10]));
+    }
+
+    #[test]
+    fn test_cname_with_compressed_target() {
+        // CNAME RDATA uses a compression pointer back to the question name
+        let mut resp = Vec::new();
+        // Header
+        resp.extend_from_slice(&0xABCDu16.to_be_bytes());
+        resp.extend_from_slice(&0x8180u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes()); // 1 CNAME answer
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        // Question: "www.example.com" at offset 12
+        resp.extend_from_slice(b"\x03www\x07example\x03com\x00");
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        // Answer: CNAME for www.example.com → example.com
+        // Name: pointer to offset 12 (www.example.com)
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&5u16.to_be_bytes());  // CNAME
+        resp.extend_from_slice(&1u16.to_be_bytes());  // IN
+        resp.extend_from_slice(&300u32.to_be_bytes());
+        // RDATA: pointer to offset 16 (example.com — inside "www.example.com")
+        resp.extend_from_slice(&2u16.to_be_bytes()); // RDLENGTH = 2 (just a pointer)
+        resp.extend_from_slice(&[0xC0, 16]);         // pointer to "example" label
+
+        let cname = extract_cname_target(&resp, 0xABCD);
+        assert_eq!(cname, Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_cname_nxdomain_response() {
+        // NXDOMAIN — should return None even if there's a CNAME in the answer
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&0x1234u16.to_be_bytes());
+        resp.extend_from_slice(&0x8183u16.to_be_bytes()); // RCODE=3 (NXDOMAIN)
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(b"\x07missing\x03com\x00");
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+
+        assert_eq!(parse_dns_response(&resp, 0x1234), None);
+        assert_eq!(extract_cname_target(&resp, 0x1234), None);
     }
 }
