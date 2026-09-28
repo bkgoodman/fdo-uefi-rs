@@ -48,6 +48,7 @@ fn start_snp_interface() -> Option<uefi::Handle> {
     
     for handle in snp_handles.iter() {
         if let Ok(snp) = boot::open_protocol_exclusive::<SimpleNetwork>(*handle) {
+            let snp = core::mem::ManuallyDrop::new(snp);
             debug!("SNP mode: {:?}", snp.mode());
             
             // Try to start the interface
@@ -171,8 +172,12 @@ pub fn configure_network(nic_handle: uefi::Handle) -> bool {
     
     debug!("Configuring network via DHCP (first time)...");
     
+    // ManuallyDrop prevents ScopedProtocol::drop() from calling
+    // CloseProtocol, which panics on some firmware (OnLogic K800 / AMI
+    // Aptio returns NOT_FOUND for protocols opened with GET_PROTOCOL).
     match Ip4Config2::new(nic_handle) {
-        Ok(mut ip4cfg) => {
+        Ok(ip4cfg) => {
+            let mut ip4cfg = core::mem::ManuallyDrop::new(ip4cfg);
             match ip4cfg.ifup() {
                 Ok(()) => {
                     debug!("Network configured successfully");
@@ -305,7 +310,8 @@ fn http_post_internal(url: &str, body: &[u8], _msg_type: u8, auth_token: Option<
     debug!("Body hex: {:02x?}", &body[..body.len().min(32)]);
     
     // Get HTTP Service Binding and create child
-    let mut binding = boot::open_protocol_exclusive::<HttpBinding>(nic_handle).ok()?;
+    let binding = boot::open_protocol_exclusive::<HttpBinding>(nic_handle).ok()?;
+    let mut binding = core::mem::ManuallyDrop::new(binding);
     let child_handle = binding.create_child().ok()?;
     debug!("Created HTTP child handle: {:?}", child_handle);
     

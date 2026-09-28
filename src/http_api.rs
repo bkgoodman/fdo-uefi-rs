@@ -97,6 +97,7 @@ fn ensure_network_configured() {
         )) {
             for handle in snp_handles.iter() {
                 if let Ok(snp) = boot::open_protocol_exclusive::<SimpleNetwork>(*handle) {
+                    let snp = core::mem::ManuallyDrop::new(snp);
                     let _ = snp.start();
                     let _ = snp.initialize(0, 0);
                     let empty_list: &[Option<uefi::Handle>] = &[];
@@ -115,7 +116,11 @@ fn ensure_network_configured() {
     )) {
         log::debug!("TCP4: Found {} IP4Config2 handle(s), checking link state...", ip4_handles.len());
 
-        // Build list of SNP handles with media_present for link detection
+        // Build list of SNP handles with media_present for link detection.
+        // NOTE: ManuallyDrop prevents ScopedProtocol::drop() from calling
+        // CloseProtocol, which panics on some firmware (OnLogic K800 / AMI
+        // Aptio returns NOT_FOUND for protocols opened with GET_PROTOCOL).
+        use core::mem::ManuallyDrop;
         use uefi::proto::network::snp::SimpleNetwork;
         let snp_link_macs = {
             let mut macs_with_link: alloc::vec::Vec<[u8; 6]> = alloc::vec::Vec::new();
@@ -134,6 +139,7 @@ fn ensure_network_configured() {
                         )
                     };
                     if let Ok(snp) = snp_result {
+                        let snp = ManuallyDrop::new(snp);
                         let mode = snp.mode();
                         let mac = &mode.current_address.0[..6];
                         let has_link = mode.media_present_supported.into()
@@ -151,7 +157,8 @@ fn ensure_network_configured() {
         };
 
         for (idx, &h) in ip4_handles.iter().enumerate() {
-            if let Ok(mut ip4cfg) = Ip4Config2::new(h) {
+            if let Ok(ip4cfg) = Ip4Config2::new(h) {
+                let mut ip4cfg = ManuallyDrop::new(ip4cfg);
                 if let Ok(info) = ip4cfg.get_interface_info() {
                     let hw = info.hw_addr.0;
                     let mac6: [u8; 6] = [hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]];
