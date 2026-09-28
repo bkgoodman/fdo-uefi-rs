@@ -32,8 +32,11 @@ EXT_HTTP=192.168.200.30:8080
 
 DELEGATE_NAME=provDelegate
 
+META_HTTP_PORT=9090
+META_HTTP_DIR=/tmp/fdo-meta-hw
+
 usage() {
-    echo "Usage: $0 {di|to2|to2-signed|to2-scope|to2-delegate|to2-delegate-signed|to2-uki|stop|status}"
+    echo "Usage: $0 {di|to2|to2-signed|to2-scope|to2-delegate|to2-delegate-signed|to2-meta|to2-meta-signed|to2-uki|stop|status}"
     echo ""
     echo "  di                   Init fresh DB + start server for DI"
     echo "  to2                  TO2 + unsigned BMO test image (Model 1)"
@@ -41,6 +44,8 @@ usage() {
     echo "  to2-scope            TO2 + signed BMO with scope (not_before/not_after/generation)"
     echo "  to2-delegate         TO2 via delegate with PERM.7, unsigned BMO (Model 2)"
     echo "  to2-delegate-signed  TO2 via delegate, delegate-signed BMO (Model 4)"
+    echo "  to2-meta             TO2 + unsigned meta-payload delivery (mode 2)"
+    echo "  to2-meta-signed      TO2 + signed meta-payload delivery (mode 2, COSE_Sign1)"
     echo "  to2-uki              TO2 + unsigned BMO with full 106MB UKI"
     echo "  stop                 Kill server"
     echo "  status               Show server status and recent log"
@@ -49,6 +54,8 @@ usage() {
 
 stop_server() {
     killall server 2>/dev/null || true
+    # Also stop any meta-payload HTTP server on META_HTTP_PORT
+    fuser -k ${META_HTTP_PORT}/tcp 2>/dev/null || true
     sleep 1
 }
 
@@ -216,6 +223,109 @@ case "${1:-}" in
             -onboardDelegate "$DELEGATE_NAME" \
             -bmo-delegate-provision "$WORKDIR/delegate-chain.pem:$WORKDIR/delegate-key.pem" \
             -bmo "application/x-uefi-image:$TEST_IMAGE" \
+            2>&1 | tee "$WORKDIR/server.log"
+        ;;
+
+    to2-meta)
+        if [ ! -f "$WORKDIR/fdo.db" ]; then
+            echo "ERROR: No database. Run '$0 di' first." >&2
+            exit 1
+        fi
+        stop_server
+        mkdir -p "$META_HTTP_DIR"
+
+        echo "=== Create test image + unsigned meta-payload ==="
+        dd if=/dev/urandom of="$META_HTTP_DIR/test-image.efi" bs=1K count=8 2>/dev/null
+        IMAGE_HASH=$(sha256sum "$META_HTTP_DIR/test-image.efi" | cut -d' ' -f1)
+        IMAGE_URL="http://192.168.200.30:${META_HTTP_PORT}/test-image.efi"
+        echo "Image: 8 KB, SHA256=$IMAGE_HASH"
+        echo "Image URL: $IMAGE_URL"
+
+        "$SERVER" meta create \
+            -mime "application/x-uefi-image" \
+            -url "$IMAGE_URL" \
+            -hash-file "$META_HTTP_DIR/test-image.efi" \
+            -name "hw-meta-test" \
+            -out "$META_HTTP_DIR/meta.cbor"
+        echo "Meta-payload: $(wc -c < "$META_HTTP_DIR/meta.cbor") bytes"
+        META_URL="http://192.168.200.30:${META_HTTP_PORT}/meta.cbor"
+
+        echo "=== Start HTTP server for meta + image ==="
+        cd "$META_HTTP_DIR"
+        python3 -m http.server $META_HTTP_PORT --bind 0.0.0.0 > "$WORKDIR/meta-http.log" 2>&1 &
+        META_PID=$!
+        cd - > /dev/null
+        sleep 1
+        echo "HTTP server: PID $META_PID, port $META_HTTP_PORT"
+
+        echo "=== Starting TO2 server (unsigned meta-URL, mode 2) ==="
+        echo "Meta URL: $META_URL"
+        echo ""
+        echo "On EFI shell:"
+        echo "  fs0:\\EFI\\fdo-uefi.efi"
+        echo ""
+
+        "$SERVER" -debug server -http 0.0.0.0:8080 -db "$WORKDIR/fdo.db" \
+            -ext-http "$EXT_HTTP" \
+            -rv-bypass -reuse-cred -bmo-sign \
+            -bmo-meta-url "$META_URL" \
+            2>&1 | tee "$WORKDIR/server.log"
+        ;;
+
+    to2-meta-signed)
+        if [ ! -f "$WORKDIR/fdo.db" ]; then
+            echo "ERROR: No database. Run '$0 di' first." >&2
+            exit 1
+        fi
+        stop_server
+        mkdir -p "$META_HTTP_DIR"
+
+        echo "=== Create test image + signed meta-payload ==="
+        dd if=/dev/urandom of="$META_HTTP_DIR/test-image.efi" bs=1K count=8 2>/dev/null
+        IMAGE_HASH=$(sha256sum "$META_HTTP_DIR/test-image.efi" | cut -d' ' -f1)
+        IMAGE_URL="http://192.168.200.30:${META_HTTP_PORT}/test-image.efi"
+        echo "Image: 8 KB, SHA256=$IMAGE_HASH"
+        echo "Image URL: $IMAGE_URL"
+
+        # Generate vendor signing key
+        openssl ecparam -name prime256v1 -genkey -noout -out "$WORKDIR/meta-signer.pem" 2>/dev/null
+        echo "Vendor key generated"
+
+        "$SERVER" meta create-signed \
+            -mime "application/x-uefi-image" \
+            -url "$IMAGE_URL" \
+            -hash-file "$META_HTTP_DIR/test-image.efi" \
+            -name "hw-meta-test-signed" \
+            -key "$WORKDIR/meta-signer.pem" \
+            -out "$META_HTTP_DIR/meta.cbor"
+        echo "Signed meta-payload: $(wc -c < "$META_HTTP_DIR/meta.cbor") bytes"
+
+        "$SERVER" meta export-pubkey \
+            -key "$WORKDIR/meta-signer.pem" \
+            -out "$WORKDIR/signer.cbor"
+        echo "COSE_Key exported: $(wc -c < "$WORKDIR/signer.cbor") bytes"
+
+        META_URL="http://192.168.200.30:${META_HTTP_PORT}/meta.cbor"
+
+        echo "=== Start HTTP server for meta + image ==="
+        cd "$META_HTTP_DIR"
+        python3 -m http.server $META_HTTP_PORT --bind 0.0.0.0 > "$WORKDIR/meta-http.log" 2>&1 &
+        META_PID=$!
+        cd - > /dev/null
+        sleep 1
+        echo "HTTP server: PID $META_PID, port $META_HTTP_PORT"
+
+        echo "=== Starting TO2 server (signed meta-URL, mode 2) ==="
+        echo "Meta URL: $META_URL (signed with vendor key)"
+        echo ""
+        echo "On EFI shell:"
+        echo "  fs0:\\EFI\\fdo-uefi.efi"
+        echo ""
+
+        "$SERVER" -debug server -http 0.0.0.0:8080 -db "$WORKDIR/fdo.db" \
+            -ext-http "$EXT_HTTP" \
+            -rv-bypass -reuse-cred -bmo-sign \
+            -bmo-meta-url "$META_URL:$WORKDIR/signer.cbor" \
             2>&1 | tee "$WORKDIR/server.log"
         ;;
 

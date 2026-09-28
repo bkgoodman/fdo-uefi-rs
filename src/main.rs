@@ -30,6 +30,57 @@ use uefi::proto::loaded_image::LoadedImage;
 #[cfg(target_os = "uefi")]
 use fdo_uefi::WATCHDOG_TIMEOUT_SECS;
 
+/// Custom panic handler: warm REBOOT instead of shutdown.
+///
+/// The uefi crate's default panic handler calls `ResetSystem(SHUTDOWN)`,
+/// which powers the machine OFF. On unattended hardware this is fatal —
+/// the watchdog never fires, the machine never comes back. Our handler
+/// prints the panic message, waits ~30 seconds for readability, then
+/// triggers a warm reset so the machine reboots.
+/// The watchdog is already armed (1800s) so even if the busy-wait
+/// misbehaves, the machine will eventually reboot.
+#[cfg(target_os = "uefi")]
+#[panic_handler]
+fn panic_handler(info: &core::panic::PanicInfo) -> ! {
+    // Print panic info to console (same as uefi crate's handler)
+    uefi::println!("[PANIC]: {}", info);
+    uefi::println!("[PANIC]: Warm reboot in ~30 seconds...");
+
+    // Give the user 30 seconds to read the message.
+    // Cannot use boot::stall() here — it may panic if boot services
+    // have exited, causing a double panic.
+    // Use RDTSC + PAUSE for a real delay that the optimizer cannot elide.
+    // On modern x86_64, PAUSE adds ~140 cycles per iteration; with RDTSC
+    // polling we get a real wall-clock wait regardless of CPU frequency.
+    unsafe {
+        // Read initial TSC
+        let start: u64;
+        core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx",
+                         out("rax") start, out("rdx") _, options(nomem, nostack));
+        // Assume ≥1 GHz clock → 1 billion ticks/sec → 30 billion ticks = 30 sec.
+        // On a 3 GHz CPU this is ~10 seconds, still enough to read the message.
+        let target = start.wrapping_add(30_000_000_000);
+        loop {
+            let now: u64;
+            core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx",
+                             out("rax") now, out("rdx") _, options(nomem, nostack));
+            // Handle wrapping: if (now - start) >= (target - start), we're done
+            if now.wrapping_sub(start) >= target.wrapping_sub(start) {
+                break;
+            }
+            core::arch::asm!("pause", options(nomem, nostack));
+        }
+    }
+
+    // WARM REBOOT — not shutdown. The machine comes back.
+    // Runtime services are available even after ExitBootServices.
+    uefi::runtime::reset(
+        uefi::runtime::ResetType::WARM,
+        Status::ABORTED,
+        None,
+    );
+}
+
 #[cfg(target_os = "uefi")]
 /// Parsed command-line options
 struct FdoOptions {

@@ -32,7 +32,12 @@ ecdsa = { version = "0.16", default-features = false, features = ["verifying"], 
 
 # --- UEFI-only dependencies (only needed when targeting UEFI) ---
 [target.'cfg(target_os = "uefi")'.dependencies]
-uefi = { version = "0.38", features = ["logger", "panic_handler", "alloc", "global_allocator"] }
+uefi = { version = "0.38", features = ["logger", "alloc", "global_allocator"] }
+# NOTE: "panic_handler" deliberately removed from uefi features.
+# The uefi crate's built-in panic handler calls ResetSystem(SHUTDOWN),
+# which powers the machine OFF on panic. On unattended hardware this is
+# fatal — the watchdog never fires, the machine doesn't come back.
+# Our custom handler in main.rs does a WARM REBOOT instead.
 uefi-raw = "0.15"  # For HttpMethod::POST access (matches uefi 0.38)
 
 # --- Native test dependencies ---
