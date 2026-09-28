@@ -11,7 +11,7 @@ UEFI dependencies (`uefi`, `uefi-raw`) are target-conditional, and UEFI-specific
 is gated with `#[cfg(target_os = "uefi")]`. This lets `make test` / `cargo test` run
 on native Linux with no QEMU or swtpm.
 
-**188 tests** across 7 modules, ~0.15s:
+**199 tests** across 7 modules, ~0.15s:
 
 | Module | Tests | Key coverage |
 |--------|-------|-------------|
@@ -20,7 +20,7 @@ on native Linux with no QEMU or swtpm.
 | `fdo.rs` | 41 | CBOR encoder/decoder, AES-GCM (wrong key/nonce/AAD/tampered), KDF (128 vs 256), COSE_Encrypt0 (tampered), encrypted message parsing (wrong tag/no tag/missing IV/empty/truncated), SetupDevice parsing, session key derivation |
 | `bmo.rs` | 45 | Full Model 1-4 authorization matrix, delegate-signed x5chain, meta-payload parse (basic/all-fields/missing/garbage/unknown), COSE_Key P-256 parse, signed meta verify (valid/wrong-key/tampered/wrong-AAD/bad-key/not-COSE), unsigned meta passthrough |
 | `voucher.rs` | 20 | OVHeader/PublicKey parse, HMAC (RFC 4231), 0/1/2-entry chains, entry swap/reorder, cross-device injection, wrong domain AAD (v2.0), chain break at entry 1, GUID mismatch |
-| `dns.rs` | 13 | DNS name encoding, query build, response parse (basic/wrong-ID/NXDOMAIN/short/no-QR/CNAME-then-A/multi-question), is_ipv4_address |
+| `dns.rs` | 24 | DNS name encoding/decoding, query build, response parse (basic/wrong-ID/NXDOMAIN/short/no-QR/CNAME-then-A/multi-question), CNAME chasing (extract target, 2-deep chain, 3-deep chain, compressed target, NXDOMAIN), is_ipv4_address |
 | `di/mfginfo.rs` | 1 | DeviceMfgInfo encoding |
 
 See `TODO_TEST.md` for the full test plan and remaining items.
@@ -74,7 +74,7 @@ DNS hostnames are now supported in HTTP URLs (RV lists, meta-payload URLs, etc.)
 - `dns_resolve()` — public API: cache check → UDP4 query → parse → cache store
 - `udp4_dns_query()` — sends/receives DNS via `EFI_UDP4_PROTOCOL`
 
-13 unit tests for DNS packet encoding/decoding (native `cargo test`).
+24 unit tests for DNS packet encoding/decoding and CNAME chasing (native `cargo test`).
 
 QEMU-verified: meta-payload with hostname `fdo-test.local` in image URL —
 device resolved hostname, fetched image, hash VERIFIED, TO2 complete.
@@ -173,8 +173,8 @@ to the ECDH x-coordinate result before passing to KDF.
 - [x] Fix server BMO chunk size check (estimatedSize +5 not +50, was double-counting overhead)
 - [x] Fix client MTU (1300, was 1040 which was too small for BMO chunks)
 - [x] **End-to-end inline BMO verified on OnLogic k800** - payload.efi (51KB) delivered in 51 chunks, chainloaded via LoadImage/StartImage, banner displayed, image-result=success
-- [ ] URL delivery mode (mode 1) - device fetches image from URL
-- [ ] Meta-URL delivery mode with COSE signature verification (mode 2)
+- [x] URL delivery mode (mode 1) - device fetches image from URL (`process_bmo_url_delivery` in `bmo.rs`: HTTP GET + size check + SHA-256 hash verification)
+- [x] Meta-URL delivery mode with COSE signature verification (mode 2) — see "Meta-Payload Delivery" section above
 - [ ] dd image mode - write raw disk image to storage device instead of executing EFI app
 - [ ] dd image mode - Delay write of INITIAL blocks until rest of image is complete (to ihibit boot of incomplete images)
 - [ ] BIOS parameter setting (fdo.bmo:set) - enroll/change BIOS config (e.g. enable Secure Boot, EFI DB keys)
@@ -206,14 +206,15 @@ to the ECDH x-coordinate result before passing to KDF.
 - [x] **Model 1 bug fix** — Unsigned BMO payloads were wrongly rejected when Owner key
   was present ("no signing or delegate authority"). Fixed: Owner-direct channel
   authority (Model 1) now correctly accepts unsigned payloads. (2026-09-23)
-- [ ] **DI: flush TPM transient handles on network error** — If DI fails after
-  `CreatePrimary` (e.g. HTTP send fails), transient handles leak. The next DI
-  attempt gets `TPM_RC_OBJECT_MEMORY` (0x902) and requires a reboot. Fix: add
-  cleanup in the DI error path to flush any transient handles before returning.
-- [ ] **DI: retry on transient failure** — Add a wait-and-retry loop (e.g. 3
-  attempts with a few seconds between) so transient network errors don't
-  require manual reboot and re-run. May be a compile-time option to keep the
-  minimal build small.
+- [x] **DI: flush TPM transient handles on network error** (2026-09-28) — 
+  `tpm_flush_all_transient()` runs at the start of both `run_di_protocol()` and
+  `perform_to2()`, cleaning up leftovers from a previous failed attempt.
+  Additionally, `tpm_create_and_persist_signing_key()` and
+  `tpm_create_hmac_and_persist()` now flush their transient handles on
+  EvictControl/HMAC failure instead of leaking them.
+- [x] **DI: retry on transient failure** (2026-09-28) — Both DI call sites
+  (main.rs and rv_firmware/mod.rs) retry up to 3 times with a 5-second delay.
+  NOT_FOUND (no server URL) exits immediately without retry.
 
 ### RV-Based Firmware Delivery (rv-firmware feature) - E2E VERIFIED 2026-08-25
 - [x] HTTP GET added to dual-stack (tcp4_http.rs + http_api.rs dispatcher)
@@ -321,8 +322,10 @@ tampering and not by having a proxy in the path.
 
 ### Remaining
 
-- [ ] **TPM transient handle cleanup on network error** — if a network error occurs
-  mid-protocol, transient TPM handles may leak. Needs a cleanup/flush path.
+- [x] **TPM transient handle cleanup on network error** (2026-09-28) —
+  `tpm_flush_all_transient()` at the start of both DI and TO2 cleans up
+  leftovers. Internal cleanup in `tpm_create_and_persist_signing_key()` and
+  `tpm_create_hmac_and_persist()` also flush on failure.
 - [ ] **DI wait-and-retry** — if DI fails (e.g. server not ready), retry a few times
   before giving up. Possibly a compile-time option. Preferable to manual reboot.
 - [ ] Delegate support (X.509) — see the BMO section below; currently refused loudly.
