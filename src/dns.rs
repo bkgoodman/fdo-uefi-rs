@@ -510,14 +510,21 @@ pub fn set_dns_server(ip: [u8; 4]) {
 
 /// Try to discover DNS server from Ip4Config2.
 /// Should be called after DHCP completes.
+///
+/// Uses raw protocol access instead of `ScopedProtocol` because some
+/// firmware (OnLogic K800 / AMI Aptio) returns NOT_FOUND from
+/// `CloseProtocol` for Ip4Config2, which triggers a panic in the uefi
+/// crate's `ScopedProtocol::drop()`.
 #[cfg(target_os = "uefi")]
 pub fn discover_dns_server() {
-    use uefi::Identify;
-    use uefi::proto::network::ip4config2::Ip4Config2;
-    use uefi_raw::protocol::network::ip4_config2::Ip4Config2DataType;
+    use core::ffi::c_void;
+    use uefi_raw::protocol::network::ip4_config2::{Ip4Config2DataType, Ip4Config2Protocol};
 
+    let ip4cfg2_guid = Ip4Config2Protocol::GUID;
+
+    // Locate all handles with Ip4Config2
     let handles = match boot::locate_handle_buffer(
-        boot::SearchType::ByProtocol(&Ip4Config2::GUID)
+        boot::SearchType::ByProtocol(&ip4cfg2_guid)
     ) {
         Ok(h) => h,
         Err(_) => {
@@ -526,24 +533,73 @@ pub fn discover_dns_server() {
         }
     };
 
+    let st = match uefi::table::system_table_raw() {
+        Some(st) => st,
+        None => { warn!("DNS: no system table"); return; }
+    };
+
     for handle in handles.iter() {
-        if let Ok(mut ip4cfg) = Ip4Config2::new(*handle) {
-            match ip4cfg.get_data(Ip4Config2DataType::DNS_SERVER) {
-                Ok(data) => {
-                    // Data is an array of EFI_IPv4_ADDRESS (4 bytes each)
-                    if data.len() >= 4 {
-                        let ip = [data[0], data[1], data[2], data[3]];
-                        if ip != [0, 0, 0, 0] {
-                            set_dns_server(ip);
-                            return;
-                        }
-                    }
-                    debug!("DNS: Ip4Config2 returned empty/zero DNS server");
-                }
-                Err(e) => {
-                    debug!("DNS: Ip4Config2 get DNS_SERVER failed: {:?}", e);
+        unsafe {
+            let bs = (*st.as_ptr()).boot_services;
+            let mut proto_ptr: *mut c_void = core::ptr::null_mut();
+
+            // Open protocol with GET_PROTOCOL — raw call, no ScopedProtocol
+            let status = ((*bs).open_protocol)(
+                handle.as_ptr(),
+                &ip4cfg2_guid,
+                &mut proto_ptr,
+                boot::image_handle().as_ptr(),
+                core::ptr::null_mut(), // no controller
+                0x00000002, // EFI_OPEN_PROTOCOL_GET_PROTOCOL
+            );
+            if status != uefi::Status::SUCCESS || proto_ptr.is_null() {
+                debug!("DNS: open Ip4Config2 failed: {:?}", status);
+                continue;
+            }
+
+            let proto = proto_ptr as *mut Ip4Config2Protocol;
+
+            // First call: get buffer size for DNS_SERVER
+            let mut data_size: usize = 0;
+            let status = ((*proto).get_data)(
+                &mut *proto,
+                Ip4Config2DataType::DNS_SERVER,
+                &mut data_size,
+                core::ptr::null_mut(),
+            );
+            if status != uefi::Status::BUFFER_TOO_SMALL || data_size < 4 {
+                debug!("DNS: Ip4Config2 get_data size query: {:?} (size={})", status, data_size);
+                // Close protocol — ignore errors (firmware bug workaround)
+                let _ = ((*bs).close_protocol)(
+                    handle.as_ptr(), &ip4cfg2_guid,
+                    boot::image_handle().as_ptr(), core::ptr::null_mut(),
+                );
+                continue;
+            }
+
+            // Second call: read DNS server data
+            let mut buf = alloc::vec![0u8; data_size];
+            let status = ((*proto).get_data)(
+                &mut *proto,
+                Ip4Config2DataType::DNS_SERVER,
+                &mut data_size,
+                buf.as_mut_ptr() as *mut c_void,
+            );
+
+            // Close protocol — ignore errors (firmware bug workaround)
+            let _ = ((*bs).close_protocol)(
+                handle.as_ptr(), &ip4cfg2_guid,
+                boot::image_handle().as_ptr(), core::ptr::null_mut(),
+            );
+
+            if status == uefi::Status::SUCCESS && buf.len() >= 4 {
+                let ip = [buf[0], buf[1], buf[2], buf[3]];
+                if ip != [0, 0, 0, 0] {
+                    set_dns_server(ip);
+                    return;
                 }
             }
+            debug!("DNS: Ip4Config2 get DNS_SERVER failed: {:?}", status);
         }
     }
     warn!("DNS: Could not discover DNS server from DHCP");
