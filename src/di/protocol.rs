@@ -56,6 +56,11 @@ pub fn run_di_protocol(cli_url: Option<&str>) -> Status {
     info!("  FDO Device Initialization (DI) Protocol");
     info!("===========================================");
     
+    // 0. Flush any leftover transient TPM handles from a previous failed attempt.
+    // Without this, a DI failure after CreatePrimary leaves transient handles
+    // loaded, and the next DI attempt gets TPM_RC_OBJECT_MEMORY (0x902).
+    tpm::tpm_flush_all_transient();
+    
     // 1. Get manufacturing server URL
     let mfg_server_url = match get_di_server_url(cli_url) {
         Some(url) => {

@@ -124,4 +124,4 @@ host). This is the source-of-truth for all code, tools, and where our working
 code and git repos live. Build *here*, and copy any required components to
 other machines we actually run and deliver code, servers, etc.
 
-
+Never commit or push code unless specifically instructed to by user.

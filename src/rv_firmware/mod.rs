@@ -56,19 +56,35 @@ pub fn check_and_deliver() -> DeliveryResult {
     {
         if tpm::tpm_nv_read(0x01D10001).is_none() {
             info!("No DCTPM in TPM — attempting Device Initialization...");
-            match crate::di::run_di_protocol(None) {
-                uefi::Status::SUCCESS => {
-                    info!("DI completed — credentials now in TPM.");
-                    info!("Continuing to firmware delivery check...");
+            const DI_MAX_ATTEMPTS: u32 = 3;
+            const DI_RETRY_DELAY_MS: u64 = 5000;
+            let mut di_ok = false;
+            for attempt in 1..=DI_MAX_ATTEMPTS {
+                if attempt > 1 {
+                    info!("DI retry {}/{} after {}s delay...",
+                          attempt, DI_MAX_ATTEMPTS, DI_RETRY_DELAY_MS / 1000);
+                    uefi::boot::stall(core::time::Duration::from_millis(DI_RETRY_DELAY_MS));
                 }
-                uefi::Status::NOT_FOUND => {
-                    info!("No DI server available — skipping firmware delivery.");
-                    return DeliveryResult::NoUpdate;
+                match crate::di::run_di_protocol(None) {
+                    uefi::Status::SUCCESS => {
+                        info!("DI completed — credentials now in TPM.");
+                        info!("Continuing to firmware delivery check...");
+                        di_ok = true;
+                        break;
+                    }
+                    uefi::Status::NOT_FOUND => {
+                        info!("No DI server available — skipping firmware delivery.");
+                        return DeliveryResult::NoUpdate;
+                    }
+                    status => {
+                        warn!("DI attempt {}/{} failed: {:?}",
+                              attempt, DI_MAX_ATTEMPTS, status);
+                    }
                 }
-                status => {
-                    warn!("DI failed ({:?}) — skipping firmware delivery.", status);
-                    return DeliveryResult::NoUpdate;
-                }
+            }
+            if !di_ok {
+                warn!("DI failed after {} attempts — skipping firmware delivery.", DI_MAX_ATTEMPTS);
+                return DeliveryResult::NoUpdate;
             }
         }
     }

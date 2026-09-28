@@ -1699,6 +1699,11 @@ pub fn perform_to2(
     debug!("Owner URL: {}", owner_url);
     debug!("GUID: {:02x?}", guid);
     
+    // Step 0: Flush any leftover transient TPM handles from a previous failed TO2.
+    // Without this, a TO2 failure after tpm_create_ecdh_key() leaves transient
+    // handles loaded, and the next attempt may get TPM_RC_OBJECT_MEMORY (0x902).
+    tpm::tpm_flush_all_transient();
+    
     // Step 1: HelloDeviceProbe -> HelloDeviceAck20
     let (ack, session_token, hello_ack_raw) = perform_to2_hello(owner_url, guid)?;
     

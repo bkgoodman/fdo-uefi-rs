@@ -428,17 +428,34 @@ fn main() -> Status {
                     info!("No credentials found in TPM.");
                     info!("Attempting Device Initialization (DI)...");
                     
-                    match fdo_uefi::di::run_di_protocol(opts.di_url.as_deref()) {
-                        Status::SUCCESS => {
-                            info!("Device Initialization completed successfully.");
-                            info!("Reboot required to proceed with onboarding.");
+                    const DI_MAX_ATTEMPTS: u32 = 3;
+                    const DI_RETRY_DELAY_MS: u64 = 5000;
+                    let mut di_ok = false;
+                    for attempt in 1..=DI_MAX_ATTEMPTS {
+                        if attempt > 1 {
+                            info!("DI retry {}/{} after {}s delay...",
+                                  attempt, DI_MAX_ATTEMPTS, DI_RETRY_DELAY_MS / 1000);
+                            boot::stall(core::time::Duration::from_millis(DI_RETRY_DELAY_MS));
                         }
-                        Status::NOT_FOUND => {
-                            info!("No manufacturing server available. Exiting.");
+                        match fdo_uefi::di::run_di_protocol(opts.di_url.as_deref()) {
+                            Status::SUCCESS => {
+                                info!("Device Initialization completed successfully.");
+                                info!("Reboot required to proceed with onboarding.");
+                                di_ok = true;
+                                break;
+                            }
+                            Status::NOT_FOUND => {
+                                info!("No manufacturing server available. Exiting.");
+                                break; // No point retrying — no server URL
+                            }
+                            status => {
+                                warn!("DI attempt {}/{} failed: {:?}",
+                                      attempt, DI_MAX_ATTEMPTS, status);
+                            }
                         }
-                        status => {
-                            info!("Device Initialization failed: {:?}", status);
-                        }
+                    }
+                    if !di_ok {
+                        info!("Device Initialization failed after {} attempts.", DI_MAX_ATTEMPTS);
                     }
                 }
                 #[cfg(not(feature = "di"))]

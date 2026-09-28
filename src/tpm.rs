@@ -1897,6 +1897,13 @@ pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmS
     
     if !persisted {
         warn!("TPM: Failed to persist signing key at 0x{:08x}", persistent_handle);
+        // Flush the transient handle to avoid leaking TPM object slots.
+        // Without this, subsequent CreatePrimary calls may fail with
+        // TPM_RC_OBJECT_MEMORY (0x902).
+        let flush_cmd = build_flush_context_cmd(transient_handle);
+        let mut flush_resp = vec![0u8; 32];
+        let _ = tcg.submit_command(&flush_cmd, &mut flush_resp);
+        debug!("TPM: Flushed leaked transient 0x{:08x} after persist failure", transient_handle);
         return None;
     }
     
@@ -2080,6 +2087,11 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
         Some(v) => v,
         None => {
             warn!("TPM2_HMAC failed after all retries");
+            // Flush the transient HMAC key handle to avoid leaking TPM object slots.
+            let flush_cmd = build_flush_context_cmd(hmac_handle);
+            let mut flush_resp = vec![0u8; 32];
+            let _ = tcg.submit_command(&flush_cmd, &mut flush_resp);
+            debug!("TPM: Flushed leaked transient 0x{:08x} after HMAC failure", hmac_handle);
             return None;
         }
     };
@@ -2112,6 +2124,11 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
     
     if !persisted {
         warn!("TPM: Failed to persist HMAC key at 0x{:08x}", persistent_handle);
+        // Flush the transient handle to avoid leaking TPM object slots.
+        let flush_cmd = build_flush_context_cmd(hmac_handle);
+        let mut flush_resp = vec![0u8; 32];
+        let _ = tcg.submit_command(&flush_cmd, &mut flush_resp);
+        debug!("TPM: Flushed leaked transient 0x{:08x} after HMAC persist failure", hmac_handle);
         // Still return the HMAC value - DI can continue, just key won't be persistent
     } else {
         debug!("TPM: HMAC key persisted at 0x{:08x}", persistent_handle);
