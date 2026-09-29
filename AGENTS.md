@@ -43,7 +43,7 @@ went unnoticed through multiple "FULLY TESTED" sign-offs.
 
 About commands such as `apt` and others which require user-interaction as they may hang agent work.
 
-## Native Unit Tests (199 tests)
+## Native Unit Tests (225 tests)
 
 ```bash
 make test          # Runs cargo test on native Linux (no UEFI, no QEMU, ~0.15s)
@@ -58,13 +58,17 @@ Tests cover:
 - **COSE** (49): Sign1 parse/verify, ES256 +/-, domain AAD (v101 vs v200,
   cross-tag), scope (GUID/combined/fail-closed), BMO signed verify, delegate
   PERM.7 check, malformed inputs
-- **Delegate** (19): 1/2/3-cert chains, permission inheritance, self-signed
-  rejection, all 5 OID flags
+- **Delegate** (24): 1/2/3-cert chains, permission inheritance, self-signed
+  rejection, all 5 OID flags, BasicConstraints CA requirement, pathLen,
+  chain-length cap, structural SPKI/OID parsing, EKU malformed-element
+  termination
 - **FDO** (41): CBOR encoder/decoder, AES-GCM (wrong key/nonce/AAD/tampered),
   KDF, COSE_Encrypt0, encrypted message parsing, SetupDevice parsing, session
   key derivation
-- **BMO** (27): Image-begin parse, result/ack/set builders, full Model 1-4
-  authorization matrix, delegate-signed x5chain
+- **BMO** (39): Image-begin parse, result/ack/set builders, full Model 1-4
+  authorization matrix, delegate-signed x5chain, image hash policy for all
+  three delivery modes (`inline_hash_decision` / `url_hash_decision` /
+  `meta_hash_decision` — a missing hash is fatal, never a warning)
 - **Voucher** (20): OVHeader/PublicKey parse, HMAC (RFC 4231), 0/1/2-entry
   chains, entry swap/reorder, cross-device entry injection, wrong domain AAD,
   chain break at arbitrary index
@@ -76,11 +80,57 @@ See `TODO_TEST.md` for the full test plan and remaining items.
 
 Put `#[cfg(test)] mod tests { ... }` at the bottom of the module.
 
+### Security-relevant invariants (do not regress)
+
+These are enforced by tests and were each a real finding — see the
+"Security Audit — 2026-09-29" section at the top of `TODO.md`:
+
+- **A BMO image is never chainloaded without an authenticated hash covering
+  it.** A missing hash is a hard refusal, not a warning, in all three
+  delivery modes. Signed (Model 3/4) `image-begin` MUST carry key `-9`.
+- **Certificate chains are structurally validated**, not just
+  signature-checked: BasicConstraints `cA` on every issuer, `pathLen`,
+  a chain-length cap, and `ecdsa-with-SHA256` bound in both AlgorithmIdentifiers.
+- **Certificate validity dates are deliberately NOT enforced** (no trusted
+  clock). Do not "fix" this without a clock policy — see TODO.md H3c.
+- **Public keys are parsed from SPKI structurally with OID checks**, never
+  located by scanning for a byte pattern.
+- **DER/CBOR loops must always advance.** `read_oid` does not advance `pos`
+  on a non-OID element; any loop calling it needs an explicit skip.
+- **TO2 echoed nonces are compared, not just logged.** `ProveOVHdr20` and
+  `DoneAck20` both echo `HelloDeviceAck20`'s nonce; `verify_nonce_echo()`
+  aborts on mismatch. The `ProveOVHdr20` check must stay *after* the COSE
+  signature check.
+- **`sugar` in HelloDeviceProbe must come from the TPM RNG**, never a
+  constant — the owner folds it into `HashPrev`.
+
+**Rule: a security check inside `#[cfg(target_os = "uefi")]` code must have
+its decision logic in a pure function that the UEFI code *calls*.** Do not
+copy the logic into the UEFI path — a duplicated-but-tested version means
+the tested implementation is not the shipped one. This happened with
+`check_bmo_authorization` (2026-09-29) and was only found by auditing test
+coverage rather than the code.
+
+### What `make test` cannot cover
+
+`make test` is `cargo test`. It cannot reach:
+
+- Anything `#[cfg(target_os = "uefi")]` — TPM calls, the network stack, and
+  the `process_bmo_*` delivery paths. Their *decision logic* is pure and
+  tested; that it is wired in and reached is only proven by QEMU.
+- The pe2 shell scripts (`~/bkgvm/*.sh`) — different language, different
+  machine, no automated check of any kind today.
+
+So a green `make test` is necessary, not sufficient. Run the QEMU scripts
+before claiming a protocol change works.
+
 Test helpers (all `#[cfg(test)]`):
 - `cose.rs`: `gen_test_keypair()`, `gen_test_keypair_b()`,
   `build_test_cose_sign1()`, `build_test_protected_header()`, `domain_aad()`,
   `encode_bstr()`, `encode_tstr()`
-- `delegate.rs`: `build_test_cert()`, OID constants (`pub(crate)`)
+- `delegate.rs`: `build_test_cert()` (end-entity, no CA bit),
+  `build_test_ca_cert()` (issuer positions — needed for any multi-cert
+  chain), OID constants (`pub(crate)`)
 - `voucher.rs`: `build_test_ov_header()`, `build_test_fdo_public_key()`,
   `build_ov_entry_payload()`, `hmac_sha256()` (pub)
 - `bmo.rs`: `check_bmo_authorization()`, `parse_meta_payload()`,

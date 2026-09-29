@@ -137,9 +137,16 @@ pub fn parse_fdo_public_key(data: &[u8]) -> Result<Vec<u8>, VoucherError> {
             // third element of [pkType, pkEnc, pkBody] is a CBOR array of
             // cert bstrs embedded directly — NOT a bstr wrapping a CBOR
             // array. We read from `data` at the current `pos`.
-            let leaf_der = x5chain_leaf_der(&data[pos..])?;
-            debug!("Voucher: X5CHAIN leaf cert: {} bytes DER", leaf_der.len());
-            spki_p256_point(leaf_der)
+            //
+            // The whole chain is validated, not just the leaf: every
+            // certificate must be signed by the one above it. Previously
+            // only the leaf was read and the remaining certificates were
+            // discarded unexamined, which made the chain purely decorative.
+            let chain = x5chain_certs(&data[pos..])?;
+            debug!("Voucher: X5CHAIN with {} certificate(s)", chain.len());
+            let refs: Vec<&[u8]> = chain.iter().map(|c| c.as_slice()).collect();
+            crate::delegate::verify_x5chain_internal(&refs)
+                .ok_or(VoucherError::UnsupportedKey("X5CHAIN validation failed"))
         }
         PK_ENC_CRYPTO => {
             error!("Voucher: pkEnc=Crypto is not implemented");
@@ -154,46 +161,34 @@ pub fn parse_fdo_public_key(data: &[u8]) -> Result<Vec<u8>, VoucherError> {
 
 /// Extract the uncompressed point from a P-256 `SubjectPublicKeyInfo` DER.
 ///
-/// Rather than hardcode an offset, locate the BIT STRING that holds the key:
-/// `03 42 00 04` — BIT STRING, length 0x42 (66 = 1 unused-bits octet + 65
-/// point octets), 0 unused bits, then the 0x04 uncompressed-point marker.
+/// Delegates to the structural SPKI parser, which walks
+/// `SEQUENCE { AlgorithmIdentifier, BIT STRING }` and checks the
+/// `id-ecPublicKey` / `prime256v1` OIDs. This used to scan for the byte
+/// pattern `03 42 00 04` and take the following 65 bytes, which checked no
+/// OIDs and — when handed a whole certificate rather than an SPKI — could
+/// match inside a name, an extension, or the signature instead of the key.
 fn spki_p256_point(der: &[u8]) -> Result<Vec<u8>, VoucherError> {
-    const PATTERN: [u8; 4] = [0x03, 0x42, 0x00, 0x04];
-    if der.len() < 65 {
-        return Err(VoucherError::UnsupportedKey("SPKI too short"));
-    }
-    for i in 0..der.len().saturating_sub(PATTERN.len() - 1) {
-        if der[i..i + 4] == PATTERN {
-            let start = i + 3; // at the 0x04 marker
-            let point = der
-                .get(start..start + 65)
-                .ok_or(VoucherError::UnsupportedKey("SPKI BIT STRING truncated"))?;
-            return Ok(point.to_vec());
-        }
-    }
-    error!("Voucher: no uncompressed P-256 BIT STRING found in SPKI ({} bytes)", der.len());
-    Err(VoucherError::UnsupportedKey("SPKI not P-256 uncompressed"))
+    crate::delegate::parse_spki_p256_point(der)
+        .ok_or(VoucherError::UnsupportedKey("not a valid P-256 SubjectPublicKeyInfo"))
 }
 
-/// Extract the leaf (first) certificate DER from an X5CHAIN pkBody.
+/// Extract every certificate DER from an X5CHAIN pkBody, leaf first.
 ///
 /// The wire format is a CBOR array of bstrs: `[leaf_cert_der, *issuer_der]`.
-/// We only need the leaf to extract the public key; chain validation (if
-/// needed) is a separate concern.
-fn x5chain_leaf_der(cbor: &[u8]) -> Result<&[u8], VoucherError> {
+/// Some implementations encode a single certificate as a bare bstr.
+fn x5chain_certs(cbor: &[u8]) -> Result<Vec<Vec<u8>>, VoucherError> {
     use crate::cose;
     let mut pos = 0usize;
     let b = *cbor.get(pos).ok_or(VoucherError::UnsupportedKey("X5CHAIN empty"))?;
     pos += 1;
     let major = b >> 5;
     if major != 4 {
-        // Not an array — some implementations encode a single cert as a bare
-        // bstr (no wrapping array). Try that.
+        // Not an array — single cert as a bare bstr.
         if major == 2 {
             pos = 0;
             let der = cose::cbor_read_bstr(cbor, &mut pos)
                 .ok_or(VoucherError::UnsupportedKey("X5CHAIN bare bstr unreadable"))?;
-            return Ok(der);
+            return Ok(alloc::vec![der.to_vec()]);
         }
         return Err(VoucherError::UnsupportedKey("X5CHAIN pkBody is not array or bstr"));
     }
@@ -202,10 +197,16 @@ fn x5chain_leaf_der(cbor: &[u8]) -> Result<&[u8], VoucherError> {
     if arr_len == 0 {
         return Err(VoucherError::UnsupportedKey("X5CHAIN empty certificate array"));
     }
-    // Read the first (leaf) certificate bstr
-    let leaf = cose::cbor_read_bstr(cbor, &mut pos)
-        .ok_or(VoucherError::UnsupportedKey("X5CHAIN leaf cert not a bstr"))?;
-    Ok(leaf)
+    if arr_len > crate::delegate::MAX_DELEGATE_CHAIN_LEN {
+        return Err(VoucherError::UnsupportedKey("X5CHAIN too long"));
+    }
+    let mut certs = Vec::with_capacity(arr_len);
+    for _ in 0..arr_len {
+        let der = cose::cbor_read_bstr(cbor, &mut pos)
+            .ok_or(VoucherError::UnsupportedKey("X5CHAIN cert is not a bstr"))?;
+        certs.push(der.to_vec());
+    }
+    Ok(certs)
 }
 
 /// Extract X/Y from a COSE_Key map (`-2` => x, `-3` => y) and build a point.

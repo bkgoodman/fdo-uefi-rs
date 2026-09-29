@@ -4,6 +4,459 @@
 
 # TODO - FDO UEFI Client
 
+# Security Audit — 2026-09-29
+
+Full-sweep review of the trust chain: every signature, hash, and certificate
+relationship, asking in each case "is this actually *checked*, or only parsed?"
+Scope: `cose.rs`, `voucher.rs`, `delegate.rs`, `bmo.rs`, `fdo.rs`,
+`rv_firmware/*`, `tpm.rs`, `chainload.rs`, `main.rs`, `di/protocol.rs`.
+
+Native test count went 199 → 217; all new tests are negative tests that failed
+(i.e. the bad input was accepted) before the corresponding fix.
+
+## Status summary
+
+| # | Finding | Severity | Status |
+|---|---------|----------|--------|
+| H1 | BMO image hash was optional in all three delivery modes | High | **FIXED** |
+| H2 | Infinite loop parsing a malformed EKU extension | High | **FIXED** |
+| H3a | No BasicConstraints / pathLen / chain-length limit on delegate chains | High | **FIXED** |
+| H3b | Certificate signature algorithm never checked | High | **FIXED** |
+| H3c | Certificate validity dates never checked | High | **WON'T FIX** (no trusted clock) |
+| M1a | TO2 `sugar` was a hardcoded constant | Medium | **FIXED** |
+| M1b | `ProveOVHdr20` / `DoneAck20` echoed nonces never compared | Medium | **FIXED** |
+| M1c | `HelloDeviceAck20.hash_prev` never compared | Medium | **BLOCKED UPSTREAM** |
+| M2 | Device ECDH key is static across sessions | Medium | **WON'T FIX** (TPM template constraints) |
+| M3 | to1d check is skippable and unbound to the endpoint | Medium | **ACCEPTED** (DoS only) |
+| M4 | DCTPM and rollback counter in unlocked TPM NV | Medium | **ACCEPTED** (physical-access equivalent) |
+| M5 | Public keys extracted by byte-pattern scan; X5CHAIN unvalidated | Medium | **FIXED** |
+| M6 | Two independent COSE parsers over the same buffer | Medium | **OPEN** (debt) |
+| L1-L8 | Assorted | Low | **OPEN** (see below) |
+
+## Fixed
+
+### H1 — Nothing required the signature to cover the bytes we execute
+
+Hash verification was optional in every BMO delivery mode; all three paths
+warned and chainloaded anyway when the hash field was absent. A signed
+`image-begin` (Model 3/4) therefore authorised *metadata*, not content —
+omit key `-9` and the signature bought nothing. Worse, meta-URL mode never
+consulted `begin.expected_hash` at all, and `meta_signer` (key `-10`) was
+optional, so an owner-signed `image-begin` with `delivery_mode=2` and no
+`-10` authorised a bare URL that any on-path attacker could answer.
+
+Policy is now fail-closed and lives in three pure, unit-tested functions in
+`bmo.rs`: `inline_hash_decision`, `url_hash_decision`, `meta_hash_decision`.
+`BmoSession.authority` (`BmoAuthority::Artifact|Channel|Unauthenticated`) is
+recorded at `image-begin` and drives them.
+
+| Mode | Rule |
+|------|------|
+| 0 inline | Artifact authority MUST have key `-9`. Channel authority may use the `image-end` hash (it arrives inside the Owner-bound session). No hash at all is always refused. |
+| 1 URL | Key `-9` mandatory, at every authority level — the image is fetched outside the authenticated channel. |
+| 2 meta-URL | Either a signed meta-payload (`-10`) or key `-9`. When both are present both hashes are enforced, so a signed meta-payload cannot redirect to content `image-begin` did not authorise. The hash-requirement decision is made *before* the image is downloaded. |
+
+12 new negative tests in `bmo.rs`.
+
+### H2 — Infinite loop on an attacker-supplied certificate
+
+`check_eku_oids` looped `while pos < seq_end` calling `read_oid`, which
+returns `None` *without advancing `pos`* when the element is not an OID. An
+EKU `SEQUENCE` containing any non-OID element spun forever. Confirmed by
+execution before the fix (`cargo test` hit the 25s timeout, exit 124), not
+just by inspection.
+
+Reachable from COSE **unprotected** headers — ProveOVHdr label 258 and BMO
+x5chain label 33 — i.e. data with no signature over it, parsed before any
+signature check runs. On UEFI the watchdog turns this into a reboot loop.
+
+Fixed by skipping non-OID elements via `skip_der_element`, which guarantees
+forward progress. Test: `test_eku_non_oid_element_terminates`, which also
+asserts an OID *following* a non-OID element is still found.
+
+### H3a / H3b — Delegate chains were signature-checked and nothing else
+
+`verify_delegate_chain` verified signatures but imposed no structural
+constraints. Added:
+
+- **BasicConstraints `cA`** required on every certificate used as an issuer.
+  Without it, any delegate holding PERM.7 could mint sub-delegates without
+  limit and pass its own permissions on indefinitely. A single end-entity
+  certificate issued directly by the Owner still needs no CA bit.
+- **`pathLenConstraint`** honoured where present.
+- **`MAX_DELEGATE_CHAIN_LEN = 8`** — the chain is unauthenticated input, so
+  the peer must not choose how much work the device does.
+- **Signature algorithm** must be `ecdsa-with-SHA256`, and the outer
+  `signatureAlgorithm` must equal `tbsCertificate.signature` (RFC 5280
+  4.1.1.2). Previously both were skipped and ES256 was simply assumed.
+
+Tests: `test_non_ca_issuer_rejected` (with a CA-issuer control proving the
+rejection is attributable to the CA bit), `test_single_leaf_needs_no_ca_bit`,
+`test_path_len_constraint_enforced`, `test_chain_length_cap`.
+
+Note: `build_test_cert` still builds a non-CA end-entity certificate;
+`build_test_ca_cert` is the new helper for issuer positions.
+
+### M5 — Keys came from a byte-pattern scan; X5CHAIN was decorative
+
+`voucher::spki_p256_point` and `delegate::extract_p256_point` located the
+public key by scanning for the bytes `03 42 00 04` and taking the next 65
+octets. No structure, no `id-ecPublicKey`/`prime256v1` OID check. For
+`PK_ENC_X5CHAIN` the scan ran over the **whole certificate**, so the first
+match anywhere — an extension, a subject attribute, the signature — won over
+the real SPKI.
+
+Replaced with `delegate::parse_spki_p256_point`, which walks
+`SEQUENCE { AlgorithmIdentifier, BIT STRING }` and checks both OIDs.
+`voucher.rs` now calls it.
+
+Separately, an X5CHAIN in a voucher `PublicKey` took the leaf key and
+discarded the rest of the chain unexamined. New
+`delegate::verify_x5chain_internal` requires every certificate to be signed
+by the one above it (plus CA bit and pathLen), so the chain structure means
+something. The topmost certificate has no issuer in the chain and is anchored
+externally — for a voucher, by the OVEntry signature over the key itself.
+
+Test: `test_spki_requires_correct_oids`, including a buffer that merely
+*contains* the old pattern with no valid SPKI around it.
+
+### M1a / M1b — TO2 freshness: random sugar, and nonce echoes actually compared
+
+Verified against the go-fdo server and reference client before changing
+anything, since these are hard aborts and a wrong guess breaks interop on a
+correct server.
+
+**`sugar` (`fdo.rs`, `perform_to2_hello`).** Was the fixed constant
+`[0xaa; 16]` with `// TODO: use real random` still on the line. It is not an
+echoed nonce — the owner folds the entire `HelloDeviceProbe` into
+`HelloDeviceAck20.HashPrev` (`to2_server_v200.go:60-80`), so sugar is the
+device's contribution of freshness to the TO2 message chain and has to be
+unpredictable. go-fdo's own client uses `rand.Read`
+(`to2_client_v200.go:199`). Now drawn from `tpm_get_random(16)`, and TO2
+aborts if the TPM cannot supply it.
+
+**Echoed nonces.** Both `ProveOVHdr20.NonceTO2ProveOV`
+(`to2_server_v200.go:224`) and `DoneAck20.NonceTO2ProveOV`
+(`to2_server_v200.go:412`) are the owner echoing the
+`NonceTO2ProveDVPrep` it issued in `HelloDeviceAck20` and that we returned in
+`ProveDevice20`. The reference client aborts on a mismatch in both places
+(`to2_client_v200.go:402` and `:725`); this client compared neither — it
+parsed them into structs and `debug!`-logged them, which reads as "handled".
+
+Added `verify_nonce_echo()` and called it at both sites. Two placement
+details that matter:
+
+- The `ProveOVHdr20` check runs **after** the COSE signature check, matching
+  the reference ordering. Comparing a nonce on unauthenticated bytes proves
+  nothing, and answering it earlier hands an attacker a pre-auth oracle.
+- The `DoneAck20` check runs immediately after decryption and before the
+  chainload, which is the last point at which we can notice we finished
+  against a different session than we started.
+
+4 native tests (`test_nonce_echo_*`), including all-zero and first-byte
+differences — the all-zero case is the shape a truncated nonce actually
+takes, because `parse_prove_ov_hdr_payload` leaves the array zeroed when the
+bstr is shorter than 16 bytes.
+
+## Won't fix / accepted — with reasoning
+
+### H3c — Certificate validity dates (`notBefore`/`notAfter`)
+
+**Deliberately not enforced.** We do not have a strong belief in the
+correctness or security of the real-time clock on these platforms right now.
+A validity check driven by an untrusted clock is worse than no check: a wrong
+RTC turns into either a permissive accept or an unbootable device, and the
+failure mode is not chosen by us. The same reasoning already applies to
+`not_before`/`not_after` in `fdo.bmo.scope` (parsed and logged, not enforced).
+
+Documented in the `verify_delegate_chain` doc comment so it cannot be
+mistaken for an oversight.
+
+**Consequence to be aware of: delegate expiry is not a usable revocation
+mechanism today.** Revoking a delegate means rotating the Owner key or not
+issuing the delegate in the first place.
+
+Revisit if/when the "Clock policy" item below lands (trustworthy-clock
+classification + monotonic high-water mark in TPM NV).
+
+### M2 — Static device ECDH key
+
+`tpm_create_ecdh_key` uses `CreatePrimary` with a fixed template and empty
+`inSensitive`, which is deterministic — the same key every boot. The TO2 code
+*relies* on this to recreate the key after flushing it for the DAK signature
+(`fdo.rs`, "CreatePrimary with the same template is deterministic").
+
+So `ECDH_x` is constant for any given (device, owner-xB) pair, and all
+per-session freshness comes from `xA.Rand`/`xB.Rand`, both sent in clear.
+There is no forward secrecy: anyone who ever learns `ECDH_x` for a given xB
+can derive every future session key that reuses it.
+
+**Not fixing now.** The obvious remedy — feeding random `unique` data into the
+template, or using `Create` under a persistent parent instead of
+`CreatePrimary` — is exactly the kind of non-standard template that has given
+us trouble on some systems' key creation. Not worth destabilising key creation
+across the hardware fleet for a property that mainly matters against an
+attacker who has already compromised an owner session.
+
+If revisited: the fix is to stop recreating the key by determinism and instead
+keep the transient handle alive (or save/load its context) across the DAK
+signature, which removes the reason the template has to be deterministic.
+
+### M3 — to1d is skippable and unbound to the endpoint
+
+Reviewed and **accepted**. The observation was that (a) if TO1 fails, TO2
+proceeds with only a warning, and (b) TO2 connects to the RV URL, never to the
+`RVTO2Addr` inside the verified to1d.
+
+There is no way to verify the to1d signature before ownership has been
+established — the Owner key that signs to1d only becomes known after the
+voucher walk in TO2 Step 3b. Checking it "early" is not possible even in
+principle, so deferring it to late TO2 is correct, and a peer that suppresses
+TO1 gains nothing: ProveOVHdr still authenticates it against the voucher-derived
+Owner key before any ServiceInfo is processed.
+
+The residual exposure is a **denial of service** by someone who controls the RV
+server — they can point the device at a dead endpoint or suppress the redirect.
+They cannot get an unauthenticated image onto the device. Accepted as such.
+
+### M4 — DCTPM and the rollback counter live in unlocked TPM NV
+
+Both NV indices are defined with `OWNERWRITE | OWNERREAD`, empty auth policy,
+empty owner auth, no `TPMA_NV_WRITE_LOCKED`, and the rollback counter is an
+ordinary index rather than `TPMA_NV_COUNTER` — so it can be rewound with a
+single `NV_Write`, and DCTPM (which names `DeviceKeyHandle` and
+`HMACKeyHandle`) can be rewritten.
+
+Reviewed and **accepted for now**, because the adversary this requires is
+essentially the adversary who can re-DI the device: anyone able to write TPM NV
+can also just run DI again and re-provision from scratch. Rewriting DCTPM to
+name an attacker-controlled HMAC key would let them forge an OVHeader HMAC and
+hence a voucher — but the result is a device onboarding to an attacker who
+already had the ability to fully re-provision it.
+
+Open question recorded for later, not resolved: **what are we actually
+securing here?** If the device holds the correct DAK, we know it is the
+manufactured system. What does detecting a modified DCTPM add on top of that?
+The candidate mechanism would be putting a TPM quote of the relevant NV/PCR
+state into the Ownership Voucher at DI time and re-quoting at onboarding to
+prove nothing was tampered with — but that is only worth building once we can
+state the threat it closes. Left as a design question.
+
+Cheap partial mitigations if we do act: set `TPMA_NV_WRITE_LOCKED` on DCTPM
+after DI, and make 0x01D10002 a real `TPMA_NV_COUNTER`. The counter one is
+worth doing on its own merits — `TODO.md` already states the rule ("a counter
+that can be rewound fails permissively, worse than not implementing it") for
+BMO `generation`, and the precedent it points at has exactly that defect.
+
+## Open
+
+### M1c — `HashPrev` / `HashPrev2` are computed by both sides and checked by neither
+
+**Blocked upstream, not by us.** Investigated while fixing M1a/M1b.
+
+The FDO 2.0 message-chaining hashes exist on the wire in both directions:
+the owner sends `HelloDeviceAck20.HashPrev` and the device sends
+`ProveDevice20.HashPrev2`. Neither is verified by anyone. All references in
+go-fdo:
+
+```
+to2_server_v200.go:91    HashPrev:  probeHash      <- set
+to2_client_v200.go:326   HashPrev2: ackHash        <- set
+to2_messages_v200.go:40  HashPrev  protocol.Hash   <- declared
+to2_messages_v200.go:50  HashPrev2 protocol.Hash   <- declared
+```
+
+That is the complete list: no comparison anywhere, server or client.
+
+Worse, `HashPrev` cannot currently be reproduced by a non-Go client. The
+server computes it as
+`H(cbor(probe) || cbor(ownerPubKey))` (`to2_server_v200.go:60-80`), where
+`ownerPubKey` comes from `Voucher.OwnerPublicKey()` — which returns a
+`crypto.PublicKey`, i.e. a Go `*ecdsa.PublicKey` (`voucher.go:189-194`). So
+the second half of the digest is the CBOR encoding of a **Go struct layout**,
+not of the FDO `protocol.PublicKey` wire structure. There is no
+specification-defined byte string for us to recompute.
+
+Implementing a hard abort against that would be a unilateral interop risk
+with no counterpart check on the other side, so it is deliberately not done.
+
+Secondary blocker even if the encoding were fixed: the device has no Owner
+key until the voucher walk completes in TO2 Step 3b, so any `HashPrev` check
+has to be deferred to that point — the same ordering constraint as the to1d
+check (M3).
+
+- [ ] Raise upstream in go-fdo: either define `HashPrev` over the FDO
+      `protocol.PublicKey` encoding (or drop the key from the digest
+      entirely), and verify it client-side
+- [ ] Once the encoding is specified: capture the Owner `PublicKey`'s raw
+      CBOR span during the voucher walk (same technique as
+      `prove_ov.hmac_raw`, which exists precisely because re-serialising is
+      not byte-safe) and compare `HashPrev` after Step 3b
+- [ ] `ProveDevice20.HashPrev2` is ours to send and we already send it; no
+      change needed until the server checks it
+
+Note the residual effect of leaving this open is small now that M1a/M1b are
+fixed: the device contributes freshness via random `sugar` and enforces the
+owner's nonce echo in two places. Combined with M2 (static ECDH key), session
+binding still rests on `xA.Rand`/`xB.Rand` plus those nonce checks.
+
+### M6 — Two independent COSE parsers over the same buffer
+
+`extract_cose_payload` (`fdo.rs:994`) produces what the code *acts on* —
+OVHeader, HMAC, xB. `cose::parse_cose_sign1` (`cose.rs:79`) produces what gets
+*signature-checked*. Same bytes, two independently written CBOR layers, and
+they already differ: `CborDecoder::decode_additional` accepts 8-byte lengths
+(additional=27) while `cose::cbor_read_uint_arg` rejects them, and
+`CborDecoder::skip_value` advances `pos` past `data.len()` unbounded
+(`fdo.rs:617-620`).
+
+**Assessed severity of the unbounded `pos`: low.** Rust bounds-checks the
+slice, so it is a panic → warm reboot, not memory corruption. Same class as
+H2, no code execution.
+
+The reason to fix is not that panic, it is the shape: verify-then-use running
+off two different parses is the classic setup for a signature bypass, where
+the signature validates over one interpretation and the code acts on another.
+No working divergence has been constructed.
+
+- [ ] Have TO2 Step 3b parse `ProveOVHdr` once via `cose::parse_cose_sign1`
+      and take the payload from that same `CoseSign1`, deleting
+      `extract_cose_payload`
+- [ ] Bounds-check `CborDecoder::skip_value`'s `pos += len`
+
+### Low
+
+| # | Finding | Location |
+|---|---------|----------|
+| L1 | `verify_bmo_signed` calls `verify_es256` directly and never checks `s1.algorithm`, unlike `verify_sign1` | `cose.rs:285,294` |
+| L2 | rv-firmware's COSE parser only *warns* on a wrong CBOR tag and proceeds | `rv_firmware/cose_verify.rs:197` |
+| L3 | Signed firmware's `platform_type` is parsed but never checked; only `architecture` is | `rv_firmware/cose_verify.rs:104` |
+| L4 | `num_ov_entries = dec.read_uint()? as u8` truncates; 256 → 0 skips the entry chain and falls back to the manufacturer key | `fdo.rs:1041` |
+| L5 | `evaluate_bmo_scope` parses unauthenticated input *before* signature verification | `cose.rs:242` |
+| L6 | Unknown critical X.509 extensions are ignored | `delegate.rs` extension loop |
+| L7 | Static IP fallback `192.168.200.26/24` still in the TCP4 path | `tcp4_http.rs:42` |
+| L8 | DI accepts the OVHeader — manufacturer key, GUID, RV info — with no authentication, over plain HTTP, from a server found by well-known DNS name (`fdo-mfg`). Everything above roots in this. Inherent to FDO DI, but it is the widest assumption in the system and is not stated as a requirement anywhere in code | `di/protocol.rs:54-160`, `main.rs:111-114` |
+
+## Bench-test coverage of the audit fixes (`make test`, no QEMU, no hardware)
+
+Audited 2026-09-29 by asking, for each fix, "would `make test` catch a
+regression here?" — then proving it by mutation rather than assuming.
+
+### Covered, and verified non-vacuous
+
+Each of these was confirmed by reverting the fix in place and watching the
+test go red:
+
+| Mutation applied | Test that caught it |
+|---|---|
+| `SignedOk => BmoAuthority::Channel` (downgrade signed artifacts) | `test_auth_result_maps_to_authority`, `test_signed_begin_composes_to_hash_requirement` |
+| drop `inner_sig_alg != outer_sig_alg` check | `test_signature_algorithm_binding` |
+| skip the x5chain per-link `verify_es256` | `test_x5chain_internal_linkage` |
+
+Full list: 26 tests across H1 (12 hash-policy + 3 authority-mapping), H2 (1),
+H3a (4), H3b (1), M5 (2), M1b (3).
+
+### Gaps found while doing this, and what was done
+
+1. **H3b and the X5CHAIN linkage had no tests at all.** Both fixes shipped in
+   the same session as the tests for everything else and were simply missed.
+   Added `test_signature_algorithm_binding` and
+   `test_x5chain_internal_linkage`.
+
+2. **The H1 policy was tested but not the code that calls it.** Worse:
+   `check_bmo_authorization` was a pure, tested function that *duplicated*
+   the Model 1-4 matrix also written inline inside the UEFI-only
+   `process_bmo_message`. The tested copy was not the shipped copy, and they
+   could drift silently. `process_bmo_message` and the `fdo.bmo:set` branch
+   now both call `check_bmo_authorization`, and the authority→hash-policy
+   step is a tested pure function (`BmoAuthResult::to_authority`). The
+   duplicate logic is deleted.
+
+### Structurally NOT coverable by `make test` — needs QEMU or hardware
+
+These are `#[cfg(target_os = "uefi")]` and depend on the TPM or the network
+stack, so no native test can reach them. They are covered only by the QEMU
+scripts:
+
+| Not covered natively | Why | Covered by |
+|---|---|---|
+| M1a random `sugar` | `tpm_get_random` in `perform_to2_hello` | `start5-verify.sh` |
+| M1b nonce checks *at their call sites* | inside `perform_to2` | `start5-verify.sh`, tamper proxy |
+| H1 policy *invocation* in the three delivery paths | `process_bmo_*` are UEFI-only | `start7`, `start15` |
+| Voucher HMAC vs TPM key | needs a real/emulated TPM | `start5-verify.sh` |
+
+The pure decision logic behind each of these *is* natively tested; what
+cannot be tested natively is that it is wired in and reached. That residual
+risk is what the QEMU negative tests exist for — which is the argument for
+running them rather than treating 225 green tests as sufficient.
+
+### Not coverable by `make test` at all — the pe2 shell scripts
+
+`make test` is `cargo test`; it cannot say anything about `~/bkgvm/*.sh`.
+The script-safety issues found on 2026-09-29 (missing `trap` handlers
+leaking swtpm, `killall server`, unvalidated `sudo kill -9` from stale
+pidfiles) need a separate harness — `shellcheck`, or a dry-run mode that
+prints the kills it would issue instead of issuing them. Currently there is
+**no automated check of any kind** over those scripts. See the script-safety
+notes below.
+
+## Process note
+
+Per the "Signature Work: Definition of Done" rule in `AGENTS.md`, none of the
+findings above had a negative test at the time they were found — including the
+ones in features signed off as working. Positive runs against a cooperative
+server cannot see any of them. The fixes in this section each ship with a
+negative test that failed before the fix; the remaining open items are not
+"done" until the same is true of them.
+
+Writing the tests was not ceremony: `test_path_len_constraint_enforced` caught
+an off-by-one in the `pathLenConstraint` check as first written (issuer index
+vs. loop index), which would have silently under-enforced the constraint.
+
+Nor was auditing the tests themselves: asking "is each fix actually covered?"
+found two fixes with no test at all, and found that the tested authorization
+function was not the one the device ran.
+
+**Rule to add: a security check that lives in `#[cfg(target_os = "uefi")]`
+code must have its decision logic factored into a pure function that the
+UEFI code calls.** Not copied — called. Otherwise the tested implementation
+and the shipped implementation are different code.
+
+## Test-environment script safety (pe2, 2026-09-29)
+
+Reviewed `~/bkgvm/*.sh` after a concern that the scripts might be killing
+unrelated QEMU processes.
+
+**They are not.** There is no `pkill qemu`, `killall qemu`, or `pidof qemu`
+anywhere in the 27 scripts. QEMU is always run in the foreground as
+`sudo timeout ${TIMEOUT_QEMU} qemu-system-x86_64 ... || true`, so it bounds
+and terminates itself; nothing selects it for killing. A libvirt guest
+running on the box at the time of review could not be affected by any code
+path. `fdo-cleanup.sh` is well built — per-workdir PID registry, kills only
+PIDs the scripts recorded.
+
+Three real issues found, none of which is the one feared:
+
+- [ ] **No `trap` handler in any script** (0 of 27). With `set -e`, any
+  mid-script failure skips the final `kill` line, leaking `swtpm`/`server`
+  and leaving `pids.txt` behind. Proven: two orphaned `swtpm` processes were
+  found running for 7 days, from `/tmp/fdo-test4` and `/tmp/fdo-test9`.
+  Fix: `trap cleanup EXIT INT TERM`.
+- [ ] **`killall server`** in `start-hw-server.sh:56` (`stop_server`). go-fdo's
+  binary is named `server` and start2/3/4/5/7-15 all launch it, so this kills
+  a concurrently running test's server. Same function does
+  `fuser -k 9090/tcp`, which kills whatever holds 9090 regardless of owner.
+  `start-k800-server.sh:67` has `killall -9 server-installer` (narrower, same
+  class). Fix: pidfile-scoped stop.
+- [ ] **`sudo kill -9` with no identity check** in `fdo-cleanup.sh:51`. If a
+  recorded PID were recycled this kills an unrelated process, with `sudo`,
+  and the QEMUs run as root. Probability is currently low and should not be
+  overstated: `pid_max` is 4194304, the counter was at 1452221 and has not
+  wrapped, and the stale PIDs (~1.35M) had not been recycled. At the observed
+  rate (~9.4k PIDs/day) a wrap is over a year out. Worth fixing because it is
+  three lines and it is `sudo`. Fix: compare `/proc/$pid/comm` to the
+  recorded name before killing.
+
 ## Native Unit Tests (2026-09-24)
 
 The crate is split into `src/lib.rs` (all modules) and `src/main.rs` (UEFI entry point).
@@ -48,6 +501,14 @@ security anchored in the FDO trust chain:
 **Security model:** TLS is not required — meta-payload signature binds URL +
 hash to the vendor's key, and image hash covers the downloaded bytes. An
 attacker on the wire can observe but not substitute content.
+
+> **Amended 2026-09-29 (audit H1).** That model was only *available*, not
+> enforced: both `meta_signer` (key `-10`) and `expected_hash` were optional,
+> and `begin.expected_hash` (key `-9`) was never consulted in mode 2 at all,
+> so omitting a field downgraded the whole path to unauthenticated HTTP.
+> `meta_hash_decision()` now requires either a signed meta-payload or key
+> `-9`, and enforces both hashes when both are present. See the Security Audit
+> section at the top of this file.
 
 Key functions: `parse_meta_payload()`, `parse_cose_key_p256()`,
 `verify_and_extract_meta()`, `process_bmo_meta_url_delivery()` (all in `bmo.rs`).
@@ -328,7 +789,10 @@ tampering and not by having a proxy in the path.
   `tpm_create_hmac_and_persist()` also flush on failure.
 - [ ] **DI wait-and-retry** — if DI fails (e.g. server not ready), retry a few times
   before giving up. Possibly a compile-time option. Preferable to manual reboot.
-- [ ] Delegate support (X.509) — see the BMO section below; currently refused loudly.
+- [x] Delegate support (X.509) — implemented in `delegate.rs`. Chain rules
+  hardened 2026-09-29 (BasicConstraints, pathLen, length cap, algorithm
+  binding); validity dates deliberately not enforced. See the Security Audit
+  section at the top of this file.
 - [ ] SHA-384 / P-384 vouchers are refused, not supported.
 - [ ] Re-run the full BMO path (`start4.sh`) — the verified runs above deliberately
   omit BMO to keep the cycle short, so the 109 MB UKI transfer has not been re-tested

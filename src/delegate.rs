@@ -57,6 +57,26 @@ pub(crate) const OID_PERMIT_PROVISION: &[u8] = &[
 /// ExtendedKeyUsage extension OID = 2.5.29.37
 const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x25];
 
+/// BasicConstraints extension OID = 2.5.29.19
+const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1D, 0x13];
+
+/// id-ecPublicKey = 1.2.840.10045.2.1
+const OID_EC_PUBLIC_KEY: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+
+/// prime256v1 (secp256r1 / P-256) = 1.2.840.10045.3.1.7
+const OID_PRIME256V1: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+
+/// ecdsa-with-SHA256 = 1.2.840.10045.4.3.2
+const OID_ECDSA_WITH_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
+
+/// Maximum number of certificates accepted in a delegate chain.
+///
+/// A bound is required: the chain arrives in a COSE *unprotected* header, so
+/// it is attacker-controlled input parsed before any signature over it has
+/// been checked. Without a cap, the peer chooses how much work and how much
+/// allocation the device performs.
+pub const MAX_DELEGATE_CHAIN_LEN: usize = 8;
+
 // ---------------------------------------------------------------------------
 // Parsed certificate
 // ---------------------------------------------------------------------------
@@ -79,6 +99,10 @@ pub struct ParsedCert<'a> {
     pub has_permit_onboard: bool,
     /// PERM.3 — OIDPermitOnboardReuseCred (credential reuse specifically)
     pub has_permit_reuse_cred: bool,
+    /// BasicConstraints cA. Required on any certificate used as an issuer.
+    pub is_ca: bool,
+    /// BasicConstraints pathLenConstraint, if present.
+    pub path_len: Option<usize>,
 }
 
 /// Result of delegate chain validation.
@@ -111,7 +135,16 @@ pub struct DelegateChainResult {
 /// 1. Parse every certificate
 /// 2. Verify root cert's signature against `owner_key_point`
 /// 3. Walk from root to leaf, verifying each cert is signed by its parent
-/// 4. Extract leaf key and permissions
+/// 4. Require BasicConstraints cA on every certificate used as an issuer,
+///    and honour pathLenConstraint where present
+/// 5. Extract leaf key and permissions
+///
+/// **Not checked: certificate validity dates.** `notBefore`/`notAfter` are
+/// deliberately not enforced — see the "Clock policy" item in TODO.md. UEFI
+/// `GetTime()` is not a trustworthy source on the platforms this runs on, and
+/// a validity check driven by an untrusted clock is worse than none: it turns
+/// a wrong RTC into either a permissive accept or an unbootable device.
+/// Delegate expiry therefore cannot be relied upon for revocation today.
 ///
 /// Returns the leaf key and its permissions on success.
 pub fn verify_delegate_chain(
@@ -120,6 +153,11 @@ pub fn verify_delegate_chain(
 ) -> Option<DelegateChainResult> {
     if cert_ders.is_empty() {
         error!("delegate: empty certificate chain");
+        return None;
+    }
+    if cert_ders.len() > MAX_DELEGATE_CHAIN_LEN {
+        error!("delegate: chain of {} certificates exceeds the maximum of {}",
+            cert_ders.len(), MAX_DELEGATE_CHAIN_LEN);
         return None;
     }
 
@@ -155,8 +193,32 @@ pub fn verify_delegate_chain(
     // Step 2: walk from root toward leaf, verifying each cert is signed by its parent
     if parsed.len() > 1 {
         for i in (0..root_idx).rev() {
-            let issuer_point = &parsed[i + 1].public_key_point;
-            if !cose::verify_es256(parsed[i].tbs_raw, &parsed[i].signature_rs, issuer_point) {
+            let issuer = &parsed[i + 1];
+
+            // A certificate that issues another certificate MUST be a CA.
+            // Without this, any delegate — including a leaf whose only job is
+            // to sign BMO artifacts — can mint further certificates and hand
+            // its own permissions to anyone, indefinitely.
+            if !issuer.is_ca {
+                error!("delegate: certificate {} issues certificate {} but is not a CA", i + 1, i);
+                error!("delegate: BasicConstraints cA is required on every issuing certificate");
+                return None;
+            }
+
+            // pathLenConstraint on the issuer bounds how many intermediates
+            // may appear below it. The issuer is index `i + 1`, so indices
+            // `0..=i` sit beneath it — that is `i + 1` certificates, of which
+            // index 0 is the end-entity leaf, leaving `i` intermediates.
+            if let Some(max_intermediates) = issuer.path_len {
+                let intermediates_below = i;
+                if intermediates_below > max_intermediates {
+                    error!("delegate: certificate {} has pathLenConstraint {} but {} intermediate(s) follow it",
+                        i + 1, max_intermediates, intermediates_below);
+                    return None;
+                }
+            }
+
+            if !cose::verify_es256(parsed[i].tbs_raw, &parsed[i].signature_rs, &issuer.public_key_point) {
                 error!("delegate: certificate {} NOT signed by certificate {}", i, i + 1);
                 return None;
             }
@@ -195,6 +257,62 @@ pub fn verify_delegate_chain(
 // X.509 DER parsing
 // ---------------------------------------------------------------------------
 
+/// Verify that an X5CHAIN is internally consistent and return the leaf key.
+///
+/// `cert_ders` is leaf-first. Each certificate must be signed by the next one
+/// up; the topmost certificate has no issuer present in the chain, so it can
+/// only be checked by whatever anchors the chain externally (for an Ownership
+/// Voucher, that is the OVEntry signature over the key itself).
+///
+/// This exists because an X5CHAIN carries *certificates*, and taking the leaf
+/// key while ignoring the rest of the chain means the chain structure is
+/// decorative — a caller cannot tell a real chain from an arbitrary pile of
+/// DER. Same date caveat as [`verify_delegate_chain`]: validity periods are
+/// not enforced.
+pub(crate) fn verify_x5chain_internal(cert_ders: &[&[u8]]) -> Option<Vec<u8>> {
+    if cert_ders.is_empty() {
+        error!("x5chain: empty certificate chain");
+        return None;
+    }
+    if cert_ders.len() > MAX_DELEGATE_CHAIN_LEN {
+        error!("x5chain: chain of {} certificates exceeds the maximum of {}",
+            cert_ders.len(), MAX_DELEGATE_CHAIN_LEN);
+        return None;
+    }
+
+    let mut parsed: Vec<ParsedCert> = Vec::with_capacity(cert_ders.len());
+    for (i, der) in cert_ders.iter().enumerate() {
+        match parse_x509_cert(der) {
+            Some(c) => parsed.push(c),
+            None => {
+                error!("x5chain: failed to parse certificate {} ({} bytes)", i, der.len());
+                return None;
+            }
+        }
+    }
+
+    for i in 0..parsed.len() - 1 {
+        let issuer = &parsed[i + 1];
+        if !issuer.is_ca {
+            error!("x5chain: certificate {} issues certificate {} but is not a CA", i + 1, i);
+            return None;
+        }
+        if let Some(max_intermediates) = issuer.path_len {
+            if i > max_intermediates {
+                error!("x5chain: certificate {} pathLenConstraint {} exceeded", i + 1, max_intermediates);
+                return None;
+            }
+        }
+        if !cose::verify_es256(parsed[i].tbs_raw, &parsed[i].signature_rs, &issuer.public_key_point) {
+            error!("x5chain: certificate {} NOT signed by certificate {}", i, i + 1);
+            return None;
+        }
+    }
+
+    debug!("x5chain: {} certificate(s), internal linkage verified", parsed.len());
+    Some(parsed[0].public_key_point.clone())
+}
+
 /// Parse a DER-encoded X.509 certificate.
 ///
 /// Certificate ::= SEQUENCE {
@@ -219,8 +337,14 @@ fn parse_x509_cert(der: &[u8]) -> Option<ParsedCert<'_>> {
     let tbs_raw = der.get(tbs_start..tbs_end)?;
     pos = tbs_end; // skip past TBS content
 
-    // signatureAlgorithm (SEQUENCE) — skip it
-    skip_der_element(der, &mut pos)?;
+    // signatureAlgorithm (AlgorithmIdentifier SEQUENCE). We verify every
+    // certificate as ES256, so the certificate must actually say ES256 —
+    // otherwise the declared algorithm and the one we apply disagree.
+    let outer_sig_alg = read_alg_identifier_oid(der, &mut pos)?;
+    if outer_sig_alg != OID_ECDSA_WITH_SHA256 {
+        error!("x509: signatureAlgorithm is not ecdsa-with-SHA256; only ES256 is implemented");
+        return None;
+    }
 
     // signatureValue (BIT STRING)
     let sig_raw = read_bit_string(der, &mut pos)?;
@@ -248,8 +372,15 @@ fn parse_x509_cert(der: &[u8]) -> Option<ParsedCert<'_>> {
 
     // serialNumber (INTEGER)
     skip_der_element(der, &mut tbs_pos)?;
-    // signature (AlgId SEQUENCE)
-    skip_der_element(der, &mut tbs_pos)?;
+    // signature (AlgId SEQUENCE). RFC 5280 4.1.1.2: this MUST equal the outer
+    // signatureAlgorithm. They are separately encoded, and only the inner one
+    // is covered by the signature, so a mismatch means someone edited the
+    // unsigned copy.
+    let inner_sig_alg = read_alg_identifier_oid(der, &mut tbs_pos)?;
+    if inner_sig_alg != outer_sig_alg {
+        error!("x509: tbsCertificate.signature does not match signatureAlgorithm");
+        return None;
+    }
     // issuer (Name SEQUENCE)
     skip_der_element(der, &mut tbs_pos)?;
     // validity (SEQUENCE)
@@ -261,11 +392,13 @@ fn parse_x509_cert(der: &[u8]) -> Option<ParsedCert<'_>> {
     let spki_start = tbs_pos;
     let (_, spki_end) = read_sequence_header(der, &mut tbs_pos)?;
     let spki_data = der.get(spki_start..spki_end)?;
-    let public_key_point = extract_p256_point(spki_data)?;
+    let public_key_point = parse_spki_p256_point(spki_data)?;
     tbs_pos = spki_end;
 
     // Extensions — look for [3] (tag 0xA3)
     let mut eku = EkuFlags { redirect: false, onboard: false, reuse_cred: false, provision: false };
+    let mut is_ca = false;
+    let mut path_len: Option<usize> = None;
 
     // There might be issuerUniqueID [1] or subjectUniqueID [2] before extensions
     while tbs_pos < tbs_raw.len() + tbs_start {
@@ -290,15 +423,22 @@ fn parse_x509_cert(der: &[u8]) -> Option<ParsedCert<'_>> {
 
                 // Extension ::= SEQUENCE { extnID OID, critical BOOL?, extnValue OCTET STRING }
                 if let Some(oid) = read_oid(der, &mut ext_pos) {
-                    if oid == OID_EXT_KEY_USAGE {
-                        // Parse the ExtendedKeyUsage value
+                    let is_eku = oid == OID_EXT_KEY_USAGE;
+                    let is_bc = oid == OID_BASIC_CONSTRAINTS;
+                    if is_eku || is_bc {
                         // Skip optional critical BOOLEAN
                         if der.get(ext_pos) == Some(&0x01) {
                             skip_der_element(der, &mut ext_pos)?;
                         }
-                        // OCTET STRING wrapping the EKU SEQUENCE
-                        let eku_wrapper = read_octet_string(der, &mut ext_pos)?;
-                        eku = check_eku_oids(eku_wrapper);
+                        // OCTET STRING wrapping the extension value
+                        let wrapper = read_octet_string(der, &mut ext_pos)?;
+                        if is_eku {
+                            eku = check_eku_oids(wrapper);
+                        } else {
+                            let (ca, plen) = parse_basic_constraints(wrapper);
+                            is_ca = ca;
+                            path_len = plen;
+                        }
                     }
                 }
                 ext_pos = ext_end;
@@ -321,7 +461,65 @@ fn parse_x509_cert(der: &[u8]) -> Option<ParsedCert<'_>> {
         has_permit_provision: eku.provision,
         has_permit_onboard: eku.onboard,
         has_permit_reuse_cred: eku.reuse_cred,
+        is_ca,
+        path_len,
     })
+}
+
+/// Read an `AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY }`
+/// and return the algorithm OID bytes. Advances `pos` past the whole SEQUENCE.
+fn read_alg_identifier_oid<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let (_, seq_end) = read_sequence_header(data, pos)?;
+    let oid = read_oid(data, pos)?;
+    *pos = seq_end;
+    Some(oid)
+}
+
+/// Parse a `BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+/// pathLenConstraint INTEGER OPTIONAL }` extension value.
+///
+/// Returns `(is_ca, path_len)`. Both DER defaults mean absence is `false`/`None`,
+/// so an unparseable or empty extension yields "not a CA" — fail closed.
+fn parse_basic_constraints(data: &[u8]) -> (bool, Option<usize>) {
+    let mut pos = 0usize;
+    let (_, seq_end) = match read_sequence_header(data, &mut pos) {
+        Some(v) => v,
+        None => return (false, None),
+    };
+
+    let mut is_ca = false;
+    let mut path_len = None;
+
+    // cA BOOLEAN DEFAULT FALSE — present only when TRUE in strict DER, but
+    // accept an explicit FALSE too.
+    if pos < seq_end && data.get(pos) == Some(&0x01) {
+        pos += 1;
+        let len = match read_der_length(data, &mut pos) {
+            Some(l) => l,
+            None => return (false, None),
+        };
+        if len != 1 {
+            return (false, None);
+        }
+        is_ca = data.get(pos).copied().unwrap_or(0) != 0;
+        pos += 1;
+    }
+
+    // pathLenConstraint INTEGER OPTIONAL
+    if pos < seq_end && data.get(pos) == Some(&0x02) {
+        if let Some(int_bytes) = read_der_integer(data, &mut pos) {
+            // Only small, non-negative path lengths are meaningful here.
+            if int_bytes.len() <= 2 && int_bytes.first().map_or(false, |b| b & 0x80 == 0) {
+                let mut v = 0usize;
+                for b in int_bytes {
+                    v = (v << 8) | (*b as usize);
+                }
+                path_len = Some(v);
+            }
+        }
+    }
+
+    (is_ca, path_len)
 }
 
 /// Parsed EKU permission flags from a single certificate.
@@ -344,7 +542,18 @@ fn check_eku_oids(data: &[u8]) -> EkuFlags {
         None => return flags,
     };
     while pos < seq_end {
-        if let Some(oid) = read_oid(data, &mut pos) {
+        // `read_oid` leaves `pos` untouched when the element is not an OID,
+        // so the skip below is what guarantees forward progress. Without it a
+        // single non-OID element in this SEQUENCE spins forever — and this
+        // data arrives in a COSE *unprotected* header, i.e. unauthenticated.
+        let Some(oid) = read_oid(data, &mut pos) else {
+            if skip_der_element(data, &mut pos).is_none() {
+                error!("delegate: malformed element in ExtendedKeyUsage — stopping");
+                break;
+            }
+            continue;
+        };
+        {
             if oid == OID_PERMIT_PROVISION {
                 flags.provision = true;
                 debug!("delegate: found OIDPermitProvision (PERM.7)");
@@ -464,30 +673,52 @@ fn read_oid<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
     Some(oid)
 }
 
-/// Extract an uncompressed P-256 point from a SubjectPublicKeyInfo.
-/// Re-uses the same pattern search as voucher.rs but is self-contained.
-fn extract_p256_point(spki: &[u8]) -> Option<Vec<u8>> {
-    // Look for BIT STRING containing 0x04 (uncompressed point marker)
-    // Pattern: 03 42 00 04 (BIT STRING, len 66, 0 unused bits, uncompressed)
-    const PATTERN: [u8; 4] = [0x03, 0x42, 0x00, 0x04];
-    for i in 0..spki.len().saturating_sub(PATTERN.len()) {
-        if spki.get(i..i + 4)? == &PATTERN {
-            let start = i + 3; // at the 0x04 marker
-            let point = spki.get(start..start + 65)?;
-            return Some(point.to_vec());
-        }
+/// Parse a `SubjectPublicKeyInfo` and return the uncompressed P-256 point.
+///
+/// ```text
+/// SubjectPublicKeyInfo ::= SEQUENCE {
+///     algorithm         AlgorithmIdentifier ::= SEQUENCE {
+///         algorithm     OBJECT IDENTIFIER,   -- id-ecPublicKey
+///         parameters    OBJECT IDENTIFIER }, -- prime256v1
+///     subjectPublicKey  BIT STRING }
+/// ```
+///
+/// This walks the structure and checks both OIDs. It deliberately does **not**
+/// search for a byte pattern: a scan for `03 42 00 04` will happily match
+/// inside a subject name, an extension, or a signature, and when the input is
+/// a whole certificate rather than just its SPKI the first such match wins
+/// over the real key.
+pub(crate) fn parse_spki_p256_point(spki: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0usize;
+    let (_, spki_end) = read_sequence_header(spki, &mut pos)?;
+
+    // algorithm AlgorithmIdentifier
+    let (_, alg_end) = read_sequence_header(spki, &mut pos)?;
+    let alg_oid = read_oid(spki, &mut pos)?;
+    if alg_oid != OID_EC_PUBLIC_KEY {
+        error!("x509: SPKI algorithm is not id-ecPublicKey");
+        return None;
     }
-    // Try P-384: 03 62 00 04 (BIT STRING, len 98, 0 unused bits, uncompressed)
-    // We don't support P-384 for verification, but log it.
-    const P384_PATTERN: [u8; 4] = [0x03, 0x62, 0x00, 0x04];
-    for i in 0..spki.len().saturating_sub(P384_PATTERN.len()) {
-        if spki.get(i..i + 4) == Some(&P384_PATTERN[..]) {
-            error!("delegate: P-384 key detected but only P-256 is supported");
-            return None;
-        }
+    let curve_oid = read_oid(spki, &mut pos)?;
+    if curve_oid != OID_PRIME256V1 {
+        error!("x509: SPKI curve is not prime256v1 (P-256); only P-256 is implemented");
+        return None;
     }
-    error!("delegate: no P-256 uncompressed point in SPKI ({} bytes)", spki.len());
-    None
+    if pos > alg_end {
+        return None;
+    }
+    pos = alg_end;
+
+    // subjectPublicKey BIT STRING
+    let bits = read_bit_string(spki, &mut pos)?;
+    if pos > spki_end {
+        return None;
+    }
+    if bits.len() != 65 || bits[0] != 0x04 {
+        error!("x509: SPKI key is not a 65-byte uncompressed P-256 point ({} bytes)", bits.len());
+        return None;
+    }
+    Some(bits.to_vec())
 }
 
 /// Convert an ECDSA DER-encoded signature to fixed-width r||s (64 bytes for P-256).
@@ -651,10 +882,35 @@ pub(crate) fn build_test_cert(
     subject_pk_point: &[u8],
     eku_oids: &[&[u8]],
 ) -> Vec<u8> {
+    build_test_cert_full(issuer_sk, subject_pk_point, eku_oids, None)
+}
+
+/// Build a test CA certificate: same as [`build_test_cert`] but with a
+/// `BasicConstraints` extension carrying `cA = TRUE` and an optional
+/// `pathLenConstraint`. Any certificate used as an issuer needs this.
+#[cfg(test)]
+pub(crate) fn build_test_ca_cert(
+    issuer_sk: &p256::ecdsa::SigningKey,
+    subject_pk_point: &[u8],
+    eku_oids: &[&[u8]],
+    path_len: Option<usize>,
+) -> Vec<u8> {
+    build_test_cert_full(issuer_sk, subject_pk_point, eku_oids, Some(path_len))
+}
+
+/// `basic_constraints`: `None` = omit the extension entirely (not a CA);
+/// `Some(path_len)` = include it with `cA = TRUE`.
+#[cfg(test)]
+fn build_test_cert_full(
+    issuer_sk: &p256::ecdsa::SigningKey,
+    subject_pk_point: &[u8],
+    eku_oids: &[&[u8]],
+    basic_constraints: Option<Option<usize>>,
+) -> Vec<u8> {
     use p256::ecdsa::{signature::Signer, Signature};
 
     // Build TBS certificate
-    let tbs = build_test_tbs(subject_pk_point, eku_oids);
+    let tbs = build_test_tbs(subject_pk_point, eku_oids, basic_constraints);
 
     // Sign TBS with issuer key
     let sig: Signature = issuer_sk.sign(&tbs);
@@ -688,7 +944,11 @@ pub(crate) fn build_test_cert(
 
 /// Build a minimal TBS certificate for testing.
 #[cfg(test)]
-fn build_test_tbs(subject_pk_point: &[u8], eku_oids: &[&[u8]]) -> Vec<u8> {
+fn build_test_tbs(
+    subject_pk_point: &[u8],
+    eku_oids: &[&[u8]],
+    basic_constraints: Option<Option<usize>>,
+) -> Vec<u8> {
     let mut tbs_inner = Vec::new();
 
     // version [0] EXPLICIT INTEGER 2 (v3)
@@ -743,6 +1003,8 @@ fn build_test_tbs(subject_pk_point: &[u8], eku_oids: &[&[u8]]) -> Vec<u8> {
     tbs_inner.extend_from_slice(&spki_seq);
 
     // Extensions [3] EXPLICIT { SEQUENCE { ... } }
+    let mut extensions = Vec::new();
+
     if !eku_oids.is_empty() {
         let mut eku_inner = Vec::new();
         for oid in eku_oids {
@@ -769,10 +1031,43 @@ fn build_test_tbs(subject_pk_point: &[u8], eku_oids: &[&[u8]]) -> Vec<u8> {
         ext_entry.extend_from_slice(eku_oid_tlv);
         ext_entry.extend_from_slice(&eku_os);
 
+        extensions.extend_from_slice(&ext_entry);
+    }
+
+    if let Some(path_len) = basic_constraints {
+        // BasicConstraints ::= SEQUENCE { cA BOOLEAN, pathLenConstraint INTEGER OPTIONAL }
+        let mut bc_inner = Vec::new();
+        bc_inner.extend_from_slice(&[0x01, 0x01, 0xFF]); // cA = TRUE
+        if let Some(pl) = path_len {
+            bc_inner.extend_from_slice(&[0x02, 0x01, pl as u8]);
+        }
+
+        let mut bc_seq = Vec::new();
+        bc_seq.push(0x30);
+        der_write_length(&mut bc_seq, bc_inner.len());
+        bc_seq.extend_from_slice(&bc_inner);
+
+        let mut bc_os = Vec::new();
+        bc_os.push(0x04); // OCTET STRING
+        der_write_length(&mut bc_os, bc_seq.len());
+        bc_os.extend_from_slice(&bc_seq);
+
+        let mut ext_entry = Vec::new();
+        ext_entry.push(0x30);
+        // extnID = 2.5.29.19 (basicConstraints)
+        let bc_oid_tlv = &[0x06, 0x03, 0x55, 0x1d, 0x13];
+        der_write_length(&mut ext_entry, bc_oid_tlv.len() + bc_os.len());
+        ext_entry.extend_from_slice(bc_oid_tlv);
+        ext_entry.extend_from_slice(&bc_os);
+
+        extensions.extend_from_slice(&ext_entry);
+    }
+
+    if !extensions.is_empty() {
         let mut ext_seq = Vec::new();
         ext_seq.push(0x30); // SEQUENCE of extensions
-        der_write_length(&mut ext_seq, ext_entry.len());
-        ext_seq.extend_from_slice(&ext_entry);
+        der_write_length(&mut ext_seq, extensions.len());
+        ext_seq.extend_from_slice(&extensions);
 
         // [3] EXPLICIT
         tbs_inner.push(0xa3);
@@ -1009,9 +1304,10 @@ mod tests {
         let (intermediate_sk, intermediate_point) = gen_test_keypair_b();
         let (_leaf_sk, leaf_point) = gen_test_keypair_c();
 
-        let root_cert = build_test_cert(
+        let root_cert = build_test_ca_cert(
             &owner_sk, &intermediate_point,
             &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED],
+            None,
         );
         let leaf_cert = build_test_cert(
             &intermediate_sk, &leaf_point,
@@ -1033,8 +1329,8 @@ mod tests {
         let (_intermediate_sk, intermediate_point) = gen_test_keypair_b();
         let (attacker_sk, _) = gen_test_keypair_c();
 
-        let root_cert = build_test_cert(
-            &owner_sk, &intermediate_point, &[OID_PERMIT_PROVISION],
+        let root_cert = build_test_ca_cert(
+            &owner_sk, &intermediate_point, &[OID_PERMIT_PROVISION], None,
         );
         // Leaf signed by attacker, not intermediate
         let leaf_cert = build_test_cert(
@@ -1065,13 +1361,15 @@ mod tests {
             p256::EncodedPoint::from(pk).as_bytes().to_vec()
         };
 
-        let root_cert = build_test_cert(
+        let root_cert = build_test_ca_cert(
             &owner_sk, &root_point,
             &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT],
+            None,
         );
-        let inter_cert = build_test_cert(
+        let inter_cert = build_test_ca_cert(
             &root_sk, &intermediate_point,
             &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT],
+            None,
         );
         let leaf_cert = build_test_cert(
             &intermediate_sk, &leaf_point,
@@ -1098,9 +1396,10 @@ mod tests {
         let (_leaf_sk, leaf_point) = gen_test_keypair_c();
 
         // Root has onboard + redirect + provision
-        let root_cert = build_test_cert(
+        let root_cert = build_test_ca_cert(
             &owner_sk, &intermediate_point,
             &[OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT, OID_PERMIT_PROVISION],
+            None,
         );
         // Intermediate has ONLY redirect (no onboard, no provision)
         let leaf_cert = build_test_cert(
@@ -1115,9 +1414,10 @@ mod tests {
         // Leaf claims onboard+provision but root has them too, so intersection passes.
         // Now test the ACTUAL intermediate-missing case:
         // Root: redirect only. Leaf: onboard + redirect.
-        let root_redirect_only = build_test_cert(
+        let root_redirect_only = build_test_ca_cert(
             &owner_sk, &intermediate_point,
             &[OID_PERMIT_REDIRECT],
+            None,
         );
         let leaf_onboard_redirect = build_test_cert(
             &intermediate_sk, &leaf_point,
@@ -1153,13 +1453,14 @@ mod tests {
         };
 
         // Root: redirect only (no onboard, no provision)
-        let root_cert = build_test_cert(
-            &owner_sk, &root_point, &[OID_PERMIT_REDIRECT],
+        let root_cert = build_test_ca_cert(
+            &owner_sk, &root_point, &[OID_PERMIT_REDIRECT], None,
         );
         // Intermediate: onboard + redirect
-        let inter_cert = build_test_cert(
+        let inter_cert = build_test_ca_cert(
             &root_sk, &intermediate_point,
             &[OID_PERMIT_ONBOARD_NEWCRED, OID_PERMIT_REDIRECT],
+            None,
         );
         // Leaf: onboard + redirect + provision
         let leaf_cert = build_test_cert(
@@ -1175,6 +1476,237 @@ mod tests {
         assert!(result.has_redirect, "redirect: all 3 have it");
         assert!(!result.has_onboard, "onboard: root lacks it → false");
         assert!(!result.has_provision, "provision: root+intermediate lack it → false");
+    }
+
+    // =====================================================================
+    // Security audit 2026-09-29 — negative tests for the new chain rules.
+    // Each of these passed before the corresponding check existed.
+    // =====================================================================
+
+    /// H2: a non-OID element inside the EKU SEQUENCE used to spin forever.
+    /// `read_oid` does not advance `pos` when the tag is not 0x06, and the
+    /// loop had no other advance. This test simply has to terminate.
+    #[test]
+    fn test_eku_non_oid_element_terminates() {
+        // SEQUENCE { NULL }
+        let flags = check_eku_oids(&[0x30, 0x02, 0x05, 0x00]);
+        assert!(!flags.provision && !flags.onboard && !flags.redirect);
+
+        // SEQUENCE { NULL, OID(PERM.7) } — must skip the NULL and still find
+        // the OID that follows it.
+        let mut data = alloc::vec![0x30, 0x00, 0x05, 0x00, 0x06, OID_PERMIT_PROVISION.len() as u8];
+        data.extend_from_slice(OID_PERMIT_PROVISION);
+        data[1] = (data.len() - 2) as u8;
+        let flags = check_eku_oids(&data);
+        assert!(flags.provision, "OID after a non-OID element must still be seen");
+    }
+
+    /// H3: a delegate that is not a CA must not be able to issue a
+    /// sub-delegate. Without BasicConstraints, any leaf holding PERM.7 could
+    /// mint further certificates and pass its permissions on indefinitely.
+    #[test]
+    fn test_non_ca_issuer_rejected() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (intermediate_sk, intermediate_point) = gen_test_keypair_b();
+        let (_leaf_sk, leaf_point) = gen_test_keypair_c();
+
+        // Issuer deliberately built WITHOUT basicConstraints.
+        let non_ca_issuer = build_test_cert(
+            &owner_sk, &intermediate_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED],
+        );
+        let leaf_cert = build_test_cert(
+            &intermediate_sk, &leaf_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED],
+        );
+
+        let certs = [leaf_cert.as_slice(), non_ca_issuer.as_slice()];
+        assert!(verify_delegate_chain(&certs, &owner_point).is_none(),
+            "a non-CA certificate must not be accepted as an issuer");
+
+        // Same chain, issuer marked as a CA, must verify — proves the
+        // rejection above is caused by the CA bit and nothing else.
+        let ca_issuer = build_test_ca_cert(
+            &owner_sk, &intermediate_point,
+            &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED],
+            None,
+        );
+        let certs_ok = [leaf_cert.as_slice(), ca_issuer.as_slice()];
+        assert!(verify_delegate_chain(&certs_ok, &owner_point).is_some(),
+            "control: same chain with a CA issuer must verify");
+    }
+
+    /// A single end-entity certificate issued directly by the Owner does not
+    /// need the CA bit — it issues nothing.
+    #[test]
+    fn test_single_leaf_needs_no_ca_bit() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (_delegate_sk, delegate_point) = gen_test_keypair_b();
+
+        let cert_der = build_test_cert(&owner_sk, &delegate_point, &[OID_PERMIT_PROVISION]);
+        assert!(verify_delegate_chain(&[cert_der.as_slice()], &owner_point).is_some(),
+            "a 1-cert chain must not require basicConstraints");
+    }
+
+    /// H3: pathLenConstraint must bound the number of intermediates below.
+    #[test]
+    fn test_path_len_constraint_enforced() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (root_sk, root_point) = gen_test_keypair_b();
+        let (intermediate_sk, intermediate_point) = gen_test_keypair_c();
+        let leaf_secret = p256::SecretKey::from_bytes(
+            &[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+              0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+              0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+              0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01].into(),
+        ).unwrap();
+        let leaf_point = p256::EncodedPoint::from(leaf_secret.public_key()).as_bytes().to_vec();
+
+        let eku: &[&[u8]] = &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED];
+
+        // Root with pathLen=0 => no intermediates may appear below it.
+        let root_pl0 = build_test_ca_cert(&owner_sk, &root_point, eku, Some(0));
+        let inter_cert = build_test_ca_cert(&root_sk, &intermediate_point, eku, None);
+        let leaf_cert = build_test_cert(&intermediate_sk, &leaf_point, eku);
+
+        let certs = [leaf_cert.as_slice(), inter_cert.as_slice(), root_pl0.as_slice()];
+        assert!(verify_delegate_chain(&certs, &owner_point).is_none(),
+            "pathLenConstraint=0 must reject an intermediate below the root");
+
+        // pathLen=1 permits exactly this depth.
+        let root_pl1 = build_test_ca_cert(&owner_sk, &root_point, eku, Some(1));
+        let certs_ok = [leaf_cert.as_slice(), inter_cert.as_slice(), root_pl1.as_slice()];
+        assert!(verify_delegate_chain(&certs_ok, &owner_point).is_some(),
+            "control: pathLenConstraint=1 must allow one intermediate");
+    }
+
+    /// H3: chain length is bounded — the chain arrives unauthenticated.
+    #[test]
+    fn test_chain_length_cap() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (_, point) = gen_test_keypair_b();
+        let cert = build_test_ca_cert(&owner_sk, &point, &[OID_PERMIT_PROVISION], None);
+
+        let refs: alloc::vec::Vec<&[u8]> =
+            (0..MAX_DELEGATE_CHAIN_LEN + 1).map(|_| cert.as_slice()).collect();
+        assert!(verify_delegate_chain(&refs, &owner_point).is_none(),
+            "a chain longer than MAX_DELEGATE_CHAIN_LEN must be refused");
+    }
+
+    /// H3b: the certificate must declare ecdsa-with-SHA256, and the outer
+    /// `signatureAlgorithm` must equal `tbsCertificate.signature`
+    /// (RFC 5280 4.1.1.2). Only the inner copy is covered by the signature,
+    /// so a mismatch means the unsigned copy was edited. Both were skipped
+    /// entirely before this fix and ES256 was simply assumed.
+    #[test]
+    fn test_signature_algorithm_binding() {
+        let (owner_sk, _) = gen_test_keypair();
+        let (_, point) = gen_test_keypair_b();
+        let good = build_test_cert(&owner_sk, &point, &[OID_PERMIT_PROVISION]);
+        assert!(parse_x509_cert(&good).is_some(), "control: well-formed cert must parse");
+
+        // ecdsa-with-SHA256 is 1.2.840.10045.4.3.2, encoded ...04 03 02.
+        // ecdsa-with-SHA384 is 1.2.840.10045.4.3.3 — same length, so we can
+        // flip the final byte in place without disturbing any DER lengths.
+        let sha256_tail: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+
+        // Find both occurrences: tbsCertificate.signature and the outer
+        // signatureAlgorithm.
+        let positions: Vec<usize> = good
+            .windows(sha256_tail.len())
+            .enumerate()
+            .filter(|(_, w)| *w == sha256_tail)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions.len(), 2,
+            "test cert should carry the algorithm OID exactly twice");
+
+        // Change ONLY the outer signatureAlgorithm -> now it disagrees with
+        // the inner one AND is no longer ES256.
+        let mut outer_changed = good.clone();
+        let last = positions[1];
+        outer_changed[last + 7] = 0x03; // ...04 03 03 = ecdsa-with-SHA384
+        assert!(parse_x509_cert(&outer_changed).is_none(),
+            "a non-ES256 signatureAlgorithm must be refused");
+
+        // Change ONLY the inner tbsCertificate.signature -> outer still says
+        // ES256, but the two no longer agree.
+        let mut inner_changed = good.clone();
+        let first = positions[0];
+        inner_changed[first + 7] = 0x03;
+        assert!(parse_x509_cert(&inner_changed).is_none(),
+            "tbsCertificate.signature must match the outer signatureAlgorithm");
+    }
+
+    /// M5: an X5CHAIN must be internally consistent — each certificate
+    /// signed by the one above it. Previously the leaf key was taken and the
+    /// rest of the chain was discarded unexamined, so the chain structure
+    /// was decorative and an arbitrary pile of DER passed.
+    #[test]
+    fn test_x5chain_internal_linkage() {
+        let (root_sk, root_point) = gen_test_keypair();
+        let (leaf_sk, leaf_point) = gen_test_keypair_b();
+        let (attacker_sk, _) = gen_test_keypair_c();
+
+        // Self-signed root marked as a CA, then a leaf it issues.
+        let root_cert = build_test_ca_cert(&root_sk, &root_point, &[OID_PERMIT_PROVISION], None);
+        let leaf_cert = build_test_cert(&root_sk, &leaf_point, &[OID_PERMIT_PROVISION]);
+
+        let ok = verify_x5chain_internal(&[leaf_cert.as_slice(), root_cert.as_slice()])
+            .expect("a correctly linked chain must verify");
+        assert_eq!(ok, leaf_point, "must return the LEAF key, not the root's");
+
+        // Leaf signed by someone who is not the cert above it.
+        let forged_leaf = build_test_cert(&attacker_sk, &leaf_point, &[OID_PERMIT_PROVISION]);
+        assert!(verify_x5chain_internal(&[forged_leaf.as_slice(), root_cert.as_slice()]).is_none(),
+            "a leaf not signed by the next certificate must be refused");
+
+        // Issuer without the CA bit.
+        let non_ca_root = build_test_cert(&root_sk, &root_point, &[OID_PERMIT_PROVISION]);
+        assert!(verify_x5chain_internal(&[leaf_cert.as_slice(), non_ca_root.as_slice()]).is_none(),
+            "a non-CA issuer must be refused in an x5chain too");
+
+        // A single certificate has nothing above it to check against; its
+        // key is returned and the caller's own signature check anchors it.
+        let single = verify_x5chain_internal(&[leaf_cert.as_slice()])
+            .expect("a 1-cert chain must yield its key");
+        assert_eq!(single, leaf_point);
+
+        assert!(verify_x5chain_internal(&[]).is_none(), "empty chain must be refused");
+        let _ = leaf_sk;
+    }
+
+    /// M5: the public key must come from a structurally parsed SPKI with the
+    /// right algorithm OIDs, not from a byte-pattern scan.
+    #[test]
+    fn test_spki_requires_correct_oids() {
+        let (_, point) = gen_test_keypair();
+
+        // Correct SPKI: SEQUENCE { SEQUENCE { ecPublicKey, prime256v1 }, BIT STRING }
+        let mut good = alloc::vec![
+            0x30, 0x59,
+            0x30, 0x13,
+            0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+            0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+            0x03, 0x42, 0x00,
+        ];
+        good.extend_from_slice(&point);
+        assert_eq!(parse_spki_p256_point(&good).as_deref(), Some(point.as_slice()));
+
+        // Same bytes but the curve OID changed to secp384r1 (1.3.132.0.34).
+        // The old pattern scan ignored the OIDs entirely and accepted this.
+        let mut wrong_curve = good.clone();
+        wrong_curve[13..23].copy_from_slice(&[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22, 0x05, 0x00, 0x00]);
+        assert!(parse_spki_p256_point(&wrong_curve).is_none(),
+            "a non-P-256 curve OID must be refused");
+
+        // A buffer that merely *contains* the 03 42 00 04 pattern, with no
+        // valid SPKI structure around it, must not yield a key.
+        let mut junk = alloc::vec![0x30, 0x04, 0x02, 0x01, 0x01, 0x05, 0x00];
+        junk.extend_from_slice(&[0x03, 0x42, 0x00]);
+        junk.extend_from_slice(&point);
+        assert!(parse_spki_p256_point(&junk).is_none(),
+            "a stray BIT STRING pattern must not be mistaken for the SPKI key");
     }
 
     // ===== Redirect-only cannot onboard (Go: TestDelegateCannotOnboardWithRedirectOnly) =====

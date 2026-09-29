@@ -98,6 +98,25 @@ pub struct BmoImageBegin {
     pub meta_signer: Option<Vec<u8>>,
 }
 
+/// How the `image-begin` that authorised the current transfer was established.
+///
+/// This decides how strict the image-hash policy has to be, so it is recorded
+/// on the session at `image-begin` time and consulted again at `image-end`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BmoAuthority {
+    /// Model 3/4 — `image-begin` was a COSE_Sign1 whose signature verified.
+    /// The signature is only worth something if it covers the image bytes,
+    /// so an authorising hash is mandatory.
+    Artifact,
+    /// Model 1/2 — `image-begin` was unsigned and accepted because the TO2
+    /// session itself is bound to the Owner (ProveOVHdr signs xB, which the
+    /// session keys derive from). Anything arriving over that channel carries
+    /// the Owner's authority, including a hash in `image-end`.
+    Channel,
+    /// No Owner key was available at all (legacy/test paths only).
+    Unauthenticated,
+}
+
 /// BMO session state
 #[derive(Debug)]
 pub struct BmoSession {
@@ -106,6 +125,8 @@ pub struct BmoSession {
     pub image_buffer: Vec<u8>,
     pub chunks_received: u32,
     pub bytes_received: u64,
+    /// Authority under which the current `image-begin` was accepted.
+    pub authority: BmoAuthority,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -125,6 +146,7 @@ impl BmoSession {
             image_buffer: Vec::new(),
             chunks_received: 0,
             bytes_received: 0,
+            authority: BmoAuthority::Unauthenticated,
         }
     }
     
@@ -134,6 +156,7 @@ impl BmoSession {
         self.image_buffer.clear();
         self.chunks_received = 0;
         self.bytes_received = 0;
+        self.authority = BmoAuthority::Unauthenticated;
     }
 }
 
@@ -538,6 +561,150 @@ pub fn verify_and_extract_meta(data: &[u8], meta_signer: Option<&[u8]>) -> Resul
     }
 }
 
+// =========================================================================
+// Image hash policy
+//
+// The device chainloads whatever comes out of BMO, so nothing may be
+// executed unless some authenticated statement covers the exact bytes.
+// Before 2026-09-29 every one of these checks was "verify if a hash happens
+// to be present, otherwise warn and continue", which let the sender opt out
+// of integrity entirely simply by omitting a field.
+//
+// The three rules, by delivery mode:
+//
+//   0 inline    — bytes arrive inside the TO2 session. Under Artifact
+//                 authority the signed image-begin MUST carry key -9, else
+//                 the signature covers only metadata. Under Channel
+//                 authority an image-end hash is acceptable, because
+//                 image-end arrives over the same Owner-bound channel.
+//                 No hash at all is never acceptable.
+//
+//   1 URL       — bytes arrive over plain HTTP, outside the authenticated
+//                 channel. Key -9 is mandatory regardless of authority.
+//
+//   2 meta-URL  — both the meta-payload and the image arrive outside the
+//                 channel. Either the meta-payload is signed (key -10, so
+//                 its hash is authenticated) or image-begin carries key -9.
+//                 With neither, nothing authenticated covers the bytes.
+// =========================================================================
+
+/// Why a BMO transfer was refused on integrity grounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HashPolicyError {
+    /// image-begin and image-end disagree about the hash.
+    BeginEndDisagree,
+    /// A signed (Model 3/4) image-begin carried no expected_hash (key -9).
+    SignedWithoutHash,
+    /// No hash was available from any source.
+    NoHash,
+    /// Delivery outside the authenticated channel with no authenticated hash.
+    UnauthenticatedSource,
+}
+
+impl HashPolicyError {
+    pub fn message(self) -> &'static str {
+        match self {
+            HashPolicyError::BeginEndDisagree => "image-begin/image-end hash disagreement",
+            HashPolicyError::SignedWithoutHash => "signed image-begin has no expected_hash (-9)",
+            HashPolicyError::NoHash => "no image hash available — refusing to chainload",
+            HashPolicyError::UnauthenticatedSource => "no authenticated hash for out-of-band image",
+        }
+    }
+}
+
+/// Decide which hash an **inline** (mode 0) transfer must be checked against.
+///
+/// Returns the hash to compare the reassembled buffer with, or the reason the
+/// transfer must be refused.
+pub fn inline_hash_decision(
+    authority: BmoAuthority,
+    begin_hash: Option<&[u8]>,
+    end_hash: Option<&[u8]>,
+) -> Result<Vec<u8>, HashPolicyError> {
+    // If both are present they must agree: a disagreement means the sender
+    // is trying to substitute content after the authorising message.
+    if let (Some(bh), Some(eh)) = (begin_hash, end_hash) {
+        if bh != eh {
+            return Err(HashPolicyError::BeginEndDisagree);
+        }
+    }
+
+    // A signature over image-begin only means something if image-begin
+    // commits to the bytes.
+    if authority == BmoAuthority::Artifact && begin_hash.is_none() {
+        return Err(HashPolicyError::SignedWithoutHash);
+    }
+
+    match begin_hash.or(end_hash) {
+        Some(h) => Ok(h.to_vec()),
+        None => Err(HashPolicyError::NoHash),
+    }
+}
+
+/// Decide which hash a **URL** (mode 1) transfer must be checked against.
+///
+/// The image is fetched over plain HTTP, entirely outside the TO2 session, so
+/// only `image-begin`'s key -9 can speak for it.
+pub fn url_hash_decision(
+    _authority: BmoAuthority,
+    begin_hash: Option<&[u8]>,
+) -> Result<Vec<u8>, HashPolicyError> {
+    match begin_hash {
+        Some(h) => Ok(h.to_vec()),
+        None => Err(HashPolicyError::UnauthenticatedSource),
+    }
+}
+
+/// Which hashes a **meta-URL** (mode 2) transfer must be checked against.
+#[derive(Debug)]
+pub struct MetaHashPlan {
+    /// Every hash that must match the downloaded image. Never empty.
+    pub required: Vec<Vec<u8>>,
+}
+
+/// Decide the hash requirements for meta-URL delivery, after the meta-payload
+/// has been fetched and (if signed) verified.
+///
+/// `meta_signed` is true only when a `meta_signer` (key -10) was supplied
+/// *and* the COSE_Sign1 over the meta-payload verified against it. When it is
+/// false the meta-payload is just bytes off the wire, so `meta_hash` carries
+/// no authority and cannot be the only thing checked.
+pub fn meta_hash_decision(
+    _authority: BmoAuthority,
+    begin_hash: Option<&[u8]>,
+    meta_signed: bool,
+    meta_hash: Option<&[u8]>,
+) -> Result<MetaHashPlan, HashPolicyError> {
+    let mut required: Vec<Vec<u8>> = Vec::new();
+
+    // image-begin's hash is authenticated whenever image-begin itself was
+    // (Artifact), and channel-authenticated otherwise. Either way it came
+    // over the TO2 session, so honour it when present.
+    if let Some(bh) = begin_hash {
+        required.push(bh.to_vec());
+    }
+
+    // The meta-payload's hash only counts if the meta-payload was signed.
+    if meta_signed {
+        match meta_hash {
+            Some(mh) => required.push(mh.to_vec()),
+            None => {
+                // Signed meta-payload that commits to no hash leaves the
+                // image bytes uncovered unless image-begin did.
+                if required.is_empty() {
+                    return Err(HashPolicyError::UnauthenticatedSource);
+                }
+            }
+        }
+    }
+
+    if required.is_empty() {
+        return Err(HashPolicyError::UnauthenticatedSource);
+    }
+
+    Ok(MetaHashPlan { required })
+}
+
 /// Result of BMO authorization check.
 #[derive(Debug, PartialEq)]
 pub enum BmoAuthResult {
@@ -551,6 +718,34 @@ pub enum BmoAuthResult {
     UnsignedModel2,
     /// Unsigned accepted — legacy/test mode (no Owner key)
     UnsignedLegacy,
+}
+
+impl BmoAuthResult {
+    /// Map an authorization outcome to the authority the hash policy must
+    /// apply. Keeping this next to the outcome enum means the two cannot
+    /// drift: a new `BmoAuthResult` variant will not compile until its
+    /// hash-policy consequence has been decided.
+    pub fn to_authority(&self) -> BmoAuthority {
+        match self {
+            // A verified signature is artifact authority — and therefore
+            // obliges the signed message to carry the image hash.
+            BmoAuthResult::SignedOk => BmoAuthority::Artifact,
+            // Rejected outright by the caller; value here is irrelevant but
+            // must be the strictest thing we have.
+            BmoAuthResult::SignedFailed => BmoAuthority::Artifact,
+            // Models 1 and 2: the TO2 session is bound to the Owner, so
+            // anything arriving over it carries the Owner's authority.
+            BmoAuthResult::UnsignedModel1 => BmoAuthority::Channel,
+            BmoAuthResult::UnsignedModel2 => BmoAuthority::Channel,
+            // No Owner key at all.
+            BmoAuthResult::UnsignedLegacy => BmoAuthority::Unauthenticated,
+        }
+    }
+
+    /// True when the payload is authorised and processing should continue.
+    pub fn is_authorized(&self) -> bool {
+        !matches!(self, BmoAuthResult::SignedFailed)
+    }
 }
 
 /// Check whether a BMO provisioning payload should be accepted.
@@ -623,38 +818,31 @@ pub fn process_bmo_message(
     
     match key {
         BMO_KEY_IMAGE_BEGIN => {
-            // Check if the body is a signed COSE_Sign1 (tag 18 = 0xD2 first byte)
-            // or a bare CBOR map.
-            let inner_data = unwrap_bmo_signed(value, owner_key_point,
+            // Authorisation runs through the same pure function the unit
+            // tests exercise (`check_bmo_authorization`). This used to be a
+            // second, hand-written copy of the Model 1-4 matrix living here
+            // in UEFI-only code, so the tested implementation and the
+            // shipped implementation were different code that could drift.
+            let (auth, inner_data) = check_bmo_authorization(
+                value, owner_key_point, delegate_has_provision,
                 crate::cose::BMO_CONTENT_TYPE_IMAGE_BEGIN, device_guid);
+
+            if !auth.is_authorized() {
+                // Tag 18 present but verification failed. Never retried as
+                // unsigned — that would be a downgrade.
+                error!("BMO: image-begin was signed but verification FAILED — rejecting");
+                session.state = BmoState::Error;
+                let result = build_bmo_image_result(BMO_STATUS_ERROR,
+                    Some("Provisioning signature verification failed"));
+                return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+            }
+
+            // Authority drives the image-hash policy applied at image-end /
+            // URL fetch time.
+            session.authority = auth.to_authority();
             let parse_data = match &inner_data {
                 Some(d) => d.as_slice(),
-                None if is_cbor_tag18(value) => {
-                    // It was tag 18 but verification failed — reject
-                    error!("BMO: image-begin was signed but verification FAILED — rejecting");
-                    session.state = BmoState::Error;
-                    let result = build_bmo_image_result(BMO_STATUS_ERROR,
-                        Some("Provisioning signature verification failed"));
-                    return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
-                }
-                None => {
-                    // Bare map — unsigned provisioning.
-                    // Model 1: Owner-direct channel authority — Owner proved identity
-                    //   via TO2 voucher chain. Unsigned payloads are trusted.
-                    // Model 2: Delegate channel authority — delegate has PERM.7,
-                    //   so unsigned payloads are trusted through the delegate.
-                    // Reject ONLY when a delegate is the TO2 peer and lacks PERM.7.
-                    if owner_key_point.is_some() && delegate_has_provision == false {
-                        // This is Model 1: Owner-direct. Owner proved identity via TO2.
-                        // Unsigned payloads are acceptable via channel authority.
-                        info!("BMO: accepting unsigned image-begin via Owner channel authority (Model 1)");
-                    } else if delegate_has_provision {
-                        info!("BMO: accepting unsigned image-begin via delegate channel authority (Model 2)");
-                    } else {
-                        debug!("BMO: image-begin is unsigned (no Owner key — legacy/test mode)");
-                    }
-                    value
-                }
+                None => value,
             };
 
             // Parse the image-begin message
@@ -841,45 +1029,36 @@ pub fn process_bmo_message(
             
             // Parse image-end message for SHA256 hash (CBOR map, key 1 = hash value)
             let end_hash = parse_image_end_hash(value);
-
-            // Choose which hash to verify against.
-            //
-            // `expected_hash` (key -9) arrives in `image-begin`, which is the
-            // message that carries provisioning authority; a hash in the
-            // unsigned `image-end` is transport integrity only and grants no
-            // authorisation over content. So image-begin wins, and if both are
-            // present they must agree — a disagreement means the sender is
-            // trying to substitute content after the authorising message.
             let begin_hash = session.begin.as_ref().and_then(|b| b.expected_hash.clone());
-            if let (Some(bh), Some(eh)) = (&begin_hash, &end_hash) {
-                if bh != eh {
-                    error!("BMO: image-begin expected_hash disagrees with image-end hash_value.");
-                    error!("BMO: REFUSING to chainload — content does not match what was authorised.");
+
+            // Decide what must be verified. This fails closed: there is no
+            // longer a path where a missing hash means "proceed anyway".
+            let expected_hash = match inline_hash_decision(
+                session.authority,
+                begin_hash.as_deref(),
+                end_hash.as_deref(),
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("BMO: {}", e.message());
+                    error!("BMO: REFUSING to chainload — nothing authenticated covers these bytes.");
                     session.state = BmoState::Error;
-                    let result = build_bmo_image_result(
-                        BMO_STATUS_ERROR, Some("image-begin/image-end hash disagreement"));
+                    let result = build_bmo_image_result(BMO_STATUS_ERROR, Some(e.message()));
                     return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
                 }
-            }
-            let from_begin = begin_hash.is_some();
-            let authoritative_hash = begin_hash.or(end_hash);
-            if authoritative_hash.is_some() && !from_begin {
-                warn!("BMO: image-begin carried no expected_hash (key -9); verifying against the");
-                warn!("BMO: unsigned image-end hash. This checks transport integrity but does NOT");
-                warn!("BMO: bind the image to an authorising message.");
-            }
+            };
 
             // Verify SHA256 hash of reassembled image buffer
-            if let Some(expected_hash) = &authoritative_hash {
+            {
                 let mut hasher = Sha256::new();
                 hasher.update(&session.image_buffer);
                 let computed = hasher.finalize();
                 let computed_bytes = computed.as_slice();
-                
+
                 debug!("BMO: SHA256 verification:");
                 debug!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
                 debug!("  Computed: {:02x?}", &computed_bytes[..16]);
-                
+
                 if computed_bytes != expected_hash.as_slice() {
                     error!("BMO: SHA256 MISMATCH! Image data is CORRUPTED.");
                     error!("BMO: REFUSING to chainload — data integrity check FAILED.");
@@ -888,9 +1067,6 @@ pub fn process_bmo_message(
                     return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
                 }
                 debug!("BMO: SHA256 verified OK");
-            } else {
-                warn!("BMO: No hash in image-begin (key -9) or image-end — cannot verify integrity");
-                warn!("BMO: Proceeding without hash verification (server should send a hash)");
             }
             
             session.state = BmoState::Complete;
@@ -905,28 +1081,23 @@ pub fn process_bmo_message(
             // BIOS parameter setting — same signed/unsigned gate as image-begin
             debug!("BMO: Received set message ({} bytes)", value.len());
 
-            let inner_data = unwrap_bmo_signed(value, owner_key_point,
+            // Same authorisation gate as image-begin, via the same pure
+            // function, for the same reason.
+            let (auth, inner_data) = check_bmo_authorization(
+                value, owner_key_point, delegate_has_provision,
                 crate::cose::BMO_CONTENT_TYPE_SET, device_guid);
+
+            if !auth.is_authorized() {
+                error!("BMO: set was signed but verification FAILED — rejecting");
+                session.state = BmoState::Error;
+                let result = build_bmo_set_response(BMO_STATUS_ERROR,
+                    Some("Provisioning signature verification failed"));
+                return Some((BMO_KEY_SET_RESPONSE.to_string(), result));
+            }
+
             let parse_data = match &inner_data {
                 Some(d) => d.as_slice(),
-                None if is_cbor_tag18(value) => {
-                    error!("BMO: set was signed but verification FAILED — rejecting");
-                    session.state = BmoState::Error;
-                    let result = build_bmo_set_response(BMO_STATUS_ERROR,
-                        Some("Provisioning signature verification failed"));
-                    return Some((BMO_KEY_SET_RESPONSE.to_string(), result));
-                }
-                None => {
-                    // Bare map — unsigned set. Same policy as image-begin:
-                    // Model 1 (Owner-direct) and Model 2 (delegate w/ PERM.7)
-                    // both accept unsigned payloads via channel authority.
-                    if owner_key_point.is_some() && !delegate_has_provision {
-                        info!("BMO: accepting unsigned set via Owner channel authority (Model 1)");
-                    } else if delegate_has_provision {
-                        info!("BMO: accepting unsigned set via delegate channel authority (Model 2)");
-                    }
-                    value
-                }
+                None => value,
             };
 
             // Parse the set message — CBOR map with "name" and "value" text keys
@@ -986,26 +1157,36 @@ fn process_bmo_url_delivery(session: &mut BmoSession, begin: &mut BmoImageBegin)
         return Err(BMO_ERROR_SIZE_EXCEEDED);
     }
     
-    // Verify hash if provided
-    if let Some(expected_hash) = &begin.expected_hash {
+    // The image came over plain HTTP, outside the TO2 session, so key -9 in
+    // image-begin is the only thing that can speak for these bytes. Its
+    // absence is fatal, not a warning.
+    let expected_hash = match url_hash_decision(session.authority, begin.expected_hash.as_deref()) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("BMO: {}", e.message());
+            error!("BMO: URL delivery fetches the image outside the authenticated TO2");
+            error!("BMO: channel. Without expected_hash (key -9) in image-begin, anyone on");
+            error!("BMO: the path chooses what this device executes. REFUSING.");
+            return Err(BMO_ERROR_HASH_MISMATCH);
+        }
+    };
+
+    {
         let mut hasher = Sha256::new();
         hasher.update(&image_data);
         let computed = hasher.finalize();
         let computed_bytes = computed.as_slice();
-        
+
         debug!("BMO: SHA256 verification (URL mode):");
         debug!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
         debug!("  Computed: {:02x?}", &computed_bytes[..16]);
-        
+
         if computed_bytes != expected_hash.as_slice() {
             error!("BMO: SHA256 MISMATCH! Downloaded image is CORRUPTED.");
             error!("BMO: REFUSING to chainload — data integrity check FAILED.");
             return Err(BMO_ERROR_HASH_MISMATCH);
         }
         debug!("BMO: SHA256 verified OK");
-    } else {
-        warn!("BMO: No expected hash provided for URL delivery — cannot verify integrity");
-        warn!("BMO: Proceeding without hash verification (server should provide hash)");
     }
     
     // Store the image data in the session buffer
@@ -1051,11 +1232,20 @@ fn process_bmo_meta_url_delivery(
         }
     };
 
-    // Step 2: Verify signature (if meta_signer is present)
+    // Step 2: Verify signature (if meta_signer is present).
+    // `meta_signed` records whether a signature was actually checked — an
+    // unsigned meta-payload is just bytes off the wire, so the hash inside it
+    // carries no authority and cannot be the only thing covering the image.
+    let meta_signed = begin.meta_signer.is_some();
     let meta_cbor = verify_and_extract_meta(
         &meta_data,
         begin.meta_signer.as_deref(),
     )?;
+    if !meta_signed {
+        warn!("BMO meta: meta-payload is UNSIGNED (no meta_signer, key -10).");
+        warn!("BMO meta: its url and hash are attacker-controllable; image-begin's");
+        warn!("BMO meta: expected_hash (key -9) must cover the image instead.");
+    }
 
     // Step 3: Parse MetaPayload
     let meta = parse_meta_payload(&meta_cbor).ok_or_else(|| {
@@ -1075,6 +1265,26 @@ fn process_bmo_meta_url_delivery(
             meta.hash_alg.as_deref().unwrap_or("sha256"));
     }
 
+    // Step 3b: Work out what must cover the image BEFORE downloading it.
+    // Deciding here rather than after the fetch means an unverifiable
+    // configuration is refused without pulling an image we could never trust.
+    let plan = match meta_hash_decision(
+        session.authority,
+        begin.expected_hash.as_deref(),
+        meta_signed,
+        meta.expected_hash.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("BMO meta: {}", e.message());
+            error!("BMO meta: meta-URL delivery fetches both the meta-payload and the image");
+            error!("BMO meta: outside the authenticated TO2 channel. Either sign the");
+            error!("BMO meta: meta-payload (key -10) or put expected_hash (key -9) in");
+            error!("BMO meta: image-begin. REFUSING.");
+            return Err(BMO_ERROR_HASH_MISMATCH);
+        }
+    };
+
     // Step 4: Fetch actual image
     info!("BMO meta: Fetching actual image from {}", meta.url);
     let image_data = match crate::http_api::http_get(&meta.url) {
@@ -1088,26 +1298,27 @@ fn process_bmo_meta_url_delivery(
         }
     };
 
-    // Step 5: Verify hash if present in meta-payload
-    if let Some(expected_hash) = &meta.expected_hash {
+    // Step 5: Verify every hash the plan requires. When both image-begin and
+    // a signed meta-payload carry one, both must match — that also catches a
+    // signed meta-payload pointing somewhere image-begin did not authorise.
+    {
         let mut hasher = Sha256::new();
         hasher.update(&image_data);
         let computed = hasher.finalize();
         let computed_bytes = computed.as_slice();
 
-        debug!("BMO meta: SHA256 verification:");
-        debug!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
-        debug!("  Computed: {:02x?}", &computed_bytes[..16]);
+        for (i, expected_hash) in plan.required.iter().enumerate() {
+            debug!("BMO meta: SHA256 verification {}/{}:", i + 1, plan.required.len());
+            debug!("  Expected: {:02x?}", &expected_hash[..core::cmp::min(16, expected_hash.len())]);
+            debug!("  Computed: {:02x?}", &computed_bytes[..16]);
 
-        if computed_bytes != expected_hash.as_slice() {
-            error!("BMO meta: SHA256 MISMATCH! Downloaded image is CORRUPTED.");
-            error!("BMO meta: REFUSING to chainload — data integrity check FAILED.");
-            return Err(BMO_ERROR_HASH_MISMATCH);
+            if computed_bytes != expected_hash.as_slice() {
+                error!("BMO meta: SHA256 MISMATCH! Downloaded image is CORRUPTED.");
+                error!("BMO meta: REFUSING to chainload — data integrity check FAILED.");
+                return Err(BMO_ERROR_HASH_MISMATCH);
+            }
         }
-        info!("BMO meta: Image hash VERIFIED");
-    } else {
-        warn!("BMO meta: No expected_hash in meta-payload — cannot verify image integrity");
-        warn!("BMO meta: Proceeding without hash verification");
+        info!("BMO meta: Image hash VERIFIED ({} hash(es) checked)", plan.required.len());
     }
 
     // Step 6: Store in session buffer
@@ -1586,6 +1797,197 @@ mod tests {
             &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
         );
         assert_eq!(result, BmoAuthResult::SignedFailed);
+    }
+
+    // =====================================================================
+    // Security audit 2026-09-29 — H1: image hash policy.
+    //
+    // Every one of these "must reject" cases was ACCEPTED before the policy
+    // existed: the old code warned and chainloaded anyway. The device
+    // executes whatever comes out of BMO, so a missing hash has to be fatal.
+    // =====================================================================
+
+    const H_A: &[u8] = &[0xAAu8; 32];
+    const H_B: &[u8] = &[0xBBu8; 32];
+
+    // ---- authority mapping ----
+    //
+    // `process_bmo_message` is UEFI-only, so the wiring from "how was this
+    // authorised" to "how strict is the hash rule" cannot be exercised
+    // natively end-to-end. It is routed through these two pure functions
+    // precisely so the decision itself can be tested here.
+
+    #[test]
+    fn test_auth_result_maps_to_authority() {
+        // A verified signature must produce Artifact authority — this is
+        // what forces key -9 to be present. Getting this mapping wrong
+        // would silently downgrade Model 3/4 to the permissive rules while
+        // every hash-policy test still passed.
+        assert_eq!(BmoAuthResult::SignedOk.to_authority(), BmoAuthority::Artifact);
+        assert_eq!(BmoAuthResult::UnsignedModel1.to_authority(), BmoAuthority::Channel);
+        assert_eq!(BmoAuthResult::UnsignedModel2.to_authority(), BmoAuthority::Channel);
+        assert_eq!(BmoAuthResult::UnsignedLegacy.to_authority(), BmoAuthority::Unauthenticated);
+        // Strictest available for the rejected case.
+        assert_eq!(BmoAuthResult::SignedFailed.to_authority(), BmoAuthority::Artifact);
+    }
+
+    #[test]
+    fn test_only_signed_failure_is_unauthorized() {
+        assert!(!BmoAuthResult::SignedFailed.is_authorized());
+        assert!(BmoAuthResult::SignedOk.is_authorized());
+        assert!(BmoAuthResult::UnsignedModel1.is_authorized());
+        assert!(BmoAuthResult::UnsignedModel2.is_authorized());
+        assert!(BmoAuthResult::UnsignedLegacy.is_authorized());
+    }
+
+    /// The composition that actually matters: a signed image-begin ends up
+    /// under Artifact authority, which then rejects a missing key -9. This
+    /// is the H1 chain minus the UEFI-only plumbing between the two halves.
+    #[test]
+    fn test_signed_begin_composes_to_hash_requirement() {
+        let (auth, _) = check_bmo_authorization(
+            &[0xA1, 0x00, 0x01],           // bare CBOR map — unsigned
+            Some(&[0u8; 65]), false,
+            crate::cose::BMO_CONTENT_TYPE_IMAGE_BEGIN, None);
+        assert_eq!(auth.to_authority(), BmoAuthority::Channel);
+        // Channel authority: an image-end hash suffices.
+        assert!(inline_hash_decision(auth.to_authority(), None, Some(H_A)).is_ok());
+
+        // Artifact authority (what a verified tag-18 body yields) does not.
+        let artifact = BmoAuthResult::SignedOk.to_authority();
+        assert_eq!(
+            inline_hash_decision(artifact, None, Some(H_A)).unwrap_err(),
+            HashPolicyError::SignedWithoutHash);
+    }
+
+    // ---- inline (mode 0) ----
+
+    #[test]
+    fn test_inline_signed_begin_without_hash_rejected() {
+        // Model 3/4: image-begin verified, but carries no key -9. The
+        // signature then covers only metadata, so an image-end hash from the
+        // same stream proves nothing about what was authorised.
+        let r = inline_hash_decision(BmoAuthority::Artifact, None, Some(H_A));
+        assert_eq!(r.unwrap_err(), HashPolicyError::SignedWithoutHash);
+
+        // ...and with no hash at all.
+        let r = inline_hash_decision(BmoAuthority::Artifact, None, None);
+        assert_eq!(r.unwrap_err(), HashPolicyError::SignedWithoutHash);
+    }
+
+    #[test]
+    fn test_inline_signed_begin_with_hash_accepted() {
+        // Control: the same case with key -9 present must verify, proving the
+        // rejections above come from the missing hash and nothing else.
+        let r = inline_hash_decision(BmoAuthority::Artifact, Some(H_A), None).unwrap();
+        assert_eq!(r, H_A);
+        let r = inline_hash_decision(BmoAuthority::Artifact, Some(H_A), Some(H_A)).unwrap();
+        assert_eq!(r, H_A);
+    }
+
+    #[test]
+    fn test_inline_no_hash_anywhere_rejected() {
+        // Channel authority still needs *a* hash — the Owner is authenticated
+        // but nothing commits to the bytes.
+        assert_eq!(
+            inline_hash_decision(BmoAuthority::Channel, None, None).unwrap_err(),
+            HashPolicyError::NoHash);
+        assert_eq!(
+            inline_hash_decision(BmoAuthority::Unauthenticated, None, None).unwrap_err(),
+            HashPolicyError::NoHash);
+    }
+
+    #[test]
+    fn test_inline_channel_authority_accepts_image_end_hash() {
+        // image-end arrives inside the Owner-bound TO2 session, so under
+        // channel authority it carries the Owner's word. This is the one
+        // place an image-end hash is sufficient.
+        let r = inline_hash_decision(BmoAuthority::Channel, None, Some(H_A)).unwrap();
+        assert_eq!(r, H_A);
+    }
+
+    #[test]
+    fn test_inline_begin_end_disagreement_rejected() {
+        assert_eq!(
+            inline_hash_decision(BmoAuthority::Channel, Some(H_A), Some(H_B)).unwrap_err(),
+            HashPolicyError::BeginEndDisagree);
+        assert_eq!(
+            inline_hash_decision(BmoAuthority::Artifact, Some(H_A), Some(H_B)).unwrap_err(),
+            HashPolicyError::BeginEndDisagree);
+    }
+
+    // ---- URL delivery (mode 1) ----
+
+    #[test]
+    fn test_url_delivery_without_hash_rejected() {
+        // The image is fetched over plain HTTP, outside the authenticated
+        // channel. No authority level makes that acceptable without key -9.
+        for authority in [BmoAuthority::Artifact, BmoAuthority::Channel,
+                          BmoAuthority::Unauthenticated] {
+            assert_eq!(
+                url_hash_decision(authority, None).unwrap_err(),
+                HashPolicyError::UnauthenticatedSource,
+                "URL delivery with no expected_hash must be refused ({:?})", authority);
+        }
+    }
+
+    #[test]
+    fn test_url_delivery_with_hash_accepted() {
+        let r = url_hash_decision(BmoAuthority::Channel, Some(H_A)).unwrap();
+        assert_eq!(r, H_A);
+    }
+
+    // ---- meta-URL delivery (mode 2) ----
+
+    #[test]
+    fn test_meta_unsigned_without_begin_hash_rejected() {
+        // Unsigned meta-payload: its url AND its hash are attacker-chosen, so
+        // checking the image against meta.expected_hash is checking the
+        // attacker's bytes against the attacker's hash.
+        assert_eq!(
+            meta_hash_decision(BmoAuthority::Channel, None, false, Some(H_A)).unwrap_err(),
+            HashPolicyError::UnauthenticatedSource);
+        assert_eq!(
+            meta_hash_decision(BmoAuthority::Artifact, None, false, Some(H_A)).unwrap_err(),
+            HashPolicyError::UnauthenticatedSource);
+        assert_eq!(
+            meta_hash_decision(BmoAuthority::Channel, None, false, None).unwrap_err(),
+            HashPolicyError::UnauthenticatedSource);
+    }
+
+    #[test]
+    fn test_meta_unsigned_with_begin_hash_accepted() {
+        // key -9 came over the TO2 channel, so it can stand in for a
+        // signature on the meta-payload.
+        let plan = meta_hash_decision(BmoAuthority::Artifact, Some(H_A), false, Some(H_B)).unwrap();
+        // Only the authenticated hash is enforced; the unsigned one is ignored.
+        assert_eq!(plan.required, alloc::vec![H_A.to_vec()]);
+    }
+
+    #[test]
+    fn test_meta_signed_uses_meta_hash() {
+        let plan = meta_hash_decision(BmoAuthority::Channel, None, true, Some(H_A)).unwrap();
+        assert_eq!(plan.required, alloc::vec![H_A.to_vec()]);
+    }
+
+    #[test]
+    fn test_meta_signed_without_any_hash_rejected() {
+        // A signed meta-payload that commits to no hash still leaves the
+        // image bytes uncovered.
+        assert_eq!(
+            meta_hash_decision(BmoAuthority::Channel, None, true, None).unwrap_err(),
+            HashPolicyError::UnauthenticatedSource);
+    }
+
+    #[test]
+    fn test_meta_both_hashes_enforced() {
+        // When image-begin and a signed meta-payload both commit to a hash,
+        // both are checked — a signed meta-payload cannot redirect to content
+        // image-begin did not authorise.
+        let plan = meta_hash_decision(BmoAuthority::Artifact, Some(H_A), true, Some(H_B)).unwrap();
+        assert_eq!(plan.required.len(), 2);
+        assert!(plan.required.contains(&H_A.to_vec()));
+        assert!(plan.required.contains(&H_B.to_vec()));
     }
 
     // --- Model 4: Delegate-signed with x5chain ---

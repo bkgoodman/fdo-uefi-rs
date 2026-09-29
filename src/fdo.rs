@@ -963,6 +963,33 @@ fn next_session_iv(counter: &mut u64) -> [u8; 12] {
     iv
 }
 
+/// Check a nonce the peer echoed back against the one we expect.
+///
+/// TO2 anti-replay depends on these comparisons actually happening. Both
+/// `ProveOVHdr20.NonceTO2ProveOV` and `DoneAck20.NonceTO2ProveOV` are the
+/// server echoing `HelloDeviceAck20.NonceTO2ProveDVPrep` back to us
+/// (go-fdo `to2_server_v200.go` lines 224 and 412), and the reference client
+/// aborts on a mismatch in both places (`to2_client_v200.go` lines 402, 725).
+///
+/// Until 2026-09-29 this client parsed both nonces into structs, logged them
+/// at `debug!`, and compared neither — which reads as "handled" to anyone
+/// skimming for whether the nonce is used.
+pub fn verify_nonce_echo(
+    context: &str,
+    expected: &[u8; 16],
+    received: &[u8; 16],
+) -> Result<(), FdoError> {
+    if expected != received {
+        error!("TO2: {} nonce MISMATCH — replayed or spoofed message.", context);
+        error!("  expected: {:02x?}", expected);
+        error!("  received: {:02x?}", received);
+        return Err(FdoError::ProtocolError(format!(
+            "{} nonce mismatch", context)));
+    }
+    debug!("TO2: {} nonce echo verified", context);
+    Ok(())
+}
+
 /// Protocol version this client speaks. Selects domain-separation AAD:
 /// FDO 2.0 uses per-context tags, FDO 1.01 used an empty external_aad.
 pub const FDO_PROTOCOL_VERSION: u16 = 200;
@@ -1650,8 +1677,17 @@ pub fn parse_to2_done_ack(data: &[u8]) -> Result<DoneAck, FdoError> {
 pub fn perform_to2_hello(owner_url: &str, guid: &[u8; 16]) -> Result<(To2HelloDeviceAck, Option<String>, Vec<u8>), FdoError> {
     debug!("TO2: Sending HelloDeviceProbe to {}", owner_url);
     
-    // Generate random sugar (16 bytes)
-    let sugar: [u8; 16] = [0xaa; 16]; // TODO: use real random
+    // Sugar: 16 random bytes mixed into HelloDeviceProbe. The owner folds the
+    // whole probe into HelloDeviceAck20.HashPrev, so this is the device's
+    // contribution of freshness to the TO2 message chain — it must be
+    // unpredictable. It was the fixed constant [0xaa; 16] until 2026-09-29,
+    // which made the device side of that chain entirely predictable.
+    // (go-fdo's client uses rand.Read here: to2_client_v200.go:199.)
+    let sugar_vec = crate::tpm::tpm_get_random(16)
+        .ok_or_else(|| FdoError::CryptoError(String::from(
+            "TPM GetRandom failed for HelloDeviceProbe sugar")))?;
+    let mut sugar = [0u8; 16];
+    sugar.copy_from_slice(&sugar_vec);
     
     // Build HelloDeviceProbe message
     let hello_probe = build_to2_hello_device_probe(guid, &sugar);
@@ -2019,6 +2055,17 @@ pub fn perform_to2(
                 "ProveOVHdr signature verification failed")));
         }
     }
+
+    // Freshness: the Owner must echo the nonce it issued in HelloDeviceAck20
+    // and that we returned in ProveDevice20. Checked only now, after the
+    // signature above — a nonce comparison on unauthenticated bytes proves
+    // nothing, and answering it early would hand an attacker an oracle.
+    // Without this, a recorded ProveOVHdr from a previous session replays.
+    verify_nonce_echo(
+        "ProveOVHdr20",
+        &ack.nonce_to2_prove_dv,
+        &prove_ov.nonce_to2_prove_ov,
+    )?;
     // Verify the TO1 rendezvous blob against the same Owner key. Per FDO, if
     // the to1d signature does not verify the device must assume a man in the
     // middle is monitoring its traffic and fail TO2 immediately — an attacker
@@ -2273,8 +2320,15 @@ pub fn perform_to2(
     
     // Parse DoneAck: [nonce_to2_prove_dv] - echo of our original nonce
     let done_ack = parse_to2_done_ack(&done_ack_plain)?;
+
+    // The owner echoes the same nonce here as in ProveOVHdr20 (go-fdo
+    // to2_server_v200.go:412 reads it back from session state). Abort on
+    // mismatch — this is the last chance to notice we finished a protocol
+    // run against a different session than the one we started, and the very
+    // next thing this function does is chainload.
+    verify_nonce_echo("DoneAck20", &ack.nonce_to2_prove_dv, &done_ack.nonce)?;
+
     info!("TO2 Step 6 complete: DoneAck received");
-    debug!("  nonce_to2_prove_dv: {:02x?}", &done_ack.nonce[..8]);
     
     info!("=== TO2 Protocol Complete! ===");
     
@@ -2906,6 +2960,47 @@ mod tests {
         // Decrypt with tampered ciphertext must fail
         let result = cose_decrypt0_a256gcm(&key, &build_encrypted_message(&parsed_nonce, &parsed_ct));
         assert!(result.is_err(), "tampered ciphertext must fail COSE_Encrypt0 decryption");
+    }
+
+    // =====================================================================
+    // Security audit 2026-09-29 — M1: TO2 nonce echo verification.
+    //
+    // Both ProveOVHdr20 and DoneAck20 echo HelloDeviceAck20's
+    // NonceTO2ProveDVPrep. Until this fix the client parsed both, logged
+    // them, and compared neither, so a recorded ProveOVHdr20 replayed.
+    // =====================================================================
+
+    #[test]
+    fn test_nonce_echo_matching_accepted() {
+        let n = [0x5au8; 16];
+        assert!(verify_nonce_echo("ProveOVHdr20", &n, &n).is_ok());
+    }
+
+    #[test]
+    fn test_nonce_echo_mismatch_rejected() {
+        let expected = [0x5au8; 16];
+        let mut received = expected;
+        received[15] ^= 0x01; // single-bit change in the last byte
+        let r = verify_nonce_echo("ProveOVHdr20", &expected, &received);
+        assert!(r.is_err(), "a one-bit nonce difference must abort TO2");
+    }
+
+    #[test]
+    fn test_nonce_echo_rejects_all_zero_and_first_byte() {
+        let expected = [0xa5u8; 16];
+
+        // An omitted/zeroed nonce must not pass. parse_prove_ov_hdr_payload
+        // leaves the array zeroed when the bstr is shorter than 16 bytes, so
+        // this is the shape a truncated nonce actually takes.
+        assert!(verify_nonce_echo("ProveOVHdr20", &expected, &[0u8; 16]).is_err(),
+            "an all-zero nonce must be rejected");
+
+        // Difference in the FIRST byte must be caught too — guards against a
+        // comparison that only looks at a prefix or suffix.
+        let mut first = expected;
+        first[0] ^= 0xff;
+        assert!(verify_nonce_echo("DoneAck20", &expected, &first).is_err(),
+            "a difference in the first byte must be caught");
     }
 
     // --- SetupDevice: wrong nonce length ---
