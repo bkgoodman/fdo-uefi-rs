@@ -2360,4 +2360,29 @@ mod tests {
         assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
             "raw CBOR when signed expected must fail");
     }
+
+    #[test]
+    fn test_verify_meta_with_real_go_fdo_bytes() {
+        // Actual wire bytes captured from go-fdo start15-meta-url.sh signed test.
+        // This validates cross-implementation interop: go-fdo signs with
+        // cose.AADMetaPayload, we verify with domain_aad(AAD_TAG_META_PAYLOAD).
+        let meta_hex = "d28443a10126a05885a50078186170706c69636174696f6e2f782d756566692d696d616765017823687474703a2f2f31302e302e322e323a393039302f746573742d696d6167652e65666903667368613235360458202500aaa08a09c4bb1e02746842626ba8bc95bd9cfc9202fb9ef791fc3d23392f06766d6574612d746573742d696d6167652d7369676e6564584096d12d5fc8556add5aec81573f6bdb44b76cffa1a09f0bf58cd255a9254515699fe0571171dca6512993a171e23bbfae5c6020eab61f69152274d023d6dec6a1";
+        let signer_hex = "a4010220012158203d28dc249ca429ea5340a6ab935447715067651a1958e8235695b972dd97213b2258201541a8871e240806c0a23276c3057937ab86b5bc16552f3e3a8cbc960d404e4e";
+
+        let meta_data: Vec<u8> = (0..meta_hex.len()).step_by(2)
+            .map(|i| u8::from_str_radix(&meta_hex[i..i+2], 16).unwrap())
+            .collect();
+        let signer_data: Vec<u8> = (0..signer_hex.len()).step_by(2)
+            .map(|i| u8::from_str_radix(&signer_hex[i..i+2], 16).unwrap())
+            .collect();
+
+        // Verify COSE_Key parses correctly
+        let point = parse_cose_key_p256(&signer_data);
+        assert!(point.is_some(), "COSE_Key must parse: got None");
+        assert_eq!(point.unwrap().len(), 65, "P-256 uncompressed point must be 65 bytes");
+
+        // Verify the meta-payload signature
+        let result = verify_and_extract_meta(&meta_data, Some(&signer_data));
+        assert!(result.is_ok(), "go-fdo signed meta-payload must verify: {:?}", result.err());
+    }
 }

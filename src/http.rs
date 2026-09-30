@@ -48,7 +48,11 @@ fn start_snp_interface() -> Option<uefi::Handle> {
     
     for handle in snp_handles.iter() {
         if let Ok(snp) = boot::open_protocol_exclusive::<SimpleNetwork>(*handle) {
-            let snp = core::mem::ManuallyDrop::new(snp);
+            // Do NOT use ManuallyDrop here — we must release the exclusive
+            // SNP lock so that connect_controller() can bind IP4Dxe/TcpDxe
+            // to this handle. The K800 ManuallyDrop fix applies only to
+            // protocols we keep using (IP4Config2, HttpBinding), not to
+            // start-and-release paths like this one.
             debug!("SNP mode: {:?}", snp.mode());
             
             // Try to start the interface
@@ -61,6 +65,7 @@ fn start_snp_interface() -> Option<uefi::Handle> {
             match snp.initialize(0, 0) {
                 Ok(_) => {
                     debug!("SNP initialized successfully");
+                    // snp drops here, releasing the exclusive lock
                     return Some(*handle);
                 }
                 Err(e) => {

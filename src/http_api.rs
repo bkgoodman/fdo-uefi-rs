@@ -97,9 +97,11 @@ fn ensure_network_configured() {
         )) {
             for handle in snp_handles.iter() {
                 if let Ok(snp) = boot::open_protocol_exclusive::<SimpleNetwork>(*handle) {
-                    let snp = core::mem::ManuallyDrop::new(snp);
+                    // No ManuallyDrop here — must release exclusive SNP lock
+                    // before connect_controller() so IP4Dxe/TcpDxe can bind.
                     let _ = snp.start();
                     let _ = snp.initialize(0, 0);
+                    drop(snp); // release exclusive lock
                     let empty_list: &[Option<uefi::Handle>] = &[];
                     let _ = boot::connect_controller(*handle, empty_list, None, true);
                     break;

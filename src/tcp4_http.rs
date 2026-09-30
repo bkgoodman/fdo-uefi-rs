@@ -710,7 +710,13 @@ fn extract_content_length(headers: &[u8]) -> Option<usize> {
 fn parse_http_response(data: &[u8]) -> Option<HttpPostResponse> {
     let header_end = find_header_end(data)?;
     let headers_section = &data[..header_end];
-    let body = data[header_end..].to_vec();
+    // Use Content-Length to trim body precisely — TCP may deliver extra bytes
+    let raw_body = &data[header_end..];
+    let body = if let Some(cl) = extract_content_length(headers_section) {
+        if cl <= raw_body.len() { raw_body[..cl].to_vec() } else { raw_body.to_vec() }
+    } else {
+        raw_body.to_vec()
+    };
     
     let headers_str = core::str::from_utf8(headers_section).ok()?;
     
@@ -1021,7 +1027,18 @@ pub fn tcp4_http_get(url: &str) -> Option<Vec<u8>> {
                     }
                 }
             }
-            let body = response_buf[header_end..].to_vec();
+            // Use Content-Length to trim body precisely — TCP may deliver
+            // extra bytes (FIN, keep-alive probe) past the actual HTTP body.
+            let raw_body = &response_buf[header_end..];
+            let body = if let Some(cl) = extract_content_length(&response_buf[..header_end]) {
+                if cl <= raw_body.len() {
+                    raw_body[..cl].to_vec()
+                } else {
+                    raw_body.to_vec()
+                }
+            } else {
+                raw_body.to_vec()
+            };
             debug!("TCP4 HTTP GET completed: {} bytes", body.len());
             Some(body)
         } else {
