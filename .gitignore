@@ -21,6 +21,7 @@ Thumbs.db
 *.a
 *.so
 *.dylib
+.devin/*
 
 # EFI disk images (generated)
 /build/*.img

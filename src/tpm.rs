@@ -62,6 +62,56 @@ fn unpack_u32(buf: &[u8]) -> u32 {
     ((buf[2] as u32) << 8) | (buf[3] as u32)
 }
 
+/// TPM_RC_RETRY (0x922) — the TPM was not able to start the command.
+/// Per TCG Part 1, the caller should resubmit the unchanged command.
+const TPM_RC_RETRY: u32 = 0x922;
+
+/// Maximum retry attempts for TPM_RC_RETRY
+const TPM_RETRY_MAX: usize = 5;
+
+/// Delay between retries in milliseconds
+const TPM_RETRY_DELAY_MS: u64 = 200;
+
+/// Submit a TPM command with automatic retry on TPM_RC_RETRY.
+///
+/// Returns Ok(response) on success, Err(rc) on non-retryable error,
+/// or Err(0xFFFFFFFF) if all retries exhausted or submit_command fails.
+///
+/// NOTE: Every TPM command can return TPM_RC_RETRY — the TPM uses it for
+/// lazy self-test and internal busy states. Always use this wrapper instead
+/// of calling submit_command directly, except for best-effort/cleanup
+/// operations (FlushContext, EvictControl of stale handles) where failure
+/// is acceptable.
+fn tpm_submit_with_retry(
+    tcg: &mut uefi::proto::tcg::v2::Tcg,
+    cmd: &[u8],
+    resp_size: usize,
+) -> Result<Vec<u8>, u32> {
+    for attempt in 0..TPM_RETRY_MAX {
+        let mut response = vec![0u8; resp_size];
+        if tcg.submit_command(cmd, &mut response).is_err() {
+            warn!("TPM: submit_command failed (attempt {})", attempt);
+            boot::stall(core::time::Duration::from_millis(TPM_RETRY_DELAY_MS));
+            continue;
+        }
+        if response.len() < 10 {
+            return Err(0xFFFFFFFF);
+        }
+        let rc = unpack_u32(&response[6..10]);
+        if rc == TPM_RC_RETRY {
+            debug!("TPM: got TPM_RC_RETRY (0x922), attempt {}, retrying...", attempt);
+            boot::stall(core::time::Duration::from_millis(TPM_RETRY_DELAY_MS));
+            continue;
+        }
+        if rc != 0 {
+            return Err(rc);
+        }
+        return Ok(response);
+    }
+    warn!("TPM: command failed after {} retries", TPM_RETRY_MAX);
+    Err(0xFFFFFFFF)
+}
+
 /// Build TPM2_NV_ReadPublic command to get NV index size
 fn build_nv_read_public_cmd(nv_index: u32) -> Vec<u8> {
     let mut cmd = vec![0u8; 14];
@@ -653,21 +703,18 @@ pub fn tpm_get_random(len: usize) -> Option<Vec<u8>> {
 
         let want = core::cmp::min(len - out.len(), 32) as u16;
         let cmd = build_get_random_cmd(want);
-        let mut response = vec![0u8; 256];
 
-        if tcg.submit_command(&cmd, &mut response).is_err() {
-            warn!("TPM2_GetRandom submit failed");
-            return None;
-        }
+        let response = match tpm_submit_with_retry(&mut tcg, &cmd, 256) {
+            Ok(r) => r,
+            Err(rc) => {
+                warn!("TPM2_GetRandom failed: rc=0x{:08x}", rc);
+                return None;
+            }
+        };
 
         // Response: tag(2) size(4) rc(4) randomBytes(TPM2B: size(2) || bytes)
         if response.len() < 12 {
             warn!("TPM2_GetRandom response too short");
-            return None;
-        }
-        let rc = unpack_u32(&response[6..10]);
-        if rc != 0 {
-            warn!("TPM2_GetRandom returned rc=0x{:08x}", rc);
             return None;
         }
         let n = unpack_u16(&response[10..12]) as usize;
@@ -689,15 +736,15 @@ pub fn tpm_create_ecdh_key() -> Option<TpmEcdhKeyPair> {
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
     
     let cmd = build_create_primary_ecdh_cmd();
-    let mut response = vec![0u8; 1024];
     
     debug!("TPM: Creating ECDH key...");
-    let result = tcg.submit_command(&cmd, &mut response);
-    
-    if result.is_err() {
-        warn!("TPM2_CreatePrimary failed");
-        return None;
-    }
+    let response = match tpm_submit_with_retry(&mut tcg, &cmd, 1024) {
+        Ok(r) => r,
+        Err(rc) => {
+            warn!("TPM2_CreatePrimary (ECDH) failed: rc=0x{:08x}", rc);
+            return None;
+        }
+    };
     
     let key_pair = parse_create_primary_response(&response)?;
     debug!("TPM: ECDH key created, handle=0x{:08x}", key_pair.handle);
@@ -713,15 +760,15 @@ pub fn tpm_ecdh_compute_secret(key_handle: u32, peer_x: &[u8], peer_y: &[u8]) ->
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
     
     let cmd = build_ecdh_zgen_cmd(key_handle, peer_x, peer_y);
-    let mut response = vec![0u8; 512];
     
     debug!("TPM: Computing ECDH shared secret...");
-    let result = tcg.submit_command(&cmd, &mut response);
-    
-    if result.is_err() {
-        warn!("TPM2_ECDH_ZGen failed");
-        return None;
-    }
+    let response = match tpm_submit_with_retry(&mut tcg, &cmd, 512) {
+        Ok(r) => r,
+        Err(rc) => {
+            warn!("TPM2_ECDH_ZGen failed: rc=0x{:08x}", rc);
+            return None;
+        }
+    };
     
     let secret = parse_ecdh_zgen_response(&response)?;
     debug!("TPM: Shared secret computed: {} bytes", secret.len());
@@ -804,18 +851,14 @@ pub fn tpm_read_public(handle: u32) -> Option<(Vec<u8>, Vec<u8>)> {
     pack_u32(&mut cmd[6..10], TPM2_CC_READ_PUBLIC);
     pack_u32(&mut cmd[10..14], handle);
     
-    let mut response = vec![0u8; 512];
     debug!("TPM: ReadPublic on handle 0x{:08x}...", handle);
-    if tcg.submit_command(&cmd, &mut response).is_err() {
-        warn!("TPM: ReadPublic submit failed for 0x{:08x}", handle);
-        return None;
-    }
-    
-    let rc = unpack_u32(&response[6..10]);
-    if rc != 0 {
-        warn!("TPM: ReadPublic error 0x{:08x} for handle 0x{:08x}", rc, handle);
-        return None;
-    }
+    let response = match tpm_submit_with_retry(&mut tcg, &cmd, 512) {
+        Ok(r) => r,
+        Err(rc) => {
+            warn!("TPM: ReadPublic error 0x{:08x} for handle 0x{:08x}", rc, handle);
+            return None;
+        }
+    };
     
     // Parse TPM2B_PUBLIC from response
     // Response layout after header (10 bytes):
@@ -933,40 +976,14 @@ pub fn tpm_sign_with_persistent(persistent_handle: u32, digest: &[u8; 32]) -> Op
     // transient contexts and are not flushed by the UEFI resource manager.
     let cmd = build_sign_cmd(persistent_handle, digest);
     
-    // Retry loop for TPM_RC_RETRY (0x922) — the TPM may need time to
-    // become ready after flushing transient handles or other operations.
-    // This matches the retry pattern used by EvictControl and NV DefineSpace.
-    let mut signed = false;
-    let mut response = vec![0u8; 512];
-    for attempt in 0..5 {
-        response = vec![0u8; 512];
-        debug!("TPM: Signing with persistent handle 0x{:08x} (attempt {})...", persistent_handle, attempt);
-        let result = tcg.submit_command(&cmd, &mut response);
-        
-        if result.is_err() {
-            warn!("TPM2_Sign submit failed for handle 0x{:08x} (attempt {})", persistent_handle, attempt);
-            boot::stall(core::time::Duration::from_millis(200));
-            continue;
+    debug!("TPM: Signing with persistent handle 0x{:08x}...", persistent_handle);
+    let response = match tpm_submit_with_retry(&mut tcg, &cmd, 512) {
+        Ok(r) => r,
+        Err(rc) => {
+            warn!("TPM2_Sign failed: rc=0x{:08x} for handle 0x{:08x}", rc, persistent_handle);
+            return None;
         }
-        
-        let rc = unpack_u32(&response[6..10]);
-        if rc == 0x922 {
-            debug!("TPM2_Sign got TPM_RC_RETRY (0x922), retrying... (attempt {})", attempt);
-            boot::stall(core::time::Duration::from_millis(200));
-            continue;
-        }
-        if rc == 0 {
-            signed = true;
-            break;
-        }
-        warn!("TPM2_Sign error: 0x{:08x} for handle 0x{:08x}", rc, persistent_handle);
-        return None;
-    }
-    
-    if !signed {
-        warn!("TPM2_Sign failed after retries for handle 0x{:08x}", persistent_handle);
-        return None;
-    }
+    };
     
     let (r, s) = parse_sign_response(&response)?;
     debug!("TPM: Signature obtained: r={} bytes, s={} bytes", r.len(), s.len());
@@ -1005,35 +1022,28 @@ pub fn tpm_nv_read(nv_index: u32) -> Option<Vec<u8>> {
     
     // First, get the NV index size
     let read_public_cmd = build_nv_read_public_cmd(nv_index);
-    let mut response = vec![0u8; 512];
     
-    let result = tcg.submit_command(&read_public_cmd, &mut response);
-    
-    if result.is_err() {
-        warn!("submit_command (NV_ReadPublic) failed for 0x{:08x}", nv_index);
-        return None;
-    }
-    
-    let rc = unpack_u32(&response[6..10]);
-    debug!("NV_ReadPublic response: rc=0x{:08x} for index 0x{:08x}", rc, nv_index);
-    if rc != 0 {
-        debug!("NV index 0x{:08x} does not exist (rc=0x{:08x})", nv_index, rc);
-        return None;
-    }
+    let response = match tpm_submit_with_retry(&mut tcg, &read_public_cmd, 512) {
+        Ok(r) => r,
+        Err(rc) => {
+            debug!("NV index 0x{:08x} does not exist or read failed (rc=0x{:08x})", nv_index, rc);
+            return None;
+        }
+    };
     
     let data_size = parse_nv_read_public_response(&response)?;
     debug!("NV index 0x{:08x} size: {} bytes", nv_index, data_size);
     
     // Now read the actual data
     let read_cmd = build_nv_read_cmd(nv_index, data_size, 0);
-    let mut response = vec![0u8; 1024];
     
-    let result = tcg.submit_command(&read_cmd, &mut response);
-    
-    if result.is_err() {
-        warn!("submit_command (NV_Read) failed");
-        return None;
-    }
+    let response = match tpm_submit_with_retry(&mut tcg, &read_cmd, 1024) {
+        Ok(r) => r,
+        Err(rc) => {
+            warn!("NV_Read failed for 0x{:08x}: rc=0x{:08x}", nv_index, rc);
+            return None;
+        }
+    };
     
     parse_nv_read_response(&response)
 }
@@ -1842,27 +1852,15 @@ pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmS
     
     // Step 1: CreatePrimary signing key
     let cmd = build_create_primary_signing_cmd();
-    let mut response = vec![0u8; 1024];
     
     debug!("TPM: Creating signing key ({} byte cmd)...", cmd.len());
-    let result = tcg.submit_command(&cmd, &mut response);
-    
-    if result.is_err() {
-        warn!("TPM2_CreatePrimary (signing) UEFI submit failed: {:?}", result.err());
-        return None;
-    }
-    
-    if response.len() < 10 {
-        warn!("TPM2_CreatePrimary response too short: {} bytes", response.len());
-        return None;
-    }
-    
-    let rc = unpack_u32(&response[6..10]);
-    debug!("TPM2_CreatePrimary response: rc=0x{:08x}, resp_len={}", rc, unpack_u32(&response[2..6]));
-    if rc != 0 {
-        warn!("TPM2_CreatePrimary error code: 0x{:08x}", rc);
-        return None;
-    }
+    let response = match tpm_submit_with_retry(&mut tcg, &cmd, 1024) {
+        Ok(r) => r,
+        Err(rc) => {
+            warn!("TPM2_CreatePrimary (signing) failed: rc=0x{:08x}", rc);
+            return None;
+        }
+    };
     
     let key_pair = parse_create_primary_response(&response)?;
     let transient_handle = key_pair.handle;
@@ -1870,44 +1868,23 @@ pub fn tpm_create_and_persist_signing_key(persistent_handle: u32) -> Option<TpmS
     
     // Step 2: EvictControl to persist the transient handle (same session!)
     let persist_cmd = build_evict_control_cmd(transient_handle, persistent_handle);
-    let mut persist_resp = vec![0u8; 64];
     
-    let mut persisted = false;
-    for attempt in 0..5 {
-        let mut resp = vec![0u8; 64];
-        if tcg.submit_command(&persist_cmd, &mut resp).is_err() {
-            warn!("TPM: EvictControl submit failed (attempt {})", attempt);
-            boot::stall(core::time::Duration::from_millis(200));
-            continue;
+    match tpm_submit_with_retry(&mut tcg, &persist_cmd, 64) {
+        Ok(_) => {
+            debug!("TPM: Signing key persisted at 0x{:08x}", persistent_handle);
         }
-        let rc = unpack_u32(&resp[6..10]);
-        debug!("TPM: EvictControl(0x{:08x}->0x{:08x}) rc=0x{:08x} (attempt {})", 
-              transient_handle, persistent_handle, rc, attempt);
-        if rc == 0x922 {
-            boot::stall(core::time::Duration::from_millis(200));
-            continue;
+        Err(rc) => {
+            warn!("TPM: Failed to persist signing key at 0x{:08x}: rc=0x{:08x}", persistent_handle, rc);
+            // Flush the transient handle to avoid leaking TPM object slots.
+            // Without this, subsequent CreatePrimary calls may fail with
+            // TPM_RC_OBJECT_MEMORY (0x902).
+            let flush_cmd = build_flush_context_cmd(transient_handle);
+            let mut flush_resp = vec![0u8; 32];
+            let _ = tcg.submit_command(&flush_cmd, &mut flush_resp);
+            debug!("TPM: Flushed leaked transient 0x{:08x} after persist failure", transient_handle);
+            return None;
         }
-        if rc == 0 {
-            persisted = true;
-            break;
-        }
-        warn!("TPM: EvictControl error: 0x{:08x}", rc);
-        break;
     }
-    
-    if !persisted {
-        warn!("TPM: Failed to persist signing key at 0x{:08x}", persistent_handle);
-        // Flush the transient handle to avoid leaking TPM object slots.
-        // Without this, subsequent CreatePrimary calls may fail with
-        // TPM_RC_OBJECT_MEMORY (0x902).
-        let flush_cmd = build_flush_context_cmd(transient_handle);
-        let mut flush_resp = vec![0u8; 32];
-        let _ = tcg.submit_command(&flush_cmd, &mut flush_resp);
-        debug!("TPM: Flushed leaked transient 0x{:08x} after persist failure", transient_handle);
-        return None;
-    }
-    
-    debug!("TPM: Signing key persisted at 0x{:08x}", persistent_handle);
     Some(TpmSigningKey {
         handle: persistent_handle,
         public_x: key_pair.public_x,
@@ -2033,23 +2010,17 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
     
     // Step 1: CreatePrimary HMAC key
     let cmd = build_create_primary_hmac_cmd();
-    let mut response = vec![0u8; 512];
     
     debug!("TPM: Creating HMAC key...");
-    let result = tcg.submit_command(&cmd, &mut response);
-    
-    if result.is_err() {
-        warn!("TPM2_CreatePrimary (HMAC) failed");
-        return None;
-    }
+    let response = match tpm_submit_with_retry(&mut tcg, &cmd, 512) {
+        Ok(r) => r,
+        Err(rc) => {
+            warn!("TPM2_CreatePrimary (HMAC) failed: rc=0x{:08x}", rc);
+            return None;
+        }
+    };
     
     if response.len() < 14 {
-        return None;
-    }
-    
-    let response_code = unpack_u32(&response[6..10]);
-    if response_code != 0 {
-        warn!("TPM2_CreatePrimary (HMAC) error: 0x{:08x}", response_code);
         return None;
     }
     
@@ -2060,33 +2031,10 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
     let hmac_cmd = build_hmac_cmd(hmac_handle, data);
     debug!("TPM: HMAC command: {} bytes, header+auth: {:02x?}", hmac_cmd.len(), &hmac_cmd[..hmac_cmd.len().min(30)]);
     
-    let mut hmac_value = None;
-    for attempt in 0..5 {
-        let mut hmac_response = vec![0u8; 256];
-        
-        let result = tcg.submit_command(&hmac_cmd, &mut hmac_response);
-        if result.is_err() {
-            warn!("TPM2_HMAC submit_command failed (attempt {})", attempt);
-            boot::stall(core::time::Duration::from_millis(100));
-            continue;
-        }
-        
-        let rc = unpack_u32(&hmac_response[6..10]);
-        if rc == 0x922 {
-            debug!("TPM: HMAC got TPM_RC_RETRY (0x922), attempt {}, retrying after delay...", attempt);
-            boot::stall(core::time::Duration::from_millis(200));
-            continue;
-        }
-        
-        debug!("TPM: HMAC response first 14: {:02x?}", &hmac_response[..14]);
-        hmac_value = parse_hmac_response(&hmac_response);
-        break;
-    }
-    
-    let hmac_value = match hmac_value {
-        Some(v) => v,
-        None => {
-            warn!("TPM2_HMAC failed after all retries");
+    let hmac_response = match tpm_submit_with_retry(&mut tcg, &hmac_cmd, 256) {
+        Ok(r) => r,
+        Err(rc) => {
+            warn!("TPM2_HMAC failed during DI: rc=0x{:08x}", rc);
             // Flush the transient HMAC key handle to avoid leaking TPM object slots.
             let flush_cmd = build_flush_context_cmd(hmac_handle);
             let mut flush_resp = vec![0u8; 32];
@@ -2095,43 +2043,35 @@ pub fn tpm_create_hmac_and_persist(data: &[u8], persistent_handle: u32) -> Optio
             return None;
         }
     };
+    debug!("TPM: HMAC response first 14: {:02x?}", &hmac_response[..14]);
+    let hmac_value = match parse_hmac_response(&hmac_response) {
+        Some(v) => v,
+        None => {
+            warn!("TPM2_HMAC: failed to parse response");
+            let flush_cmd = build_flush_context_cmd(hmac_handle);
+            let mut flush_resp = vec![0u8; 32];
+            let _ = tcg.submit_command(&flush_cmd, &mut flush_resp);
+            debug!("TPM: Flushed leaked transient 0x{:08x} after HMAC parse failure", hmac_handle);
+            return None;
+        }
+    };
     
     // Step 3: EvictControl to persist the HMAC key (same session!)
     let persist_cmd = build_evict_control_cmd(hmac_handle, persistent_handle);
     
-    let mut persisted = false;
-    for attempt in 0..5 {
-        let mut resp = vec![0u8; 64];
-        if tcg.submit_command(&persist_cmd, &mut resp).is_err() {
-            warn!("TPM: EvictControl (HMAC) submit failed (attempt {})", attempt);
-            boot::stall(core::time::Duration::from_millis(200));
-            continue;
+    match tpm_submit_with_retry(&mut tcg, &persist_cmd, 64) {
+        Ok(_) => {
+            debug!("TPM: HMAC key persisted at 0x{:08x}", persistent_handle);
         }
-        let rc = unpack_u32(&resp[6..10]);
-        debug!("TPM: EvictControl HMAC(0x{:08x}->0x{:08x}) rc=0x{:08x} (attempt {})",
-              hmac_handle, persistent_handle, rc, attempt);
-        if rc == 0x922 {
-            boot::stall(core::time::Duration::from_millis(200));
-            continue;
+        Err(rc) => {
+            warn!("TPM: Failed to persist HMAC key at 0x{:08x}: rc=0x{:08x}", persistent_handle, rc);
+            // Flush the transient handle to avoid leaking TPM object slots.
+            let flush_cmd = build_flush_context_cmd(hmac_handle);
+            let mut flush_resp = vec![0u8; 32];
+            let _ = tcg.submit_command(&flush_cmd, &mut flush_resp);
+            debug!("TPM: Flushed leaked transient 0x{:08x} after HMAC persist failure", hmac_handle);
+            // Still return the HMAC value - DI can continue, just key won't be persistent
         }
-        if rc == 0 {
-            persisted = true;
-            break;
-        }
-        warn!("TPM: EvictControl (HMAC) error: 0x{:08x}", rc);
-        break;
-    }
-    
-    if !persisted {
-        warn!("TPM: Failed to persist HMAC key at 0x{:08x}", persistent_handle);
-        // Flush the transient handle to avoid leaking TPM object slots.
-        let flush_cmd = build_flush_context_cmd(hmac_handle);
-        let mut flush_resp = vec![0u8; 32];
-        let _ = tcg.submit_command(&flush_cmd, &mut flush_resp);
-        debug!("TPM: Flushed leaked transient 0x{:08x} after HMAC persist failure", hmac_handle);
-        // Still return the HMAC value - DI can continue, just key won't be persistent
-    } else {
-        debug!("TPM: HMAC key persisted at 0x{:08x}", persistent_handle);
     }
     
     Some((persistent_handle, hmac_value))
@@ -2239,14 +2179,15 @@ pub fn tpm_hmac(key_handle: u32, data: &[u8]) -> Option<Vec<u8>> {
     
     let cmd = build_hmac_cmd(key_handle, data);
     debug!("TPM: HMAC command: {} bytes, first 20: {:02x?}", cmd.len(), &cmd[..cmd.len().min(20)]);
-    let mut response = vec![0u8; 256];
-    
-    let result = tcg.submit_command(&cmd, &mut response);
-    if result.is_err() {
-        warn!("TPM2_HMAC submit_command failed");
-        return None;
-    }
-    
+
+    let response = match tpm_submit_with_retry(&mut tcg, &cmd, 256) {
+        Ok(r) => r,
+        Err(rc) => {
+            warn!("TPM2_HMAC failed: rc=0x{:08x}", rc);
+            return None;
+        }
+    };
+
     debug!("TPM: HMAC response first 14: {:02x?}", &response[..14]);
     parse_hmac_response(&response)
 }
@@ -2326,13 +2267,14 @@ pub fn tpm_sign_ecdsa(key_handle: u32, digest: &[u8]) -> Option<Vec<u8>> {
     let mut tcg = boot::open_protocol_exclusive::<Tcg>(tcg_handle).ok()?;
     
     let cmd = build_sign_cmd(key_handle, digest);
-    let mut response = vec![0u8; 256];
     
-    let result = tcg.submit_command(&cmd, &mut response);
-    if result.is_err() {
-        warn!("TPM2_Sign failed");
-        return None;
-    }
+    let response = match tpm_submit_with_retry(&mut tcg, &cmd, 256) {
+        Ok(r) => r,
+        Err(rc) => {
+            warn!("TPM2_Sign (ECDSA) failed: rc=0x{:08x}", rc);
+            return None;
+        }
+    };
     
     let (r, s) = parse_sign_response(&response)?;
     
@@ -2358,23 +2300,14 @@ pub fn tpm_evict_control(transient_handle: u32, persistent_handle: u32) -> bool 
     };
     
     let cmd = build_evict_control_cmd(transient_handle, persistent_handle);
-    let mut response = vec![0u8; 64];
     
-    if tcg.submit_command(&cmd, &mut response).is_err() {
-        return false;
+    match tpm_submit_with_retry(&mut tcg, &cmd, 64) {
+        Ok(_) => true,
+        Err(rc) => {
+            warn!("TPM2_EvictControl failed: rc=0x{:08x}", rc);
+            false
+        }
     }
-    
-    if response.len() < 10 {
-        return false;
-    }
-    
-    let response_code = unpack_u32(&response[6..10]);
-    if response_code != 0 {
-        warn!("TPM2_EvictControl error: 0x{:08x}", response_code);
-        return false;
-    }
-    
-    true
 }
 
 /// Build TPM2_EvictControl command
@@ -2436,70 +2369,29 @@ pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
     let define_cmd = build_nv_define_space_cmd(nv_index, data.len() as u16);
     debug!("NV DefineSpace cmd ({} bytes) for index 0x{:08x}, size={}", define_cmd.len(), nv_index, data.len());
     
-    let mut define_ok = false;
-    for attempt in 0..5 {
-        let mut response = vec![0u8; 64];
-        if tcg.submit_command(&define_cmd, &mut response).is_ok() {
-            let rc = unpack_u32(&response[6..10]);
-            debug!("NV DefineSpace response: rc=0x{:08x} (attempt {})", rc, attempt);
-            if rc == 0x922 {
-                debug!("NV DefineSpace got TPM_RC_RETRY, retrying...");
-                boot::stall(core::time::Duration::from_millis(200));
-                continue;
-            }
-            if rc == 0 || rc == 0x0000014c {  // Success or NV_DEFINED (index still exists)
-                define_ok = true;
-                break;
-            }
-            warn!("TPM2_NV_DefineSpace error: 0x{:08x}", rc);
-            break;
-        } else {
-            warn!("NV DefineSpace submit_command failed (attempt {})", attempt);
-            boot::stall(core::time::Duration::from_millis(200));
+    match tpm_submit_with_retry(&mut tcg, &define_cmd, 64) {
+        Ok(_) => {}
+        Err(0x0000014c) => {
+            // NV_DEFINED — index still exists, acceptable
+            debug!("NV DefineSpace: index already defined (0x14c), continuing");
+        }
+        Err(rc) => {
+            warn!("NV DefineSpace failed for 0x{:08x}: rc=0x{:08x}", nv_index, rc);
+            return false;
         }
     }
-    if !define_ok {
-        warn!("NV DefineSpace failed for 0x{:08x}", nv_index);
-        return false;
-    }
     
-    // Now write the data (with retry for TPM_RC_RETRY)
+    // Now write the data
     let write_cmd = build_nv_write_cmd(nv_index, data);
     debug!("NV Write cmd: {} bytes of data to 0x{:08x}", data.len(), nv_index);
     
-    for attempt in 0..5 {
-        let mut response = vec![0u8; 64];
-        
-        if tcg.submit_command(&write_cmd, &mut response).is_err() {
-            warn!("NV_Write submit_command failed (attempt {})", attempt);
-            boot::stall(core::time::Duration::from_millis(200));
-            continue;
+    match tpm_submit_with_retry(&mut tcg, &write_cmd, 64) {
+        Ok(_) => true,
+        Err(rc) => {
+            warn!("NV_Write failed for 0x{:08x}: rc=0x{:08x}", nv_index, rc);
+            false
         }
-        
-        if response.len() < 10 {
-            warn!("NV_Write response too short");
-            return false;
-        }
-        
-        let response_code = unpack_u32(&response[6..10]);
-        debug!("NV_Write response: rc=0x{:08x} (attempt {})", response_code, attempt);
-        
-        if response_code == 0x922 {
-            debug!("NV_Write got TPM_RC_RETRY, retrying...");
-            boot::stall(core::time::Duration::from_millis(200));
-            continue;
-        }
-        
-        if response_code != 0 {
-            warn!("TPM2_NV_Write error: 0x{:08x}", response_code);
-            return false;
-        }
-        
-        return true;
     }
-    
-    warn!("NV_Write failed after all retries");
-    false
 }
 
 /// Build TPM2_NV_UndefineSpace command

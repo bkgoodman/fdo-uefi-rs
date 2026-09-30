@@ -4,6 +4,40 @@
 
 # TODO - FDO UEFI Client
 
+# Perpetual Reminders (never "completed")
+
+## TPM_RC_RETRY (0x922) — every TPM command can return this
+
+Any TPM command can return `TPM_RC_RETRY` (0x922) at any time — the TPM uses
+it for lazy self-test, NV write coalescing, and internal busy states. Per TCG
+Part 1, the caller MUST resubmit the unchanged command.
+
+**Rule**: Always use `tpm_submit_with_retry()` for TPM commands. Direct
+`submit_command()` is only acceptable for best-effort/cleanup operations
+(FlushContext, EvictControl of stale handles) where failure is tolerable.
+
+When adding a new TPM command call, grep for `submit_command` in `tpm.rs`
+and verify you're using the retry wrapper. The audit below shows where
+direct calls are intentional:
+
+| Direct call site | Purpose | Retry needed? |
+|------------------|---------|---------------|
+| `tpm_submit_with_retry()` itself | The retry wrapper | N/A |
+| `tpm_flush_all_transient` | FlushContext (best-effort scan) | No |
+| `tpm_flush_context` | FlushContext (cleanup) | No |
+| `tpm_create_and_persist_*` evict stale | EvictControl (best-effort) | No |
+| `tpm_create_and_persist_*` flush leaked | FlushContext (error cleanup) | No |
+| `tpm_nv_write` undefine old | NV_UndefineSpace (best-effort) | No |
+
+History: We hit this bug twice — once in `tpm_sign_with_persistent` (caught
+during swtpm testing) and again in `tpm_hmac` (caught on real K800 hardware
+when running the binary from a different filename). Both times the fix was
+adding a retry loop, and both times existing code in nearby functions
+already had one. The central `tpm_submit_with_retry` helper was created to
+prevent this from happening again.
+
+---
+
 # Security Audit — 2026-09-29
 
 Full-sweep review of the trust chain: every signature, hash, and certificate
