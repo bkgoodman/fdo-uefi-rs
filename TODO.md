@@ -1300,12 +1300,12 @@ Next: full chain, where each stage is a genuinely separate binary.
 
 | Stage | Build | Size | Role |
 |-------|-------|-----:|------|
-| 1 | `--no-default-features --features uefi-http,tcp4-http,rv-firmware,di` | 238.5 KiB | On ESP. Reads DCTPM, downloads + verifies COSE, chainloads Stage 2 |
-| 2 | `--no-default-features --features uefi-http,tcp4-http,fdo-installer` | 226 KiB | Delivered via COSE. Runs TO1/TO2 + BMO, chainloads Stage 3 |
+| 1 | `--no-default-features --features uefi-http,tcp4-http,rv-firmware,di` | 258.5 KiB | On ESP. Reads DCTPM, downloads + verifies COSE, chainloads Stage 2 |
+| 2 | `--no-default-features --features uefi-http,tcp4-http,fdo-installer` | 359.5 KiB | Delivered via COSE. Runs TO1/TO2 + BMO, chainloads Stage 3 |
 | 3 | `test-keys/payload_image.efi` | 50 KiB | Hello-world EFI app |
 
 Stage 1 gained `di` so it can re-provision itself (`-force-di`); a pure
-`rv-firmware` stub is 178 KiB but cannot rewrite its own DCTPM.
+`rv-firmware` stub is 192.5 KiB but cannot rewrite its own DCTPM.
 
 Stage 1 deliberately excludes `fdo-installer`, and Stage 2 deliberately excludes
 `rv-firmware` — otherwise Stage 2 would run the firmware check again and
@@ -1407,7 +1407,7 @@ first; the new firmware config takes effect on the next boot.
 
 ## Build Size Analysis — all 8 feature combinations
 
-### Current (2026-09-24)
+### Current (2026-10-01)
 
 Since the 2026-09-01 baseline, the `fdo-installer` feature gained:
 - Delegation support (x5chain X.509 chain validation in `delegate.rs`)
@@ -1417,35 +1417,35 @@ Since the 2026-09-01 baseline, the `fdo-installer` feature gained:
 
 Crate restructured into lib + bin (2026-09-24): `src/lib.rs` exports all
 modules, `src/main.rs` is a thin UEFI entry point. UEFI deps are
-target-conditional. `make test` runs 157 native unit tests on Linux
+target-conditional. `make test` runs 226 native unit tests on Linux
 (no UEFI, no QEMU). All test code is `#[cfg(test)]` — zero impact on
 UEFI binary size.
 
 Release builds, `x86_64-unknown-uefi`, all with `uefi-http,tcp4-http`:
 
-| `di` | `fdo-installer` | `rv-firmware` | Size | over base | Δ from Sep-01 |
-|:----:|:---------------:|:-------------:|---------:|----------:|-------------:|
-| | | | 51 KiB | base | +0 |
-| ✓ | | | 167 KiB | +116 KiB | +5 KiB |
-| | | ✓ | 167 KiB | +116 KiB | −11 KiB |
-| | ✓ | | 330 KiB | +279 KiB | +104 KiB |
-| ✓ | | ✓ | 330 KiB | +279 KiB | +91.5 KiB |
-| ✓ | ✓ | | 368 KiB | +317 KiB | +104 KiB |
-| | ✓ | ✓ | 376 KiB | +325 KiB | +70 KiB |
-| ✓ | ✓ | ✓ | 410 KiB | +359 KiB | +70 KiB |
+| `di` | `fdo-installer` | `rv-firmware` | Bytes | Size | over base | Δ from Sep-01 |
+|:----:|:---------------:|:-------------:|------:|-----:|----------:|-------------:|
+| | | | 52,224 | 51 KiB | base | +0 |
+| ✓ | | | 184,832 | 180.5 KiB | +129.5 KiB | +18.5 KiB |
+| | | ✓ | 197,120 | 192.5 KiB | +141.5 KiB | +14.5 KiB |
+| | ✓ | | 368,128 | 359.5 KiB | +308.5 KiB | +133.5 KiB |
+| ✓ | | ✓ | 264,704 | 258.5 KiB | +207.5 KiB | +20 KiB |
+| ✓ | ✓ | | 406,016 | 396.5 KiB | +345.5 KiB | +132.5 KiB |
+| | ✓ | ✓ | 413,696 | 404 KiB | +353 KiB | +98 KiB |
+| ✓ | ✓ | ✓ | 448,000 | 437.5 KiB | +386.5 KiB | +97.5 KiB |
 
 Marginal cost, alone vs added to a build that already has the other two:
 
 | Feature | alone | incremental |
 |---------|---------:|-----------:|
-| `di` | +116 KiB | +34 KiB |
-| `fdo-installer` | +279 KiB | +80 KiB |
-| `rv-firmware` | +116 KiB | +42 KiB |
+| `di` | +129.5 KiB | +33.5 KiB |
+| `fdo-installer` | +308.5 KiB | +179 KiB |
+| `rv-firmware` | +141.5 KiB | +41 KiB |
 
 ### Where the growth went
 
-The `fdo-installer` feature grew **+104 KiB** (from 226→330 KiB). This is the
-cost of the new security features:
+The installer-only build has grown **+133.5 KiB** since the Sep-01 baseline
+(from 226→359.5 KiB). Major contributors include:
 - **Delegation** (`delegate.rs`): X.509 chain validation, ASN.1 DER parsing,
   OID matching, signature verification for x5chain — replaces the need for an
   external x509 crate.
@@ -1457,8 +1457,8 @@ cost of the new security features:
 - **BMO authorization** (`bmo.rs`): `check_bmo_authorization()` extracted for
   testability, `hmac_sha256()` software HMAC (+2 KiB).
 
-The non-`fdo-installer` features (`di`, `rv-firmware`, base) barely changed
-because the new code is gated behind `fdo-installer`.
+The base transport build remains exactly 51 KiB. The DI-only and
+RV-firmware-only builds have grown to 180.5 KiB and 192.5 KiB respectively.
 
 ### Previous (2026-09-01 baseline)
 
@@ -1475,13 +1475,12 @@ because the new code is gated behind `fdo-installer`.
 
 ### Observations
 
-- The everything binary grew from 340→409 KiB (+69 KiB, +20%) — the cost of
-  full Model 3/4 security (delegation + signed BMO + scope).
-- `di` and `rv-firmware` converged to the same size (168 KiB each), likely due
-  to shared code paths being refactored.
-- The transports alone remain 51 KiB — no change.
-- Incrementally, `fdo-installer` costs only +81 KiB when `di` + `rv-firmware`
-  are already present (shared COSE/CBOR/crypto code).
+- The everything binary grew from 340→437.5 KiB (+97.5 KiB, +28.7%).
+- The transports alone remain exactly 51 KiB — no change.
+- Incrementally, `di` costs +33.5 KiB and `rv-firmware` costs +41 KiB when
+  added to a build already containing the other two features.
+- Incrementally, `fdo-installer` now costs +179 KiB when added to the
+  `di` + `rv-firmware` build.
 
 ### Stripped sizes: still identical (verified, 2026-09-23)
 

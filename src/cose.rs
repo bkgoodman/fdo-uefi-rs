@@ -219,6 +219,7 @@ pub fn verify_sign1(s1: &CoseSign1, external_aad: &[u8], point: &[u8]) -> bool {
 /// `device_guid` is the 16-byte voucher GUID proven in TO2 (for scope.guid check).
 ///
 /// Returns the inner payload bytes on success, or None on failure.
+#[cfg(feature = "fdo-installer")]
 pub fn verify_bmo_signed<'a>(data: &'a [u8], owner_point: &[u8], expected_ct: &str, device_guid: Option<&[u8]>) -> Option<&'a [u8]> {
     let s1 = parse_cose_sign1(data)?;
 
