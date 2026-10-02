@@ -35,6 +35,8 @@ pub mod delegate;
 #[cfg(feature = "fdo-installer")]
 pub mod fdo;
 #[cfg(feature = "fdo-installer")]
+pub mod chunking;
+#[cfg(feature = "fdo-installer")]
 pub mod bmo;
 #[cfg(feature = "di")]
 pub mod di;

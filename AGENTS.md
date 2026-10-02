@@ -43,7 +43,7 @@ went unnoticed through multiple "FULLY TESTED" sign-offs.
 
 About commands such as `apt` and others which require user-interaction as they may hang agent work.
 
-## Native Unit Tests (225 tests)
+## Native Unit Tests (245 tests)
 
 ```bash
 make test          # Runs cargo test on native Linux (no UEFI, no QEMU, ~0.15s)
@@ -55,20 +55,25 @@ target-conditional. `#[cfg(target_os = "uefi")]` gates all UEFI-dependent
 code so it compiles out on native Linux.
 
 Tests cover:
-- **COSE** (49): Sign1 parse/verify, ES256 +/-, domain AAD (v101 vs v200,
+- **COSE** (52): Sign1 parse/verify, ES256 +/-, domain AAD (v101 vs v200,
   cross-tag), scope (GUID/combined/fail-closed), BMO signed verify, delegate
   PERM.7 check, malformed inputs
-- **Delegate** (24): 1/2/3-cert chains, permission inheritance, self-signed
+- **Delegate** (27): 1/2/3-cert chains, permission inheritance, self-signed
   rejection, all 5 OID flags, BasicConstraints CA requirement, pathLen,
   chain-length cap, structural SPKI/OID parsing, EKU malformed-element
   termination
-- **FDO** (41): CBOR encoder/decoder, AES-GCM (wrong key/nonce/AAD/tampered),
+- **FDO** (44): CBOR encoder/decoder, AES-GCM (wrong key/nonce/AAD/tampered),
   KDF, COSE_Encrypt0, encrypted message parsing, SetupDevice parsing, session
   key derivation
-- **BMO** (39): Image-begin parse, result/ack/set builders, full Model 1-4
-  authorization matrix, delegate-signed x5chain, image hash policy for all
-  three delivery modes (`inline_hash_decision` / `url_hash_decision` /
-  `meta_hash_decision` — a missing hash is fatal, never a warning)
+- **BMO / chunking** (77): Image-begin parse (generic keys 5–9, legacy
+  aliases, conflict rejection), result/ack/set builders, full Model 1-4
+  authorization matrix × peer type (Owner / PERM.7 delegate / onboard-only
+  delegate), delegate-signed x5chain incl. signer-without-PERM.7, image hash
+  policy for all three delivery modes (`inline_hash_decision` /
+  `url_hash_decision` / `meta_hash_decision` — a missing hash is fatal, never
+  a warning), meta signing (named key / Owner / PERM.7 x5chain),
+  unauthenticated-meta rules, signed-inline-begin-needs-hash
+- **DNS** (24): resolver parsing
 - **Voucher** (20): OVHeader/PublicKey parse, HMAC (RFC 4231), 0/1/2-entry
   chains, entry swap/reorder, cross-device entry injection, wrong domain AAD,
   chain break at arbitrary index
@@ -87,12 +92,26 @@ These are enforced by tests and were each a real finding — see the
 
 - **A BMO image is never chainloaded without an authenticated hash covering
   it.** A missing hash is a hard refusal, not a warning, in all three
-  delivery modes. Signed (Model 3/4) `image-begin` MUST carry key `-9`.
+  delivery modes. Signed (Model 3/4) inline `image-begin` MUST carry key `8`
+  (`expected_hash`; legacy alias `-9`), refused at image-begin time.
+- **"Owner key present" never implies "peer is the Owner."** The Owner key
+  is known from the voucher even when a delegate signed `ProveOVHdr`. Who the
+  TO2 peer is must be carried explicitly as `bmo::PeerAuthority`. An
+  onboard-only delegate (no PERM.7) gets `UnsignedRefused` for unsigned
+  provisioning payloads; it may only relay a Model 3/4 artifact (TODO.md H4).
 - **Certificate chains are structurally validated**, not just
   signature-checked: BasicConstraints `cA` on every issuer, `pathLen`,
   a chain-length cap, and `ecdsa-with-SHA256` bound in both AlgorithmIdentifiers.
 - **Certificate validity dates are deliberately NOT enforced** (no trusted
   clock). Do not "fix" this without a clock policy — see TODO.md H3c.
+- **Artifact scope constraints this device cannot evaluate are REJECTED,
+  never ignored**: `not_before`/`not_after` (no trusted clock),
+  `generation` (no rollback storage), `guid` without a device GUID. Scope is
+  evaluated only after the signature. (Distinct from certificate dates above:
+  the spec makes unevaluable *scope* a MUST-reject.)
+- **An unauthenticated meta-payload is only a pointer**: it needs key 8 in
+  image-begin and may not carry instruction fields (`check_unauthenticated_meta`).
+  Delivery keys are 5–9; `-6..-10` are accepted aliases, conflicting pairs rejected.
 - **Public keys are parsed from SPKI structurally with OID checks**, never
   located by scanning for a byte pattern.
 - **DER/CBOR loops must always advance.** `read_oid` does not advance `pos`
@@ -133,8 +152,11 @@ Test helpers (all `#[cfg(test)]`):
   chain), OID constants (`pub(crate)`)
 - `voucher.rs`: `build_test_ov_header()`, `build_test_fdo_public_key()`,
   `build_ov_entry_payload()`, `hmac_sha256()` (pub)
-- `bmo.rs`: `check_bmo_authorization()`, `parse_meta_payload()`,
-  `parse_cose_key_p256()`, `verify_and_extract_meta()` (all pub),
+- `chunking.rs` (generic, mirrors chunking-strategy.md; re-exported from
+  `bmo`): `parse_meta_payload()`, `parse_cose_key_p256()`,
+  `verify_and_extract_meta()`, `check_unauthenticated_meta()`, the three
+  `*_hash_decision()`s, error codes 9–19
+- `bmo.rs`: `check_bmo_authorization()`, `signed_begin_binds_content()` (pub),
   test helpers: `build_test_meta_payload()`, `build_test_cose_key()`
 
 ## Build & Ship

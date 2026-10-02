@@ -32,6 +32,12 @@ pub const BMO_ERROR_HASH_MISMATCH: u8 = 11;
 pub const BMO_ERROR_META_SIGNATURE_INVALID: u8 = 12;
 pub const BMO_ERROR_META_PARSE_ERROR: u8 = 13;
 pub const BMO_ERROR_DELIVERY_MODE_NOT_SUPPORTED: u8 = 14;
+// Generic transfer error codes 15-19 (chunking-strategy.md "Transfer Error Codes").
+pub use crate::chunking::{
+    ERR_NOT_AUTHORIZED as BMO_ERROR_NOT_AUTHORIZED, ERR_SCOPE_MISMATCH as BMO_ERROR_SCOPE_MISMATCH,
+    ERR_SUPERSEDED as BMO_ERROR_SUPERSEDED, ERR_UNAUTHENTICATED_SOURCE as BMO_ERROR_UNAUTHENTICATED_SOURCE,
+    ERR_VALIDITY_FAILED as BMO_ERROR_VALIDITY_FAILED,
+};
 
 /// BMO result status codes
 pub const BMO_STATUS_SUCCESS: u8 = 0;
@@ -59,18 +65,29 @@ pub const BMO_FIELD_BOOT_ARGS: i32 = -2;      // Kernel arguments (optional)
 pub const BMO_FIELD_NAME: i32 = -3;           // Image name (optional, informational)
 pub const BMO_FIELD_VERSION: i32 = -4;        // Version string (optional, informational)
 pub const BMO_FIELD_DESCRIPTION: i32 = -5;    // Description (optional, informational)
-pub const BMO_FIELD_DELIVERY_MODE: i32 = -6;  // Delivery mode (optional, default 0)
-pub const BMO_FIELD_URL: i32 = -7;            // URL for modes 1 and 2 (optional)
-pub const BMO_FIELD_TLS_CA: i32 = -8;         // Single DER CA cert for TLS (optional)
-pub const BMO_FIELD_EXPECTED_HASH: i32 = -9;  // Expected hash of final image (optional)
-pub const BMO_FIELD_META_SIGNER: i32 = -10;   // COSE_Key for meta-payload sig (optional)
 
 /// Generic chunking field keys (non-negative), per chunking-strategy.md
-pub const CHUNK_FIELD_TOTAL_SIZE: i32 = 0;   // Total bytes
-pub const CHUNK_FIELD_HASH_ALG: i32 = 1;     // Hash algorithm
-pub const CHUNK_FIELD_METADATA: i32 = 2;     // Optional metadata
-pub const CHUNK_FIELD_REQUIRE_ACK: i32 = 3;  // Require acknowledgment
-pub const CHUNK_FIELD_EST_DURATION: i32 = 4; // Advisory: estimated transfer+apply time (seconds)
+/// "Begin Message Fields". Delivery keys 5-9 are generic so any FSIM can use
+/// them; fdo.bmo formerly numbered them -6..-10 (see `LEGACY_*` below).
+pub const CHUNK_FIELD_TOTAL_SIZE: i32 = 0;    // Total bytes
+pub const CHUNK_FIELD_HASH_ALG: i32 = 1;      // Hash algorithm
+pub const CHUNK_FIELD_METADATA: i32 = 2;      // Optional metadata
+pub const CHUNK_FIELD_REQUIRE_ACK: i32 = 3;   // Require acknowledgment
+pub const CHUNK_FIELD_EST_DURATION: i32 = 4;  // Advisory: estimated transfer+apply time (seconds)
+pub const CHUNK_FIELD_DELIVERY_MODE: i32 = 5; // 0=inline, 1=url, 2=meta-url
+pub const CHUNK_FIELD_URL: i32 = 6;           // URL of image (mode 1) or meta-payload (mode 2)
+pub const CHUNK_FIELD_TLS_CA: i32 = 7;        // Single DER CA cert used as TLS trust anchor
+pub const CHUNK_FIELD_EXPECTED_HASH: i32 = 8; // Expected hash of final image
+pub const CHUNK_FIELD_META_SIGNER: i32 = 9;   // COSE_Key of a third-party meta-payload publisher
+
+/// Legacy fdo.bmo aliases for keys 5-9. Accepted on receipt; a message that
+/// carries a generic key and its alias with different values is rejected
+/// (chunking-strategy.md "Reserved Key Policy").
+pub const LEGACY_BMO_FIELD_DELIVERY_MODE: i32 = -6;
+pub const LEGACY_BMO_FIELD_URL: i32 = -7;
+pub const LEGACY_BMO_FIELD_TLS_CA: i32 = -8;
+pub const LEGACY_BMO_FIELD_EXPECTED_HASH: i32 = -9;
+pub const LEGACY_BMO_FIELD_META_SIGNER: i32 = -10;
 
 /// Parsed BMO image-begin message
 #[derive(Debug, Default)]
@@ -98,23 +115,32 @@ pub struct BmoImageBegin {
     pub meta_signer: Option<Vec<u8>>,
 }
 
-/// How the `image-begin` that authorised the current transfer was established.
+
+/// Who the TO2 peer proved itself to be in `ProveOVHdr`.
 ///
-/// This decides how strict the image-hash policy has to be, so it is recorded
-/// on the session at `image-begin` time and consulted again at `image-end`.
+/// This must be stated explicitly. The Owner key is known whether or not a
+/// delegate signed `ProveOVHdr` (it comes from the voucher), so "Owner key
+/// present" cannot distinguish the Owner from an onboard-only delegate —
+/// conflating the two once let a PERM.2-only delegate supply unsigned
+/// provisioning payloads under Owner channel authority.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BmoAuthority {
-    /// Model 3/4 — `image-begin` was a COSE_Sign1 whose signature verified.
-    /// The signature is only worth something if it covers the image bytes,
-    /// so an authorising hash is mandatory.
-    Artifact,
-    /// Model 1/2 — `image-begin` was unsigned and accepted because the TO2
-    /// session itself is bound to the Owner (ProveOVHdr signs xB, which the
-    /// session keys derive from). Anything arriving over that channel carries
-    /// the Owner's authority, including a hash in `image-end`.
-    Channel,
-    /// No Owner key was available at all (legacy/test paths only).
+pub enum PeerAuthority {
+    /// `ProveOVHdr` verified directly against the Owner key.
+    OwnerDirect,
+    /// `ProveOVHdr` verified against a delegate leaf whose chain roots in the
+    /// Owner key. `provision` is PERM.7 across the whole chain.
+    Delegate { provision: bool },
+    /// No TO2-proven peer (legacy/test paths only).
     Unauthenticated,
+}
+
+impl PeerAuthority {
+    /// Whether this peer may supply unsigned provisioning payloads (channel
+    /// authority). An onboard-only delegate may not — it must deliver an
+    /// artifact signed by the Owner or by a PERM.7 holder.
+    pub fn has_channel_provision_authority(&self) -> bool {
+        matches!(self, PeerAuthority::OwnerDirect | PeerAuthority::Delegate { provision: true })
+    }
 }
 
 /// BMO session state
@@ -188,6 +214,8 @@ pub fn parse_bmo_image_begin(data: &[u8]) -> Option<BmoImageBegin> {
     // Read map header
     let map_len = dec.read_map_header().ok()?;
     debug!("BMO: image-begin has {} map entries", map_len);
+    let mut generic = DeliveryKeys::default();
+    let mut legacy = DeliveryKeys::default();
     
     for i in 0..map_len {
         // Read key (can be positive or negative integer)
@@ -242,32 +270,39 @@ pub fn parse_bmo_image_begin(data: &[u8]) -> Option<BmoImageBegin> {
                 begin.description = Some(dec.read_text().ok()?);
                 debug!("BMO: description = {:?}", begin.description);
             }
-            BMO_FIELD_DELIVERY_MODE => {
-                begin.delivery_mode = dec.read_uint().ok()? as u8;
-                debug!("BMO: delivery_mode = {}", begin.delivery_mode);
-            }
-            BMO_FIELD_URL => {
-                begin.url = Some(dec.read_text().ok()?);
-                debug!("BMO: url = {:?}", begin.url);
-            }
-            BMO_FIELD_TLS_CA => {
-                begin.tls_ca = Some(dec.read_bytes().ok()?);
-            }
-            BMO_FIELD_EXPECTED_HASH => {
-                begin.expected_hash = Some(dec.read_bytes().ok()?);
-                debug!("BMO: expected_hash = {} bytes",
-                       begin.expected_hash.as_ref().map(|h| h.len()).unwrap_or(0));
-            }
-            BMO_FIELD_META_SIGNER => {
-                begin.meta_signer = Some(dec.read_bytes().ok()?);
-            }
+            // Delivery fields: generic keys 5-9, or their legacy aliases.
+            CHUNK_FIELD_DELIVERY_MODE => generic.mode = Some(dec.read_uint().ok()? as u64),
+            LEGACY_BMO_FIELD_DELIVERY_MODE => legacy.mode = Some(dec.read_uint().ok()? as u64),
+            CHUNK_FIELD_URL => generic.url = Some(dec.read_text().ok()?),
+            LEGACY_BMO_FIELD_URL => legacy.url = Some(dec.read_text().ok()?),
+            CHUNK_FIELD_TLS_CA => generic.tls_ca = Some(dec.read_bytes().ok()?),
+            LEGACY_BMO_FIELD_TLS_CA => legacy.tls_ca = Some(dec.read_bytes().ok()?),
+            CHUNK_FIELD_EXPECTED_HASH => generic.hash = Some(dec.read_bytes().ok()?),
+            LEGACY_BMO_FIELD_EXPECTED_HASH => legacy.hash = Some(dec.read_bytes().ok()?),
+            CHUNK_FIELD_META_SIGNER => generic.signer = Some(dec.read_bytes().ok()?),
+            LEGACY_BMO_FIELD_META_SIGNER => legacy.signer = Some(dec.read_bytes().ok()?),
             _ => {
                 // Skip unknown fields
                 dec.skip_value().ok()?;
             }
         }
     }
-    
+
+    // Fold legacy aliases into the generic fields; a conflicting pair is a
+    // malformed message.
+    let mode = merge_alias("delivery_mode", generic.mode, legacy.mode)?;
+    begin.delivery_mode = match mode {
+        Some(m) if m > u8::MAX as u64 => u8::MAX, // unknown mode → rejected later as unsupported
+        Some(m) => m as u8,
+        None => 0,
+    };
+    begin.url = merge_alias("url", generic.url, legacy.url)?;
+    begin.tls_ca = merge_alias("tls_ca", generic.tls_ca, legacy.tls_ca)?;
+    begin.expected_hash = merge_alias("expected_hash", generic.hash, legacy.hash)?;
+    begin.meta_signer = merge_alias("meta_signer", generic.signer, legacy.signer)?;
+    debug!("BMO: delivery_mode={} url={:?} expected_hash={} bytes",
+           begin.delivery_mode, begin.url, begin.expected_hash.as_ref().map(|h| h.len()).unwrap_or(0));
+
     Some(begin)
 }
 
@@ -362,11 +397,7 @@ pub fn build_service_info_kv(key: &str, value: &[u8]) -> Vec<u8> {
     enc.into_bytes()
 }
 
-/// Returns true if `data` starts with CBOR tag 18 (0xD2 = major 6, value 18).
-fn is_cbor_tag18(data: &[u8]) -> bool {
-    // CBOR tag 18: major type 6 (0xC0), additional info 18 → 0xD2
-    data.first() == Some(&0xD2)
-}
+use crate::chunking::is_cbor_tag18;
 
 /// Attempt to unwrap a signed BMO provisioning envelope (COSE_Sign1 tag 18).
 ///
@@ -401,308 +432,30 @@ fn unwrap_bmo_signed(data: &[u8], owner_key_point: Option<&[u8]>, expected_ct: &
     }
 }
 
-// ===== Meta-payload support (delivery_mode 2) =====
+// Generic delivery logic (meta-payload, fetched-content evidence, hash
+// decisions, legacy-key merging) lives in `crate::chunking`, mirroring
+// chunking-strategy.md. Re-exported here so `bmo::...` paths keep working.
+pub use crate::chunking::{
+    check_unauthenticated_meta, inline_hash_decision, meta_hash_decision, parse_cose_key_p256,
+    parse_meta_payload, url_hash_decision, verify_and_extract_meta, HashPolicyError,
+    MetaHashPlan, MetaPayload, Authority as BmoAuthority,
+};
+use crate::chunking::{merge_alias, DeliveryKeys};
 
-/// Parsed meta-payload descriptor.
-///
-/// CBOR map with integer keys per `fdo.bmo.md` MetaPayload CDDL:
-/// ```text
-/// MetaPayload = {
-///   0: tstr,          ; mime_type (required)
-///   1: tstr,          ; url       (required)
-///   ? 2: bstr,        ; tls_ca
-///   ? 3: tstr,        ; hash_alg
-///   ? 4: bstr,        ; expected_hash
-///   ? 5: tstr,        ; boot_args
-///   ? 6: tstr,        ; name
-///   ? 7: tstr,        ; version
-///   ? 8: tstr,        ; description
-/// }
-/// ```
-#[derive(Debug)]
-pub struct MetaPayload {
-    pub mime_type: String,
-    pub url: String,
-    pub tls_ca: Option<Vec<u8>>,
-    pub hash_alg: Option<String>,
-    pub expected_hash: Option<Vec<u8>>,
-    pub boot_args: Option<String>,
-    pub name: Option<String>,
-    pub version: Option<String>,
-    pub description: Option<String>,
-}
-
-/// Parse a MetaPayload CBOR map from raw bytes.
-///
-/// Returns `None` if the bytes are not a valid CBOR map or if the required
-/// fields (0: mime_type, 1: url) are missing.
-pub fn parse_meta_payload(data: &[u8]) -> Option<MetaPayload> {
-    let mut dec = CborDecoder::new(data);
-
-    let map_len = dec.read_map_header().ok()?;
-
-    let mut mime_type: Option<String> = None;
-    let mut url: Option<String> = None;
-    let mut tls_ca: Option<Vec<u8>> = None;
-    let mut hash_alg: Option<String> = None;
-    let mut expected_hash: Option<Vec<u8>> = None;
-    let mut boot_args: Option<String> = None;
-    let mut name: Option<String> = None;
-    let mut version: Option<String> = None;
-    let mut description: Option<String> = None;
-
-    for _ in 0..map_len {
-        let key = dec.read_uint().ok()?;
-        match key {
-            0 => mime_type = Some(dec.read_text().ok()?),
-            1 => url = Some(dec.read_text().ok()?),
-            2 => tls_ca = Some(dec.read_bytes().ok()?),
-            3 => hash_alg = Some(dec.read_text().ok()?),
-            4 => expected_hash = Some(dec.read_bytes().ok()?),
-            5 => boot_args = Some(dec.read_text().ok()?),
-            6 => name = Some(dec.read_text().ok()?),
-            7 => version = Some(dec.read_text().ok()?),
-            8 => description = Some(dec.read_text().ok()?),
-            _ => { dec.skip_value().ok()?; }
-        }
-    }
-
-    Some(MetaPayload {
-        mime_type: mime_type?,
-        url: url?,
-        tls_ca,
-        hash_alg,
-        expected_hash,
-        boot_args,
-        name,
-        version,
-        description,
-    })
-}
-
-/// Extract an uncompressed P-256 point (65 bytes: 0x04 || x || y) from a
-/// standalone COSE_Key CBOR byte slice.
-///
-/// The COSE_Key is a CBOR map with labels -2 (x) and -3 (y), each 32 bytes.
-/// This is the format used for `image-begin[-10]` (meta_signer).
-pub fn parse_cose_key_p256(data: &[u8]) -> Option<Vec<u8>> {
-    let mut pos = 0usize;
-    let b = *data.get(pos)?;
-    pos += 1;
-    if (b >> 5) != 5 {
-        return None; // not a CBOR map
-    }
-    let map_len = crate::cose::cbor_read_uint_arg(data, &mut pos, b & 0x1f)?;
-
-    let mut x: Option<&[u8]> = None;
-    let mut y: Option<&[u8]> = None;
-    for _ in 0..map_len {
-        let key = crate::cose::cbor_read_int_value(data, &mut pos)?;
-        match key {
-            -2 => x = crate::cose::cbor_read_bstr(data, &mut pos),
-            -3 => y = crate::cose::cbor_read_bstr(data, &mut pos),
-            _ => { crate::cose::cbor_skip(data, &mut pos)?; }
-        }
-    }
-
-    match (x, y) {
-        (Some(xb), Some(yb)) if xb.len() == 32 && yb.len() == 32 => {
-            let mut point = Vec::with_capacity(65);
-            point.push(0x04);
-            point.extend_from_slice(xb);
-            point.extend_from_slice(yb);
-            Some(point)
-        }
-        _ => None,
-    }
-}
-
-/// Verify a signed meta-payload (COSE_Sign1) and extract the inner MetaPayload CBOR.
-///
-/// If `meta_signer` is `Some`, the data must be a tagged COSE_Sign1, verified with
-/// the supplied COSE_Key using AAD `"FDO-FSIM-MetaPayload-v1"`.
-///
-/// If `meta_signer` is `None`, the data is treated as raw (unsigned) MetaPayload CBOR.
-///
-/// Returns the raw inner payload bytes on success, or an error code on failure.
-pub fn verify_and_extract_meta(data: &[u8], meta_signer: Option<&[u8]>) -> Result<Vec<u8>, u8> {
-    match meta_signer {
-        Some(signer_cose_key) => {
-            // Signed meta-payload: must be COSE_Sign1 tag 18
-            let point = parse_cose_key_p256(signer_cose_key).ok_or_else(|| {
-                error!("BMO meta: failed to parse meta_signer COSE_Key");
-                BMO_ERROR_META_SIGNATURE_INVALID
-            })?;
-
-            let s1 = crate::cose::parse_cose_sign1(data).ok_or_else(|| {
-                error!("BMO meta: downloaded meta-payload is not a valid COSE_Sign1");
-                BMO_ERROR_META_SIGNATURE_INVALID
-            })?;
-
-            // Verify with meta-payload domain AAD (always FDO 2.0 style)
-            let aad = crate::cose::domain_aad(
-                crate::cose::AAD_TAG_META_PAYLOAD,
-                crate::cose::FDO_VERSION_200,
-            );
-
-            if !crate::cose::verify_sign1(&s1, &aad, &point) {
-                error!("BMO meta: COSE_Sign1 signature verification FAILED");
-                return Err(BMO_ERROR_META_SIGNATURE_INVALID);
-            }
-
-            info!("BMO meta: Meta-payload signature VERIFIED");
-            Ok(s1.payload.to_vec())
-        }
-        None => {
-            // Unsigned meta-payload: raw CBOR
-            debug!("BMO meta: No meta_signer — treating as unsigned meta-payload");
-            Ok(data.to_vec())
-        }
-    }
-}
-
-// =========================================================================
-// Image hash policy
-//
-// The device chainloads whatever comes out of BMO, so nothing may be
-// executed unless some authenticated statement covers the exact bytes.
-// Before 2026-09-29 every one of these checks was "verify if a hash happens
-// to be present, otherwise warn and continue", which let the sender opt out
-// of integrity entirely simply by omitting a field.
-//
-// The three rules, by delivery mode:
-//
-//   0 inline    — bytes arrive inside the TO2 session. Under Artifact
-//                 authority the signed image-begin MUST carry key -9, else
-//                 the signature covers only metadata. Under Channel
-//                 authority an image-end hash is acceptable, because
-//                 image-end arrives over the same Owner-bound channel.
-//                 No hash at all is never acceptable.
-//
-//   1 URL       — bytes arrive over plain HTTP, outside the authenticated
-//                 channel. Key -9 is mandatory regardless of authority.
-//
-//   2 meta-URL  — both the meta-payload and the image arrive outside the
-//                 channel. Either the meta-payload is signed (key -10, so
-//                 its hash is authenticated) or image-begin carries key -9.
-//                 With neither, nothing authenticated covers the bytes.
-// =========================================================================
-
-/// Why a BMO transfer was refused on integrity grounds.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HashPolicyError {
-    /// image-begin and image-end disagree about the hash.
-    BeginEndDisagree,
-    /// A signed (Model 3/4) image-begin carried no expected_hash (key -9).
-    SignedWithoutHash,
-    /// No hash was available from any source.
-    NoHash,
-    /// Delivery outside the authenticated channel with no authenticated hash.
-    UnauthenticatedSource,
-}
-
-impl HashPolicyError {
-    pub fn message(self) -> &'static str {
-        match self {
-            HashPolicyError::BeginEndDisagree => "image-begin/image-end hash disagreement",
-            HashPolicyError::SignedWithoutHash => "signed image-begin has no expected_hash (-9)",
-            HashPolicyError::NoHash => "no image hash available — refusing to chainload",
-            HashPolicyError::UnauthenticatedSource => "no authenticated hash for out-of-band image",
-        }
-    }
-}
-
-/// Decide which hash an **inline** (mode 0) transfer must be checked against.
-///
-/// Returns the hash to compare the reassembled buffer with, or the reason the
-/// transfer must be refused.
-pub fn inline_hash_decision(
-    authority: BmoAuthority,
-    begin_hash: Option<&[u8]>,
-    end_hash: Option<&[u8]>,
-) -> Result<Vec<u8>, HashPolicyError> {
-    // If both are present they must agree: a disagreement means the sender
-    // is trying to substitute content after the authorising message.
-    if let (Some(bh), Some(eh)) = (begin_hash, end_hash) {
-        if bh != eh {
-            return Err(HashPolicyError::BeginEndDisagree);
-        }
-    }
-
-    // A signature over image-begin only means something if image-begin
-    // commits to the bytes.
-    if authority == BmoAuthority::Artifact && begin_hash.is_none() {
+/// At `image-begin` time: a signed (Artifact) **inline** image-begin MUST
+/// carry `expected_hash` (key 8). `image-end` is never signed, so without it
+/// the signature authorises only metadata. Refusing here — rather than in
+/// `inline_hash_decision` at image-end — avoids accepting a whole transfer
+/// that can never be used. (URL/meta-URL modes are governed by their own
+/// decisions, where the hash may come from a signed meta-payload.)
+pub fn signed_begin_binds_content(authority: BmoAuthority, begin: &BmoImageBegin) -> Result<(), HashPolicyError> {
+    if authority == BmoAuthority::Artifact
+        && begin.delivery_mode == BMO_DELIVERY_INLINE
+        && begin.expected_hash.is_none()
+    {
         return Err(HashPolicyError::SignedWithoutHash);
     }
-
-    match begin_hash.or(end_hash) {
-        Some(h) => Ok(h.to_vec()),
-        None => Err(HashPolicyError::NoHash),
-    }
-}
-
-/// Decide which hash a **URL** (mode 1) transfer must be checked against.
-///
-/// The image is fetched over plain HTTP, entirely outside the TO2 session, so
-/// only `image-begin`'s key -9 can speak for it.
-pub fn url_hash_decision(
-    _authority: BmoAuthority,
-    begin_hash: Option<&[u8]>,
-) -> Result<Vec<u8>, HashPolicyError> {
-    match begin_hash {
-        Some(h) => Ok(h.to_vec()),
-        None => Err(HashPolicyError::UnauthenticatedSource),
-    }
-}
-
-/// Which hashes a **meta-URL** (mode 2) transfer must be checked against.
-#[derive(Debug)]
-pub struct MetaHashPlan {
-    /// Every hash that must match the downloaded image. Never empty.
-    pub required: Vec<Vec<u8>>,
-}
-
-/// Decide the hash requirements for meta-URL delivery, after the meta-payload
-/// has been fetched and (if signed) verified.
-///
-/// `meta_signed` is true only when a `meta_signer` (key -10) was supplied
-/// *and* the COSE_Sign1 over the meta-payload verified against it. When it is
-/// false the meta-payload is just bytes off the wire, so `meta_hash` carries
-/// no authority and cannot be the only thing checked.
-pub fn meta_hash_decision(
-    _authority: BmoAuthority,
-    begin_hash: Option<&[u8]>,
-    meta_signed: bool,
-    meta_hash: Option<&[u8]>,
-) -> Result<MetaHashPlan, HashPolicyError> {
-    let mut required: Vec<Vec<u8>> = Vec::new();
-
-    // image-begin's hash is authenticated whenever image-begin itself was
-    // (Artifact), and channel-authenticated otherwise. Either way it came
-    // over the TO2 session, so honour it when present.
-    if let Some(bh) = begin_hash {
-        required.push(bh.to_vec());
-    }
-
-    // The meta-payload's hash only counts if the meta-payload was signed.
-    if meta_signed {
-        match meta_hash {
-            Some(mh) => required.push(mh.to_vec()),
-            None => {
-                // Signed meta-payload that commits to no hash leaves the
-                // image bytes uncovered unless image-begin did.
-                if required.is_empty() {
-                    return Err(HashPolicyError::UnauthenticatedSource);
-                }
-            }
-        }
-    }
-
-    if required.is_empty() {
-        return Err(HashPolicyError::UnauthenticatedSource);
-    }
-
-    Ok(MetaHashPlan { required })
+    Ok(())
 }
 
 /// Result of BMO authorization check.
@@ -718,6 +471,10 @@ pub enum BmoAuthResult {
     UnsignedModel2,
     /// Unsigned accepted — legacy/test mode (no Owner key)
     UnsignedLegacy,
+    /// Unsigned refused — the TO2 peer lacks provisioning authority (e.g. a
+    /// delegate holding only onboard permissions), so only a signed artifact
+    /// is acceptable from it.
+    UnsignedRefused,
 }
 
 impl BmoAuthResult {
@@ -733,6 +490,7 @@ impl BmoAuthResult {
             // Rejected outright by the caller; value here is irrelevant but
             // must be the strictest thing we have.
             BmoAuthResult::SignedFailed => BmoAuthority::Artifact,
+            BmoAuthResult::UnsignedRefused => BmoAuthority::Artifact,
             // Models 1 and 2: the TO2 session is bound to the Owner, so
             // anything arriving over it carries the Owner's authority.
             BmoAuthResult::UnsignedModel1 => BmoAuthority::Channel,
@@ -744,7 +502,16 @@ impl BmoAuthResult {
 
     /// True when the payload is authorised and processing should continue.
     pub fn is_authorized(&self) -> bool {
-        !matches!(self, BmoAuthResult::SignedFailed)
+        !matches!(self, BmoAuthResult::SignedFailed | BmoAuthResult::UnsignedRefused)
+    }
+
+    /// Human-readable reason for a refusal (sent back in the result message).
+    pub fn rejection_reason(&self) -> &'static str {
+        match self {
+            BmoAuthResult::UnsignedRefused =>
+                "Provisioning not authorized: unsigned payload from peer without provision permission",
+            _ => "Provisioning artifact rejected: signature, content type, signer authority or scope check failed",
+        }
     }
 }
 
@@ -753,20 +520,22 @@ impl BmoAuthResult {
 /// This is the pure authorization logic extracted from `process_bmo_message`.
 /// It handles the full security model matrix:
 ///
-/// - **Model 1:** Owner-direct channel authority. Owner proved identity via TO2.
-///   Unsigned payloads accepted when `owner_key_point` is `Some` and
-///   `delegate_has_provision` is false.
-/// - **Model 2:** Delegate channel authority. Delegate with PERM.7.
-///   Unsigned payloads accepted when `delegate_has_provision` is true.
+/// - **Model 1:** Owner-direct channel authority. Peer is `OwnerDirect`;
+///   unsigned payloads accepted.
+/// - **Model 2:** Delegate channel authority. Peer is a delegate with PERM.7;
+///   unsigned payloads accepted.
+/// - **Onboard-only delegate:** peer is a delegate without PERM.7; unsigned
+///   payloads REFUSED. It may only relay a Model 3/4 artifact.
 /// - **Model 3:** Owner artifact authority. Payload is COSE_Sign1 (tag 18)
-///   signed by Owner key.
+///   signed by Owner key. Accepted from any peer.
 /// - **Model 4:** Delegate artifact authority. Payload is COSE_Sign1 with
-///   x5chain, verified against delegate chain rooted in Owner key.
-/// - **Legacy/test:** No Owner key available. Unsigned payloads accepted.
+///   x5chain, verified against delegate chain rooted in Owner key, leaf PERM.7.
+///   Accepted from any peer.
+/// - **Legacy/test:** No TO2-proven peer and no Owner key. Unsigned accepted.
 pub fn check_bmo_authorization(
     data: &[u8],
     owner_key_point: Option<&[u8]>,
-    delegate_has_provision: bool,
+    peer: PeerAuthority,
     expected_ct: &str,
     device_guid: Option<&[u8]>,
 ) -> (BmoAuthResult, Option<Vec<u8>>) {
@@ -780,15 +549,30 @@ pub fn check_bmo_authorization(
         }
     } else {
         // Unsigned — check channel authority
-        if owner_key_point.is_some() && !delegate_has_provision {
-            info!("BMO: accepting unsigned image-begin via Owner channel authority (Model 1)");
-            (BmoAuthResult::UnsignedModel1, None)
-        } else if delegate_has_provision {
-            info!("BMO: accepting unsigned image-begin via delegate channel authority (Model 2)");
-            (BmoAuthResult::UnsignedModel2, None)
-        } else {
-            debug!("BMO: image-begin is unsigned (no Owner key — legacy/test mode)");
-            (BmoAuthResult::UnsignedLegacy, None)
+        match peer {
+            PeerAuthority::OwnerDirect => {
+                info!("BMO: accepting unsigned payload via Owner channel authority (Model 1)");
+                (BmoAuthResult::UnsignedModel1, None)
+            }
+            PeerAuthority::Delegate { provision: true } => {
+                info!("BMO: accepting unsigned payload via delegate channel authority (Model 2)");
+                (BmoAuthResult::UnsignedModel2, None)
+            }
+            PeerAuthority::Delegate { provision: false } => {
+                error!("BMO: unsigned payload from delegate lacking PERM.7 — REFUSED");
+                error!("BMO: an onboard-only delegate may only relay a signed artifact");
+                (BmoAuthResult::UnsignedRefused, None)
+            }
+            // An Owner key with no stated peer is an inconsistent caller
+            // state; fail closed rather than guess which model applies.
+            PeerAuthority::Unauthenticated if owner_key_point.is_some() => {
+                error!("BMO: unsigned payload with Owner key but no proven TO2 peer — REFUSED");
+                (BmoAuthResult::UnsignedRefused, None)
+            }
+            PeerAuthority::Unauthenticated => {
+                debug!("BMO: payload is unsigned (no Owner key — legacy/test mode)");
+                (BmoAuthResult::UnsignedLegacy, None)
+            }
         }
     }
 }
@@ -800,9 +584,8 @@ pub fn check_bmo_authorization(
 /// verified against it. When `None`, only unsigned (channel-authority) messages
 /// are accepted.
 ///
-/// `delegate_has_provision` is true when the TO2 peer authenticated as a
-/// delegate with OIDPermitProvision (PERM.7). In that case, unsigned
-/// provisioning messages are acceptable via channel authority (Model 2).
+/// `peer` is who the TO2 peer proved itself to be. Unsigned provisioning
+/// messages are acceptable only from the Owner or a PERM.7 delegate.
 ///
 #[cfg(target_os = "uefi")]
 /// Returns optional response ServiceInfo to send back.
@@ -811,7 +594,7 @@ pub fn process_bmo_message(
     key: &str,
     value: &[u8],
     owner_key_point: Option<&[u8]>,
-    delegate_has_provision: bool,
+    peer: PeerAuthority,
     device_guid: Option<&[u8]>,
 ) -> Option<(String, Vec<u8>)> {
     debug!("BMO: Processing message key='{}', value={} bytes", key, value.len());
@@ -824,16 +607,17 @@ pub fn process_bmo_message(
             // in UEFI-only code, so the tested implementation and the
             // shipped implementation were different code that could drift.
             let (auth, inner_data) = check_bmo_authorization(
-                value, owner_key_point, delegate_has_provision,
+                value, owner_key_point, peer,
                 crate::cose::BMO_CONTENT_TYPE_IMAGE_BEGIN, device_guid);
 
             if !auth.is_authorized() {
-                // Tag 18 present but verification failed. Never retried as
-                // unsigned — that would be a downgrade.
-                error!("BMO: image-begin was signed but verification FAILED — rejecting");
+                // Signed-but-unverified is never retried as unsigned (that
+                // would be a downgrade); unsigned from a peer without
+                // provisioning authority is refused outright.
+                error!("BMO: image-begin REJECTED: {}", auth.rejection_reason());
                 session.state = BmoState::Error;
                 let result = build_bmo_image_result(BMO_STATUS_ERROR,
-                    Some("Provisioning signature verification failed"));
+                    Some(auth.rejection_reason()));
                 return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
             }
 
@@ -870,6 +654,16 @@ pub fn process_bmo_message(
                     }
                 }
                 
+                // A signed inline image-begin must commit to the image now,
+                // not after the whole transfer (chunking-strategy.md "Hash
+                // Handling"): refuse before any image-data is accepted.
+                if let Err(e) = signed_begin_binds_content(session.authority, &begin) {
+                    error!("BMO: image-begin REJECTED: {} (error {})", e.message(), e.code());
+                    session.state = BmoState::Error;
+                    let result = build_bmo_image_result(BMO_STATUS_ERROR, Some(e.message()));
+                    return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
+                }
+
                 // Handle delivery mode
                 match begin.delivery_mode {
                     BMO_DELIVERY_INLINE => {
@@ -900,9 +694,15 @@ pub fn process_bmo_message(
                                     return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
                                 }
                                 Err(error_code) => {
-                                    error!("BMO: URL fetch failed with error code {}", error_code);
+                                    error!("BMO: URL delivery failed with error code {}", error_code);
                                     session.state = BmoState::Error;
-                                    let result = build_bmo_image_result(BMO_STATUS_ERROR, Some("URL fetch failed"));
+                                    let msg = match error_code {
+                                        BMO_ERROR_UNAUTHENTICATED_SOURCE =>
+                                            "Unauthenticated source: URL delivery requires expected_hash (key 8)",
+                                        BMO_ERROR_HASH_MISMATCH => "Image hash mismatch",
+                                        _ => "URL fetch failed",
+                                    };
+                                    let result = build_bmo_image_result(BMO_STATUS_ERROR, Some(msg));
                                     return Some((BMO_KEY_IMAGE_RESULT.to_string(), result));
                                 }
                             }
@@ -918,7 +718,7 @@ pub fn process_bmo_message(
                         debug!("BMO: Using meta-URL delivery mode");
                         if let Some(meta_url) = &begin.url {
                             info!("BMO: Meta-URL delivery: {}", meta_url);
-                            match process_bmo_meta_url_delivery(session, &mut begin) {
+                            match process_bmo_meta_url_delivery(session, &mut begin, owner_key_point) {
                                 Ok(()) => {
                                     session.begin = Some(begin);
                                     session.state = BmoState::Complete;
@@ -935,6 +735,8 @@ pub fn process_bmo_message(
                                         BMO_ERROR_META_SIGNATURE_INVALID => "Meta-payload signature invalid",
                                         BMO_ERROR_META_PARSE_ERROR => "Meta-payload parse error",
                                         BMO_ERROR_HASH_MISMATCH => "Image hash mismatch",
+                                        BMO_ERROR_NOT_AUTHORIZED => "Provisioning not authorized: unauthenticated meta-payload carries instruction fields",
+                                        BMO_ERROR_UNAUTHENTICATED_SOURCE => "Unauthenticated source: no hash, signature, or validated TLS covers the content",
                                         _ => "Meta-URL delivery failed",
                                     };
                                     let result = build_bmo_image_result(BMO_STATUS_ERROR, Some(msg));
@@ -1084,14 +886,14 @@ pub fn process_bmo_message(
             // Same authorisation gate as image-begin, via the same pure
             // function, for the same reason.
             let (auth, inner_data) = check_bmo_authorization(
-                value, owner_key_point, delegate_has_provision,
+                value, owner_key_point, peer,
                 crate::cose::BMO_CONTENT_TYPE_SET, device_guid);
 
             if !auth.is_authorized() {
-                error!("BMO: set was signed but verification FAILED — rejecting");
+                error!("BMO: set REJECTED: {}", auth.rejection_reason());
                 session.state = BmoState::Error;
                 let result = build_bmo_set_response(BMO_STATUS_ERROR,
-                    Some("Provisioning signature verification failed"));
+                    Some(auth.rejection_reason()));
                 return Some((BMO_KEY_SET_RESPONSE.to_string(), result));
             }
 
@@ -1136,6 +938,21 @@ fn process_bmo_url_delivery(session: &mut BmoSession, begin: &mut BmoImageBegin)
         }
     };
     
+    // The image comes over plain HTTP, outside the TO2 session, and this
+    // firmware has no validated TLS, so expected_hash (key 8) in image-begin
+    // is the only thing that can speak for these bytes. Decide BEFORE
+    // downloading, so an unverifiable configuration fetches nothing.
+    let expected_hash = match url_hash_decision(session.authority, begin.expected_hash.as_deref()) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("BMO: {}", e.message());
+            error!("BMO: URL delivery fetches the image outside the authenticated TO2");
+            error!("BMO: channel. Without expected_hash (key 8) in image-begin, anyone on");
+            error!("BMO: the path chooses what this device executes. REFUSING (error 19).");
+            return Err(e.code());
+        }
+    };
+
     debug!("BMO: Fetching image from URL: {}", url);
     
     // Fetch the image from the URL
@@ -1157,19 +974,6 @@ fn process_bmo_url_delivery(session: &mut BmoSession, begin: &mut BmoImageBegin)
         return Err(BMO_ERROR_SIZE_EXCEEDED);
     }
     
-    // The image came over plain HTTP, outside the TO2 session, so key -9 in
-    // image-begin is the only thing that can speak for these bytes. Its
-    // absence is fatal, not a warning.
-    let expected_hash = match url_hash_decision(session.authority, begin.expected_hash.as_deref()) {
-        Ok(h) => h,
-        Err(e) => {
-            error!("BMO: {}", e.message());
-            error!("BMO: URL delivery fetches the image outside the authenticated TO2");
-            error!("BMO: channel. Without expected_hash (key -9) in image-begin, anyone on");
-            error!("BMO: the path chooses what this device executes. REFUSING.");
-            return Err(BMO_ERROR_HASH_MISMATCH);
-        }
-    };
 
     {
         let mut hasher = Sha256::new();
@@ -1210,6 +1014,7 @@ fn process_bmo_url_delivery(session: &mut BmoSession, begin: &mut BmoImageBegin)
 fn process_bmo_meta_url_delivery(
     session: &mut BmoSession,
     begin: &mut BmoImageBegin,
+    owner_key_point: Option<&[u8]>,
 ) -> Result<(), u8> {
     let meta_url = match &begin.url {
         Some(u) => u.clone(),
@@ -1232,19 +1037,18 @@ fn process_bmo_meta_url_delivery(
         }
     };
 
-    // Step 2: Verify signature (if meta_signer is present).
-    // `meta_signed` records whether a signature was actually checked — an
-    // unsigned meta-payload is just bytes off the wire, so the hash inside it
-    // carries no authority and cannot be the only thing covering the image.
-    let meta_signed = begin.meta_signer.is_some();
-    let meta_cbor = verify_and_extract_meta(
+    // Step 2: Authenticate the meta-payload by signature: named publisher
+    // (meta_signer, key 9), or — with no meta_signer — the Owner key or a
+    // PERM.7 delegate x5chain. This firmware has no validated TLS, so an
+    // unsigned meta-payload is unauthenticated and may only be a pointer.
+    let (meta_cbor, meta_authenticated) = verify_and_extract_meta(
         &meta_data,
         begin.meta_signer.as_deref(),
+        owner_key_point,
     )?;
-    if !meta_signed {
-        warn!("BMO meta: meta-payload is UNSIGNED (no meta_signer, key -10).");
-        warn!("BMO meta: its url and hash are attacker-controllable; image-begin's");
-        warn!("BMO meta: expected_hash (key -9) must cover the image instead.");
+    if !meta_authenticated {
+        warn!("BMO meta: meta-payload is UNSIGNED — usable only as a pointer to an image");
+        warn!("BMO meta: pinned by expected_hash (key 8) in image-begin.");
     }
 
     // Step 3: Parse MetaPayload
@@ -1265,13 +1069,20 @@ fn process_bmo_meta_url_delivery(
             meta.hash_alg.as_deref().unwrap_or("sha256"));
     }
 
+    // Step 3a: An unauthenticated meta-payload is only a pointer: it needs a
+    // pinned image hash and may not carry instruction fields.
+    if let Err(e) = check_unauthenticated_meta(&meta, meta_authenticated, begin.expected_hash.as_deref()) {
+        error!("BMO meta: {} — REFUSING (error {})", e.message(), e.code());
+        return Err(e.code());
+    }
+
     // Step 3b: Work out what must cover the image BEFORE downloading it.
     // Deciding here rather than after the fetch means an unverifiable
     // configuration is refused without pulling an image we could never trust.
     let plan = match meta_hash_decision(
         session.authority,
         begin.expected_hash.as_deref(),
-        meta_signed,
+        meta_authenticated,
         meta.expected_hash.as_deref(),
     ) {
         Ok(p) => p,
@@ -1279,9 +1090,9 @@ fn process_bmo_meta_url_delivery(
             error!("BMO meta: {}", e.message());
             error!("BMO meta: meta-URL delivery fetches both the meta-payload and the image");
             error!("BMO meta: outside the authenticated TO2 channel. Either sign the");
-            error!("BMO meta: meta-payload (key -10) or put expected_hash (key -9) in");
-            error!("BMO meta: image-begin. REFUSING.");
-            return Err(BMO_ERROR_HASH_MISMATCH);
+            error!("BMO meta: meta-payload, or put expected_hash (key 8) in image-begin.");
+            error!("BMO meta: REFUSING (error {}).", e.code());
+            return Err(e.code());
         }
     };
 
@@ -1389,7 +1200,7 @@ pub fn test_bmo_handling() {
     // Simulate fdo.bmo:active
     debug!("Test 1: Processing fdo.bmo:active");
     let active_value = alloc::vec![0xf5]; // CBOR true
-    let result = process_bmo_message(&mut session, "fdo.bmo:active", &active_value, None, false, None);
+    let result = process_bmo_message(&mut session, "fdo.bmo:active", &active_value, None, PeerAuthority::Unauthenticated, None);
     debug!("  Result: {:?}", result.is_some());
     
     // Simulate fdo.bmo:image-begin with inline delivery
@@ -1406,24 +1217,24 @@ pub fn test_bmo_handling() {
     begin_msg.push(0x18); // uint8
     begin_msg.push(0x64); // 100 bytes
     
-    let result = process_bmo_message(&mut session, BMO_KEY_IMAGE_BEGIN, &begin_msg, None, false, None);
+    let result = process_bmo_message(&mut session, BMO_KEY_IMAGE_BEGIN, &begin_msg, None, PeerAuthority::Unauthenticated, None);
     debug!("  Result: {:?}", result.is_some());
     debug!("  State: {:?}", session.state);
     
     // Simulate image data chunks
     debug!("Test 3: Processing fdo.bmo:image-data chunks");
     let chunk_data: Vec<u8> = (0u8..50).collect();
-    let result = process_bmo_message(&mut session, "fdo.bmo:image-data-0", &chunk_data, None, false, None);
+    let result = process_bmo_message(&mut session, "fdo.bmo:image-data-0", &chunk_data, None, PeerAuthority::Unauthenticated, None);
     debug!("  Chunk 0 result: {:?}, bytes_received: {}", result.is_some(), session.bytes_received);
     
     let chunk_data: Vec<u8> = (50u8..100).collect();
-    let result = process_bmo_message(&mut session, "fdo.bmo:image-data-1", &chunk_data, None, false, None);
+    let result = process_bmo_message(&mut session, "fdo.bmo:image-data-1", &chunk_data, None, PeerAuthority::Unauthenticated, None);
     debug!("  Chunk 1 result: {:?}, bytes_received: {}", result.is_some(), session.bytes_received);
     
     // Simulate image-end
     debug!("Test 4: Processing fdo.bmo:image-end");
     let end_msg = alloc::vec![0xf6]; // CBOR null
-    let result = process_bmo_message(&mut session, BMO_KEY_IMAGE_END, &end_msg, None, false, None);
+    let result = process_bmo_message(&mut session, BMO_KEY_IMAGE_END, &end_msg, None, PeerAuthority::Unauthenticated, None);
     debug!("  Result: {:?}", result.is_some());
     debug!("  Final state: {:?}", session.state);
     debug!("  Image buffer size: {} bytes", session.image_buffer.len());
@@ -1469,10 +1280,61 @@ mod tests {
         // key -1 = image_type
         enc.neg_int(BMO_FIELD_IMAGE_TYPE as i8);
         enc.text(image_type);
-        // key -6 = delivery_mode
-        enc.neg_int(BMO_FIELD_DELIVERY_MODE as i8);
+        // key 5 = delivery_mode (generic)
+        enc.uint(CHUNK_FIELD_DELIVERY_MODE as u16);
         enc.uint(delivery_mode as u16);
         enc.into_bytes()
+    }
+
+    // --- delivery keys 5..9 and legacy aliases -6..-10 ---
+
+    #[test]
+    fn test_parse_image_begin_generic_delivery_keys() {
+        let mut enc = CborEncoder::new();
+        enc.encode_map(5);
+        enc.neg_int(-1); enc.text("application/efi");
+        enc.uint(5); enc.uint(2);
+        enc.uint(6); enc.text("https://x/meta");
+        enc.uint(8); enc.bytes(&[0xAA; 32]);
+        enc.uint(9); enc.bytes(&[0x01]);
+        let b = parse_bmo_image_begin(&enc.into_bytes()).expect("generic keys should parse");
+        assert_eq!(b.delivery_mode, 2);
+        assert_eq!(b.url.as_deref(), Some("https://x/meta"));
+        assert_eq!(b.expected_hash.as_deref(), Some(&[0xAA; 32][..]));
+        assert_eq!(b.meta_signer.as_deref(), Some(&[0x01][..]));
+    }
+
+    #[test]
+    fn test_parse_image_begin_legacy_aliases_accepted() {
+        let mut enc = CborEncoder::new();
+        enc.encode_map(4);
+        enc.neg_int(-1); enc.text("application/efi");
+        enc.neg_int(-6); enc.uint(1);
+        enc.neg_int(-7); enc.text("https://x/img");
+        enc.neg_int(-9); enc.bytes(&[0xBB; 32]);
+        let b = parse_bmo_image_begin(&enc.into_bytes()).expect("legacy aliases should parse");
+        assert_eq!(b.delivery_mode, 1);
+        assert_eq!(b.url.as_deref(), Some("https://x/img"));
+        assert_eq!(b.expected_hash.as_deref(), Some(&[0xBB; 32][..]));
+    }
+
+    #[test]
+    fn test_parse_image_begin_alias_conflict_rejected() {
+        let mut enc = CborEncoder::new();
+        enc.encode_map(3);
+        enc.neg_int(-1); enc.text("application/efi");
+        enc.uint(8); enc.bytes(&[0xAA; 32]);
+        enc.neg_int(-9); enc.bytes(&[0xBB; 32]);
+        assert!(parse_bmo_image_begin(&enc.into_bytes()).is_none(),
+            "generic key and legacy alias with different values must be rejected");
+
+        let mut same = CborEncoder::new();
+        same.encode_map(3);
+        same.neg_int(-1); same.text("application/efi");
+        same.uint(6); same.text("https://x");
+        same.neg_int(-7); same.text("https://x");
+        assert!(parse_bmo_image_begin(&same.into_bytes()).is_some(),
+            "identical values under both keys are accepted");
     }
 
     #[test]
@@ -1703,7 +1565,7 @@ mod tests {
         let (_, owner_point) = gen_test_keypair();
         let data = build_unsigned_image_begin();
         let (result, inner) = check_bmo_authorization(
-            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            &data, Some(&owner_point), PeerAuthority::OwnerDirect, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
         );
         assert_eq!(result, BmoAuthResult::UnsignedModel1);
         assert!(inner.is_none(), "unsigned returns no inner payload");
@@ -1716,7 +1578,7 @@ mod tests {
         let (_, owner_point) = gen_test_keypair();
         let data = build_unsigned_image_begin();
         let (result, _) = check_bmo_authorization(
-            &data, Some(&owner_point), true, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            &data, Some(&owner_point), PeerAuthority::Delegate { provision: true }, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
         );
         assert_eq!(result, BmoAuthResult::UnsignedModel2);
     }
@@ -1727,9 +1589,93 @@ mod tests {
     fn test_bmo_auth_unsigned_no_owner_key() {
         let data = build_unsigned_image_begin();
         let (result, _) = check_bmo_authorization(
-            &data, None, false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            &data, None, PeerAuthority::Unauthenticated, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
         );
         assert_eq!(result, BmoAuthResult::UnsignedLegacy);
+    }
+
+    // --- Onboard-only delegate (no PERM.7) ---
+    //
+    // Regression: before PeerAuthority existed, the caller passed
+    // (Some(owner_key), delegate_has_provision=false) for BOTH the Owner and
+    // an onboard-only delegate, and both were accepted as Model 1. That let a
+    // delegate the Owner had explicitly *not* granted provisioning choose the
+    // image (and its hash) to install.
+
+    #[test]
+    fn test_bmo_auth_unsigned_onboard_only_delegate_refused() {
+        let (_, owner_point) = gen_test_keypair();
+        for (ct, data) in [
+            (BMO_CONTENT_TYPE_IMAGE_BEGIN, build_unsigned_image_begin()),
+            (BMO_CONTENT_TYPE_SET, alloc::vec![0x80]), // empty array
+        ] {
+            let (result, inner) = check_bmo_authorization(
+                &data, Some(&owner_point), PeerAuthority::Delegate { provision: false }, ct, None,
+            );
+            assert_eq!(result, BmoAuthResult::UnsignedRefused, "ct={}", ct);
+            assert!(!result.is_authorized());
+            assert!(inner.is_none());
+        }
+    }
+
+    /// Control for the test above: identical input, only the peer differs.
+    /// Proves the refusal is attributable to the missing PERM.7.
+    #[test]
+    fn test_bmo_auth_unsigned_peer_matrix() {
+        let (_, owner_point) = gen_test_keypair();
+        let data = build_unsigned_image_begin();
+        let cases = [
+            (PeerAuthority::OwnerDirect, BmoAuthResult::UnsignedModel1),
+            (PeerAuthority::Delegate { provision: true }, BmoAuthResult::UnsignedModel2),
+            (PeerAuthority::Delegate { provision: false }, BmoAuthResult::UnsignedRefused),
+            // Owner key known but no proven peer: inconsistent, fail closed.
+            (PeerAuthority::Unauthenticated, BmoAuthResult::UnsignedRefused),
+        ];
+        for (peer, expected) in cases {
+            let (result, _) = check_bmo_authorization(
+                &data, Some(&owner_point), peer, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            );
+            assert_eq!(result, expected, "peer={:?}", peer);
+            assert_eq!(result.is_authorized(), peer.has_channel_provision_authority(),
+                "peer={:?}", peer);
+        }
+    }
+
+    /// The whole point of onboard-only delegation: the delegate operates the
+    /// service, the Owner decides what is installed. An Owner-signed artifact
+    /// relayed by an onboard-only delegate must be accepted.
+    #[test]
+    fn test_bmo_auth_onboard_only_delegate_relays_owner_signed() {
+        let (sk, owner_point) = gen_test_keypair();
+        let data = build_signed_image_begin(&sk);
+        let (result, inner) = check_bmo_authorization(
+            &data, Some(&owner_point), PeerAuthority::Delegate { provision: false },
+            BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::SignedOk);
+        assert!(inner.is_some());
+        assert_eq!(result.to_authority(), BmoAuthority::Artifact);
+    }
+
+    #[test]
+    fn test_bmo_auth_onboard_only_delegate_relays_owner_signed_tampered() {
+        let (sk, owner_point) = gen_test_keypair();
+        let mut data = build_signed_image_begin(&sk);
+        let last = data.len() - 1;
+        data[last] ^= 0x01;
+        let (result, _) = check_bmo_authorization(
+            &data, Some(&owner_point), PeerAuthority::Delegate { provision: false },
+            BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::SignedFailed);
+    }
+
+    #[test]
+    fn test_refused_maps_to_strictest_authority() {
+        assert_eq!(BmoAuthResult::UnsignedRefused.to_authority(), BmoAuthority::Artifact);
+        assert!(!BmoAuthResult::UnsignedRefused.is_authorized());
+        assert_ne!(BmoAuthResult::UnsignedRefused.rejection_reason(),
+                   BmoAuthResult::SignedFailed.rejection_reason());
     }
 
     // --- Model 3: Owner-signed, correct key ---
@@ -1739,7 +1685,7 @@ mod tests {
         let (sk, owner_point) = gen_test_keypair();
         let data = build_signed_image_begin(&sk);
         let (result, inner) = check_bmo_authorization(
-            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            &data, Some(&owner_point), PeerAuthority::OwnerDirect, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
         );
         assert_eq!(result, BmoAuthResult::SignedOk);
         assert!(inner.is_some(), "signed OK must return inner payload");
@@ -1753,7 +1699,7 @@ mod tests {
         let (_, wrong_point) = gen_test_keypair_b();
         let data = build_signed_image_begin(&sk);
         let (result, inner) = check_bmo_authorization(
-            &data, Some(&wrong_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            &data, Some(&wrong_point), PeerAuthority::OwnerDirect, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
         );
         assert_eq!(result, BmoAuthResult::SignedFailed);
         assert!(inner.is_none());
@@ -1766,7 +1712,7 @@ mod tests {
         let (sk, _) = gen_test_keypair();
         let data = build_signed_image_begin(&sk);
         let (result, inner) = check_bmo_authorization(
-            &data, None, false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            &data, None, PeerAuthority::Unauthenticated, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
         );
         assert_eq!(result, BmoAuthResult::SignedFailed);
         assert!(inner.is_none());
@@ -1780,7 +1726,7 @@ mod tests {
         let data = build_signed_image_begin(&sk);
         // Expect BMO_CONTENT_TYPE_SET but got IMAGE_BEGIN
         let (result, _) = check_bmo_authorization(
-            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_SET, None,
+            &data, Some(&owner_point), PeerAuthority::OwnerDirect, BMO_CONTENT_TYPE_SET, None,
         );
         assert_eq!(result, BmoAuthResult::SignedFailed);
     }
@@ -1794,7 +1740,7 @@ mod tests {
         let last = data.len() - 1;
         data[last] ^= 0x01; // flip last byte (signature)
         let (result, _) = check_bmo_authorization(
-            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            &data, Some(&owner_point), PeerAuthority::OwnerDirect, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
         );
         assert_eq!(result, BmoAuthResult::SignedFailed);
     }
@@ -1847,7 +1793,7 @@ mod tests {
     fn test_signed_begin_composes_to_hash_requirement() {
         let (auth, _) = check_bmo_authorization(
             &[0xA1, 0x00, 0x01],           // bare CBOR map — unsigned
-            Some(&[0u8; 65]), false,
+            Some(&[0u8; 65]), PeerAuthority::OwnerDirect,
             crate::cose::BMO_CONTENT_TYPE_IMAGE_BEGIN, None);
         assert_eq!(auth.to_authority(), BmoAuthority::Channel);
         // Channel authority: an image-end hash suffices.
@@ -1960,8 +1906,10 @@ mod tests {
         // key -9 came over the TO2 channel, so it can stand in for a
         // signature on the meta-payload.
         let plan = meta_hash_decision(BmoAuthority::Artifact, Some(H_A), false, Some(H_B)).unwrap();
-        // Only the authenticated hash is enforced; the unsigned one is ignored.
-        assert_eq!(plan.required, alloc::vec![H_A.to_vec()]);
+        // Changed 2026-10-02: the unauthenticated meta-payload's hash is still
+        // ENFORCED (it can only make acceptance stricter) — it just does not
+        // count as evidence. Previously it was ignored.
+        assert_eq!(plan.required, alloc::vec![H_A.to_vec(), H_B.to_vec()]);
     }
 
     #[test]
@@ -2022,7 +1970,7 @@ mod tests {
         );
 
         let (result, inner) = check_bmo_authorization(
-            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            &data, Some(&owner_point), PeerAuthority::OwnerDirect, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
         );
         assert_eq!(result, BmoAuthResult::SignedOk,
             "delegate-signed Model 4 with x5chain must verify");
@@ -2070,10 +2018,61 @@ mod tests {
         );
 
         let (result, _) = check_bmo_authorization(
-            &data, Some(&owner_point), false, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            &data, Some(&owner_point), PeerAuthority::OwnerDirect, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
         );
         assert_eq!(result, BmoAuthResult::SignedFailed,
             "delegate chain not rooted in owner must be rejected");
+    }
+
+    /// Build a delegate-signed (x5chain) image-begin whose single leaf cert is
+    /// issued by `owner_sk` with the given permission OIDs.
+    fn build_delegate_signed_image_begin(
+        owner_sk: &p256::ecdsa::SigningKey, perms: &[&[u8]],
+    ) -> Vec<u8> {
+        let (delegate_sk, delegate_point) = gen_test_keypair_b();
+        let cert_der = crate::delegate::build_test_cert(owner_sk, &delegate_point, perms);
+        let protected = build_test_protected_header(Some(BMO_CONTENT_TYPE_IMAGE_BEGIN));
+        let aad = domain_aad(AAD_TAG_BMO_PROVISION, 200);
+        let mut unhdr = alloc::vec![0xa1, 0x18, 33];
+        crate::cose::encode_bstr(&mut unhdr, &cert_der);
+        build_test_cose_sign1(&protected, b"\xa1\x00\x18\x34", &aad, &unhdr, &delegate_sk)
+    }
+
+    /// Model 4 relayed by an onboard-only peer: the TO2 peer and the artifact
+    /// signer are different parties. Accepted because the *signer* has PERM.7.
+    #[test]
+    fn test_bmo_auth_onboard_only_delegate_relays_model4() {
+        use crate::delegate::{OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED};
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let data = build_delegate_signed_image_begin(
+            &owner_sk, &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED]);
+        let (result, inner) = check_bmo_authorization(
+            &data, Some(&owner_point), PeerAuthority::Delegate { provision: false },
+            BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+        );
+        assert_eq!(result, BmoAuthResult::SignedOk);
+        assert!(inner.is_some());
+    }
+
+    /// Device-side Model 4 negative: the signer's chain is validly rooted in
+    /// the Owner but lacks PERM.7. Previously only covered by the server
+    /// refusing to start (`start9 --no-provision`), so the device never saw it.
+    /// Checked from every peer type — a PERM.7 *peer* must not lend its
+    /// permission to a signer that lacks it.
+    #[test]
+    fn test_bmo_auth_model4_signer_without_provision_rejected() {
+        use crate::delegate::OID_PERMIT_ONBOARD_NEWCRED;
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let data = build_delegate_signed_image_begin(&owner_sk, &[OID_PERMIT_ONBOARD_NEWCRED]);
+        for peer in [PeerAuthority::OwnerDirect,
+                     PeerAuthority::Delegate { provision: true },
+                     PeerAuthority::Delegate { provision: false }] {
+            let (result, inner) = check_bmo_authorization(
+                &data, Some(&owner_point), peer, BMO_CONTENT_TYPE_IMAGE_BEGIN, None,
+            );
+            assert_eq!(result, BmoAuthResult::SignedFailed, "peer={:?}", peer);
+            assert!(inner.is_none());
+        }
     }
 
     // ===== Meta-payload tests =====
@@ -2235,8 +2234,9 @@ mod tests {
         let cbor = build_test_meta_payload(
             "application/efi", "http://10.0.0.1/img.efi", None, None, None,
         );
-        let result = verify_and_extract_meta(&cbor, None).expect("unsigned should pass");
+        let (result, signed) = verify_and_extract_meta(&cbor, None, None).expect("unsigned should pass");
         assert_eq!(result, cbor);
+        assert!(!signed, "unsigned meta-payload must be reported as unauthenticated");
     }
 
     #[test]
@@ -2259,8 +2259,9 @@ mod tests {
             &protected, &meta_cbor, &aad, &[0xa0], &sk,
         );
 
-        let result = verify_and_extract_meta(&envelope, Some(&cose_key))
+        let (result, signed) = verify_and_extract_meta(&envelope, Some(&cose_key), None)
             .expect("valid signature should pass");
+        assert!(signed);
         assert_eq!(result, meta_cbor);
 
         // Parse the extracted payload to confirm it's intact
@@ -2287,7 +2288,7 @@ mod tests {
             &protected, &meta_cbor, &aad, &[0xa0], &sk,
         );
 
-        let result = verify_and_extract_meta(&envelope, Some(&wrong_cose_key));
+        let result = verify_and_extract_meta(&envelope, Some(&wrong_cose_key), None);
         assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
             "wrong signer key must fail");
     }
@@ -2312,7 +2313,7 @@ mod tests {
         let last = envelope.len() - 1;
         envelope[last] ^= 0xFF;
 
-        let result = verify_and_extract_meta(&envelope, Some(&cose_key));
+        let result = verify_and_extract_meta(&envelope, Some(&cose_key), None);
         assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
             "tampered signature must fail");
     }
@@ -2335,7 +2336,7 @@ mod tests {
             &protected, &meta_cbor, &wrong_aad, &[0xa0], &sk,
         );
 
-        let result = verify_and_extract_meta(&envelope, Some(&cose_key));
+        let result = verify_and_extract_meta(&envelope, Some(&cose_key), None);
         assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
             "wrong domain AAD must fail");
     }
@@ -2343,7 +2344,7 @@ mod tests {
     #[test]
     fn test_verify_and_extract_meta_bad_cose_key() {
         // Garbage COSE_Key
-        let result = verify_and_extract_meta(&[0xD2, 0x83, 0x40, 0xa0, 0x40], Some(&[0xFF, 0x00]));
+        let result = verify_and_extract_meta(&[0xD2, 0x83, 0x40, 0xa0, 0x40], Some(&[0xFF, 0x00]), None);
         assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
             "garbage COSE_Key must fail");
     }
@@ -2356,7 +2357,7 @@ mod tests {
         let meta_cbor = build_test_meta_payload(
             "application/efi", "http://example.com/img", None, None, None,
         );
-        let result = verify_and_extract_meta(&meta_cbor, Some(&cose_key));
+        let result = verify_and_extract_meta(&meta_cbor, Some(&cose_key), None);
         assert_eq!(result.unwrap_err(), BMO_ERROR_META_SIGNATURE_INVALID,
             "raw CBOR when signed expected must fail");
     }
@@ -2382,7 +2383,126 @@ mod tests {
         assert_eq!(point.unwrap().len(), 65, "P-256 uncompressed point must be 65 bytes");
 
         // Verify the meta-payload signature
-        let result = verify_and_extract_meta(&meta_data, Some(&signer_data));
+        let result = verify_and_extract_meta(&meta_data, Some(&signer_data), None);
         assert!(result.is_ok(), "go-fdo signed meta-payload must verify: {:?}", result.err());
+    }
+    // ===== Meta-payload rules (chunking-strategy.md, 2026-10-02) =====
+
+    fn meta_with(extra: impl FnOnce(&mut CborEncoder), n_extra: usize) -> Vec<u8> {
+        let mut enc = CborEncoder::new();
+        enc.encode_map(2 + n_extra);
+        enc.uint(0); enc.text("application/efi");
+        enc.uint(1); enc.text("https://cdn/img.efi");
+        extra(&mut enc);
+        enc.into_bytes()
+    }
+
+    #[test]
+    fn test_meta_instruction_fields_detected() {
+        let plain = parse_meta_payload(&meta_with(|e| { e.uint(6); e.text("name"); }, 1)).unwrap();
+        assert!(plain.instruction_fields().is_empty(), "pointer + informational fields are not instructions");
+
+        let boot = parse_meta_payload(&meta_with(|e| { e.uint(5); e.text("init=/bin/sh"); }, 1)).unwrap();
+        assert_eq!(boot.instruction_fields(), alloc::vec![String::from("boot_args")]);
+
+        let ca = parse_meta_payload(&meta_with(|e| { e.uint(2); e.bytes(&[1, 2]); }, 1)).unwrap();
+        assert_eq!(ca.instruction_fields(), alloc::vec![String::from("tls_ca")]);
+
+        // A negative (FSIM-defined) key used to make the whole parse fail;
+        // now it parses and is classified as an instruction.
+        let fsim = parse_meta_payload(&meta_with(|e| { e.neg_int(-1); e.text("x"); }, 1))
+            .expect("meta-payload with an FSIM-defined negative key must parse");
+        assert_eq!(fsim.instruction_fields(), alloc::vec![String::from("key -1")]);
+    }
+
+    #[test]
+    fn test_check_unauthenticated_meta_matrix() {
+        let pointer = parse_meta_payload(&meta_with(|e| { e.uint(4); e.bytes(H_B); }, 1)).unwrap();
+        let boot = parse_meta_payload(&meta_with(|e| { e.uint(5); e.text("init=/bin/sh"); }, 1)).unwrap();
+
+        // Authenticated meta-payloads may carry anything.
+        assert!(check_unauthenticated_meta(&boot, true, None).is_ok());
+        // Unauthenticated, no pinned image hash: nothing authenticates the image.
+        assert_eq!(check_unauthenticated_meta(&pointer, false, None).unwrap_err(),
+            HashPolicyError::UnauthenticatedSource);
+        // Unauthenticated pointer with pinned hash: allowed.
+        assert!(check_unauthenticated_meta(&pointer, false, Some(H_A)).is_ok());
+        // Unauthenticated with boot_args: refused even with a pinned hash.
+        let e = check_unauthenticated_meta(&boot, false, Some(H_A)).unwrap_err();
+        assert_eq!(e, HashPolicyError::InstructionFromUnauthenticatedMeta);
+        assert_eq!(e.code(), BMO_ERROR_NOT_AUTHORIZED);
+        assert_eq!(HashPolicyError::UnauthenticatedSource.code(), BMO_ERROR_UNAUTHENTICATED_SOURCE);
+    }
+
+    fn sign_meta(sk: &p256::ecdsa::SigningKey, meta: &[u8], unprotected: &[u8]) -> Vec<u8> {
+        let protected = build_test_protected_header(None);
+        let aad = domain_aad(crate::cose::AAD_TAG_META_PAYLOAD, 200);
+        build_test_cose_sign1(&protected, meta, &aad, unprotected, sk)
+    }
+
+    fn x5chain_hdr(cert_der: &[u8]) -> Vec<u8> {
+        let mut h = alloc::vec![0xa1, 0x18, 33];
+        crate::cose::encode_bstr(&mut h, cert_der);
+        h
+    }
+
+    #[test]
+    fn test_meta_signed_by_owner_without_meta_signer() {
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let meta = meta_with(|_| {}, 0);
+        let signed = sign_meta(&owner_sk, &meta, &[0xa0]);
+
+        let (inner, ok) = verify_and_extract_meta(&signed, None, Some(&owner_point))
+            .expect("Owner-signed meta-payload must verify against the Owner key");
+        assert!(ok && inner == meta);
+
+        let (_, other_point) = gen_test_keypair_b();
+        assert_eq!(verify_and_extract_meta(&signed, None, Some(&other_point)).unwrap_err(),
+            BMO_ERROR_META_SIGNATURE_INVALID, "wrong Owner key must be rejected");
+        assert_eq!(verify_and_extract_meta(&signed, None, None).unwrap_err(),
+            BMO_ERROR_META_SIGNATURE_INVALID, "signed meta with no meta_signer and no Owner key must be rejected");
+    }
+
+    #[test]
+    fn test_meta_signed_by_delegate_x5chain() {
+        use crate::delegate::{build_test_cert, OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED};
+        let (owner_sk, owner_point) = gen_test_keypair();
+        let (delegate_sk, delegate_point) = gen_test_keypair_b();
+        let meta = meta_with(|_| {}, 0);
+
+        let good = build_test_cert(&owner_sk, &delegate_point, &[OID_PERMIT_PROVISION, OID_PERMIT_ONBOARD_NEWCRED]);
+        let signed = sign_meta(&delegate_sk, &meta, &x5chain_hdr(&good));
+        let (_, ok) = verify_and_extract_meta(&signed, None, Some(&owner_point))
+            .expect("PERM.7 delegate-signed meta-payload must verify");
+        assert!(ok);
+
+        let no_perm = build_test_cert(&owner_sk, &delegate_point, &[OID_PERMIT_ONBOARD_NEWCRED]);
+        let signed = sign_meta(&delegate_sk, &meta, &x5chain_hdr(&no_perm));
+        assert_eq!(verify_and_extract_meta(&signed, None, Some(&owner_point)).unwrap_err(),
+            BMO_ERROR_META_SIGNATURE_INVALID, "delegate without PERM.7 must be rejected");
+    }
+
+    #[test]
+    fn test_meta_signer_named_but_unsigned_rejected() {
+        let (_, point) = gen_test_keypair();
+        let key = build_test_cose_key(&point);
+        assert_eq!(verify_and_extract_meta(&meta_with(|_| {}, 0), Some(&key), None).unwrap_err(),
+            BMO_ERROR_META_SIGNATURE_INVALID, "never downgraded to unsigned when meta_signer is named");
+    }
+
+    #[test]
+    fn test_signed_begin_binds_content() {
+        let mut b = BmoImageBegin::default();
+        b.delivery_mode = BMO_DELIVERY_INLINE;
+        assert_eq!(signed_begin_binds_content(BmoAuthority::Artifact, &b).unwrap_err(),
+            HashPolicyError::SignedWithoutHash, "signed inline begin without key 8 refused at begin");
+        assert!(signed_begin_binds_content(BmoAuthority::Channel, &b).is_ok(),
+            "channel authority: image-end hash is acceptable, decided later");
+        b.expected_hash = Some(H_A.to_vec());
+        assert!(signed_begin_binds_content(BmoAuthority::Artifact, &b).is_ok());
+        let mut m = BmoImageBegin::default();
+        m.delivery_mode = BMO_DELIVERY_META_URL;
+        assert!(signed_begin_binds_content(BmoAuthority::Artifact, &m).is_ok(),
+            "meta-URL: the hash may come from a signed meta-payload");
     }
 }

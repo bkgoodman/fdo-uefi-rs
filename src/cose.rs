@@ -205,16 +205,14 @@ pub fn verify_sign1(s1: &CoseSign1, external_aad: &[u8], point: &[u8]) -> bool {
 
 /// Verify a BMO provisioning COSE_Sign1 envelope (tag 18).
 ///
-/// Checks:
+/// Checks, in this order (chunking-strategy.md "Verification Algorithm"):
 /// 1. Parses the COSE_Sign1 (expects tag 18 to already be present)
 /// 2. Verifies content_type in protected header matches `expected_ct`
-/// 3. Evaluates fdo.bmo.scope if present (guid, not_before, not_after, generation)
-/// 4. Builds external_aad = CBOR(["FDO-FSIM-BmoProvision-v1"])
-/// 5. If x5chain (label 33) is present in unprotected header:
-///    - Validates certificate chain to `owner_point`
-///    - Checks PERM.7 (OIDPermitProvision) on leaf certificate
-///    - Verifies signature against delegate leaf key (Model 4)
-/// 6. Otherwise verifies signature against `owner_point` directly (Model 3)
+/// 3. Chooses the key (`artifact_signer_point`): Owner key, or the leaf of an
+///    x5chain that validates to it and grants PERM.7 in every certificate
+/// 4. Verifies the signature with external_aad = CBOR(["FDO-FSIM-BmoProvision-v1"])
+/// 5. Only then evaluates scope ("fdo.scope", or legacy "fdo.bmo.scope"),
+///    rejecting any constraint it cannot evaluate
 ///
 /// `device_guid` is the 16-byte voucher GUID proven in TO2 (for scope.guid check).
 ///
@@ -239,86 +237,109 @@ pub fn verify_bmo_signed<'a>(data: &'a [u8], owner_point: &[u8], expected_ct: &s
         }
     }
 
-    // Evaluate fdo.bmo.scope if present in the protected header.
-    if !evaluate_bmo_scope(s1.protected_header, device_guid) {
-        error!("BMO COSE: scope evaluation FAILED — rejecting artifact");
-        return None;
-    }
-
     // Build external_aad = CBOR(["FDO-FSIM-BmoProvision-v1"])
     let mut aad = Vec::with_capacity(AAD_TAG_BMO_PROVISION.len() + 3);
     aad.push(0x81); // array(1)
     encode_tstr(&mut aad, AAD_TAG_BMO_PROVISION);
 
     // Determine the verification key: Owner-direct (Model 3) or delegate x5chain (Model 4).
-    if has_delegate_header(s1.unprotected_header) {
-        // Model 4: Delegate-signed provisioning artifact.
-        // Extract the x5chain, validate the certificate chain against the Owner key,
-        // check that the leaf has PERM.7, and verify the signature with the leaf key.
-        info!("BMO COSE: x5chain present — delegate-signed artifact (Model 4)");
+    let key = artifact_signer_point(s1.unprotected_header, owner_point)?;
+    let sig_structure = build_sig_structure(s1.protected_header, &aad, s1.payload);
+    if !verify_es256(&sig_structure, s1.signature, &key) {
+        error!("BMO COSE: SIGNATURE VERIFICATION FAILED");
+        return None;
+    }
+    info!("BMO COSE: provisioning artifact verified OK (content_type={})", expected_ct);
 
-        let cert_ders = match crate::delegate::extract_x5chain_from_unprotected(s1.unprotected_header) {
-            Some(c) => c,
-            None => {
-                error!("BMO COSE: failed to extract x5chain from unprotected header");
-                return None;
-            }
-        };
-
-        let cert_refs: Vec<&[u8]> = cert_ders.iter().map(|c| c.as_slice()).collect();
-        let chain_result = match crate::delegate::verify_delegate_chain(&cert_refs, owner_point) {
-            Some(r) => r,
-            None => {
-                error!("BMO COSE: delegate x5chain verification FAILED");
-                return None;
-            }
-        };
-
-        if !chain_result.has_provision {
-            error!("BMO COSE: delegate leaf certificate lacks OIDPermitProvision (PERM.7)");
-            error!("BMO COSE: a delegate signing provisioning artifacts MUST have PERM.7");
-            return None;
-        }
-
-        info!("BMO COSE: delegate chain verified, leaf has PERM.7");
-
-        // Verify signature against the delegate leaf key
-        let sig_structure = build_sig_structure(s1.protected_header, &aad, s1.payload);
-        if !verify_es256(&sig_structure, s1.signature, &chain_result.leaf_key_point) {
-            error!("BMO COSE: SIGNATURE VERIFICATION FAILED against delegate leaf key");
-            return None;
-        }
-
-        info!("BMO COSE: delegate-signed artifact verified OK (content_type={})", expected_ct);
-    } else {
-        // Model 3: Owner-direct signed provisioning artifact.
-        let sig_structure = build_sig_structure(s1.protected_header, &aad, s1.payload);
-        if !verify_es256(&sig_structure, s1.signature, owner_point) {
-            error!("BMO COSE: SIGNATURE VERIFICATION FAILED against Owner key");
-            return None;
-        }
-
-        info!("BMO COSE: Owner-signed artifact verified OK (content_type={})", expected_ct);
+    // Scope is evaluated only AFTER the signature, so no constraint decision
+    // rests on unauthenticated bytes (chunking-strategy.md "Verification
+    // Algorithm", step 6).
+    if !evaluate_bmo_scope(s1.protected_header, device_guid) {
+        error!("BMO COSE: scope evaluation FAILED — rejecting artifact");
+        return None;
     }
 
     Some(s1.payload)
 }
 
-/// Label for the scope field in the protected header.
-const BMO_SCOPE_LABEL: &str = "fdo.bmo.scope";
+/// The key that must have produced an authorization artifact's signature:
+/// the Owner key when no `x5chain` (label 33) is present (Owner-direct), or
+/// the leaf of an `x5chain` that validates to the Owner key and grants
+/// `fdo-ekt-permit-provision` (PERM.7) in every certificate (Delegate).
+///
+/// Shared by provisioning artifacts (`verify_bmo_signed`) and meta-payloads
+/// (`verify_meta_signed`), so both apply the same signer rules.
+#[cfg(feature = "fdo-installer")]
+fn artifact_signer_point(unprotected: &[u8], owner_point: &[u8]) -> Option<Vec<u8>> {
+    if !has_delegate_header(unprotected) {
+        return Some(owner_point.to_vec());
+    }
+    info!("COSE: x5chain present — delegate-signed artifact");
+    let cert_ders = match crate::delegate::extract_x5chain_from_unprotected(unprotected) {
+        Some(c) => c,
+        None => {
+            error!("COSE: failed to extract x5chain from unprotected header");
+            return None;
+        }
+    };
+    let cert_refs: Vec<&[u8]> = cert_ders.iter().map(|c| c.as_slice()).collect();
+    let chain = match crate::delegate::verify_delegate_chain(&cert_refs, owner_point) {
+        Some(r) => r,
+        None => {
+            error!("COSE: delegate x5chain verification FAILED");
+            return None;
+        }
+    };
+    if !chain.has_provision {
+        error!("COSE: delegate chain does not grant fdo-ekt-permit-provision (PERM.7)");
+        return None;
+    }
+    Some(chain.leaf_key_point)
+}
 
-/// Evaluate fdo.bmo.scope from the protected header.
+/// Verify a meta-payload signed by the Owner or a PERM.7 Delegate (used when
+/// `image-begin` names no `meta_signer`), with external AAD
+/// `["FDO-FSIM-MetaPayload-v1"]`. Returns the inner MetaPayload CBOR.
+#[cfg(feature = "fdo-installer")]
+pub fn verify_meta_signed<'a>(data: &'a [u8], owner_point: &[u8]) -> Option<&'a [u8]> {
+    let s1 = parse_cose_sign1(data)?;
+    let key = artifact_signer_point(s1.unprotected_header, owner_point)?;
+    let aad = domain_aad(AAD_TAG_META_PAYLOAD, FDO_VERSION_200);
+    let sig_structure = build_sig_structure(s1.protected_header, &aad, s1.payload);
+    if !verify_es256(&sig_structure, s1.signature, &key) {
+        error!("COSE: meta-payload signature verification FAILED (Owner / delegate)");
+        return None;
+    }
+    Some(s1.payload)
+}
+
+/// Protected-header label for scope constraints (chunking-strategy.md
+/// "Scope Constraints").
+pub const SCOPE_LABEL: &str = "fdo.scope";
+/// Legacy fdo.bmo label, still accepted. An artifact carrying both is rejected.
+pub const LEGACY_BMO_SCOPE_LABEL: &str = "fdo.bmo.scope";
+
+/// Evaluate scope constraints from the protected header.
 ///
 /// Returns `true` if scope is absent (no constraint) or all constraints pass.
-/// Returns `false` if any constraint fails (caller should reject the artifact).
+/// Returns `false` if any constraint fails **or cannot be evaluated**
+/// (chunking-strategy.md "Unevaluable constraints"): this firmware has no
+/// trustworthy clock and no rollback-protected storage, so `not_before`,
+/// `not_after` and `generation` are always rejected, never ignored; `guid`
+/// without a device GUID is rejected too.
 fn evaluate_bmo_scope(protected_header: &[u8], device_guid: Option<&[u8]>) -> bool {
-    // Find the scope bytes in the protected header (text-keyed map entry)
-    let scope_bytes = match extract_tstr_keyed_value(protected_header, BMO_SCOPE_LABEL) {
-        Some(b) => b,
-        None => return true, // No scope → no constraints
+    let generic = extract_tstr_keyed_value(protected_header, SCOPE_LABEL);
+    let legacy = extract_tstr_keyed_value(protected_header, LEGACY_BMO_SCOPE_LABEL);
+    let scope_bytes = match (generic, legacy) {
+        (Some(_), Some(_)) => {
+            error!("COSE: artifact carries both \"{}\" and \"{}\" — rejecting", SCOPE_LABEL, LEGACY_BMO_SCOPE_LABEL);
+            return false;
+        }
+        (Some(b), None) => { info!("COSE: evaluating \"{}\" ({} bytes)", SCOPE_LABEL, b.len()); b }
+        (None, Some(b)) => { info!("COSE: evaluating legacy \"{}\" ({} bytes)", LEGACY_BMO_SCOPE_LABEL, b.len()); b }
+        (None, None) => return true, // No scope → no constraints
     };
 
-    info!("BMO COSE: evaluating fdo.bmo.scope ({} bytes)", scope_bytes.len());
 
     // Parse scope as a CBOR map with text keys
     let mut pos = 0usize;
@@ -369,31 +390,17 @@ fn evaluate_bmo_scope(protected_header: &[u8], device_guid: Option<&[u8]>) -> bo
                     return false;
                 }
             }
-            "not_before" => {
-                let ts = match read_scope_uint(scope_bytes, &mut pos) {
-                    Some(v) => v,
-                    None => { error!("BMO COSE: scope not_before parse error"); return false; }
-                };
-                info!("BMO COSE: scope not_before={}", ts);
-                // Clock evaluation: log but do not enforce (no trusted clock in UEFI)
-                warn!("BMO COSE: not_before enforcement skipped (no trusted clock)");
-            }
-            "not_after" => {
-                let ts = match read_scope_uint(scope_bytes, &mut pos) {
-                    Some(v) => v,
-                    None => { error!("BMO COSE: scope not_after parse error"); return false; }
-                };
-                info!("BMO COSE: scope not_after={}", ts);
-                warn!("BMO COSE: not_after enforcement skipped (no trusted clock)");
+            "not_before" | "not_after" => {
+                // No trustworthy clock in this firmware: the constraint cannot
+                // be evaluated, so it MUST reject (error 17), never be ignored.
+                // The Owner's remedy is to mint without a validity window.
+                error!("BMO COSE: scope {} present but this device has no trustworthy clock — rejecting (error 17)", key_str);
+                return false;
             }
             "generation" => {
-                let gen = match read_scope_uint(scope_bytes, &mut pos) {
-                    Some(v) => v,
-                    None => { error!("BMO COSE: scope generation parse error"); return false; }
-                };
-                info!("BMO COSE: scope generation={}", gen);
-                // Generation enforcement: log but do not enforce (no rollback storage yet)
-                warn!("BMO COSE: generation enforcement skipped (no rollback storage)");
+                // No rollback-protected storage: MUST reject (error 18).
+                error!("BMO COSE: scope generation present but this device has no rollback-protected storage — rejecting (error 18)");
+                return false;
             }
             _ => {
                 // Unknown scope field — fail closed per spec
@@ -439,8 +446,8 @@ fn evaluate_scope_guid(data: &[u8], pos: &mut usize, device_guid: Option<&[u8]>)
                 return false;
             }
         }
-        info!("BMO COSE: scope guid present but no device GUID to check against");
-        return true;
+        error!("BMO COSE: scope guid present but no device GUID to check against — rejecting");
+        return false;
     }
 
     if major == 4 {
@@ -477,26 +484,12 @@ fn evaluate_scope_guid(data: &[u8], pos: &mut usize, device_guid: Option<&[u8]>)
                 }
             }
         }
-        if device_guid.is_some() {
-            error!("BMO COSE: scope guid array — no entry matches device GUID");
-            return false;
-        }
-        return true;
+        error!("BMO COSE: scope guid array — no entry matches device GUID (or no device GUID)");
+        return false;
     }
 
     error!("BMO COSE: scope guid is not a bstr or array");
     false
-}
-
-/// Read a uint value from CBOR at position.
-fn read_scope_uint(data: &[u8], pos: &mut usize) -> Option<u64> {
-    let b = *data.get(*pos)?;
-    *pos += 1;
-    if (b >> 5) != 0 {
-        return None; // not a uint
-    }
-    let val = cbor_read_uint_arg(data, pos, b & 0x1f)? as u64;
-    Some(val)
 }
 
 /// Extract a raw CBOR value from a protected header map for a given text key.
@@ -1107,7 +1100,7 @@ mod tests {
         let mut hdr = Vec::new();
         hdr.push(0xa2); // map(2)
         hdr.push(0x01); hdr.push(0x26); // alg = -7
-        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
         // scope value is a CBOR map, encoded as raw bytes
         hdr.extend_from_slice(&scope_cbor);
 
@@ -1126,7 +1119,7 @@ mod tests {
         let mut hdr = Vec::new();
         hdr.push(0xa2); // map(2)
         hdr.push(0x01); hdr.push(0x26);
-        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
         hdr.extend_from_slice(&scope_cbor);
 
         assert!(!evaluate_bmo_scope(&hdr, Some(&device_guid)),
@@ -1151,7 +1144,7 @@ mod tests {
         let mut hdr = Vec::new();
         hdr.push(0xa2);
         hdr.push(0x01); hdr.push(0x26);
-        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
         hdr.extend_from_slice(&scope_cbor);
 
         assert!(evaluate_bmo_scope(&hdr, Some(&device_guid)),
@@ -1174,7 +1167,7 @@ mod tests {
         let mut hdr = Vec::new();
         hdr.push(0xa2);
         hdr.push(0x01); hdr.push(0x26);
-        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
         hdr.extend_from_slice(&scope_cbor);
 
         assert!(!evaluate_bmo_scope(&hdr, Some(&device_guid)),
@@ -1198,7 +1191,7 @@ mod tests {
         let mut hdr = Vec::new();
         hdr.push(0xa2);
         hdr.push(0x01); hdr.push(0x26);
-        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
         hdr.extend_from_slice(&scope_cbor);
 
         assert!(!evaluate_bmo_scope(&hdr, None),
@@ -1381,11 +1374,16 @@ mod tests {
         let mut hdr = Vec::new();
         hdr.push(0xa2); // map(2)
         hdr.push(0x01); hdr.push(0x26); // alg = -7
-        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
         hdr.extend_from_slice(&scope_cbor);
 
-        assert!(evaluate_bmo_scope(&hdr, Some(&device_guid)),
-            "all valid scope fields must pass");
+        // Changed 2026-10-02: this firmware has no trustworthy clock and no
+        // rollback-protected storage, so not_before/not_after/generation
+        // cannot be evaluated and MUST reject (chunking-strategy.md
+        // "Unevaluable constraints"). Previously they were logged and ignored,
+        // which granted more than the Owner authorised.
+        assert!(!evaluate_bmo_scope(&hdr, Some(&device_guid)),
+            "time/generation constraints this device cannot evaluate must reject");
     }
 
     #[test]
@@ -1406,7 +1404,7 @@ mod tests {
         let mut hdr = Vec::new();
         hdr.push(0xa2);
         hdr.push(0x01); hdr.push(0x26);
-        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
         hdr.extend_from_slice(&scope_cbor);
 
         assert!(!evaluate_bmo_scope(&hdr, Some(&device_guid)),
@@ -1414,8 +1412,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scope_guid_no_device_guid_skips() {
-        // When device_guid is None, guid check is skipped (device doesn't know its GUID yet)
+    fn test_scope_guid_no_device_guid_rejects() {
+        // A guid constraint the device cannot evaluate (no device GUID) must
+        // reject, not be skipped. (Previously skipped.)
         let scope_guid = [0xAA; 16];
         let mut scope_cbor = Vec::new();
         scope_cbor.push(0xa1);
@@ -1425,11 +1424,63 @@ mod tests {
         let mut hdr = Vec::new();
         hdr.push(0xa2);
         hdr.push(0x01); hdr.push(0x26);
-        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
         hdr.extend_from_slice(&scope_cbor);
 
-        assert!(evaluate_bmo_scope(&hdr, None),
-            "no device GUID → guid check skipped → pass");
+        assert!(!evaluate_bmo_scope(&hdr, None),
+            "no device GUID → guid constraint unevaluable → reject");
+    }
+
+    fn scope_hdr(label: &str, scope_cbor: &[u8]) -> Vec<u8> {
+        let mut hdr = Vec::new();
+        hdr.push(0xa2);
+        hdr.push(0x01); hdr.push(0x26);
+        encode_tstr(&mut hdr, label);
+        hdr.extend_from_slice(scope_cbor);
+        hdr
+    }
+
+    fn guid_scope(guid: &[u8]) -> Vec<u8> {
+        let mut s = Vec::new();
+        s.push(0xa1);
+        encode_tstr(&mut s, "guid");
+        encode_bstr(&mut s, guid);
+        s
+    }
+
+    #[test]
+    fn test_scope_generic_label_evaluated() {
+        let g = [0x01u8; 16];
+        assert!(evaluate_bmo_scope(&scope_hdr(SCOPE_LABEL, &guid_scope(&g)), Some(&g)),
+            "\"fdo.scope\" guid match must pass");
+        assert!(!evaluate_bmo_scope(&scope_hdr(SCOPE_LABEL, &guid_scope(&[0x02u8; 16])), Some(&g)),
+            "\"fdo.scope\" guid mismatch must reject");
+    }
+
+    #[test]
+    fn test_scope_both_labels_rejected() {
+        let g = [0x01u8; 16];
+        let s = guid_scope(&g);
+        let mut hdr = Vec::new();
+        hdr.push(0xa3);
+        hdr.push(0x01); hdr.push(0x26);
+        encode_tstr(&mut hdr, SCOPE_LABEL);
+        hdr.extend_from_slice(&s);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
+        hdr.extend_from_slice(&s);
+        assert!(!evaluate_bmo_scope(&hdr, Some(&g)), "both scope labels present must reject");
+    }
+
+    #[test]
+    fn test_scope_each_unevaluable_field_rejects_alone() {
+        for field in ["not_before", "not_after", "generation"] {
+            let mut s = Vec::new();
+            s.push(0xa1);
+            encode_tstr(&mut s, field);
+            s.push(0x01);
+            assert!(!evaluate_bmo_scope(&scope_hdr(SCOPE_LABEL, &s), Some(&[0x01u8; 16])),
+                "{} must reject on a device that cannot evaluate it", field);
+        }
     }
 
     #[test]
@@ -1438,7 +1489,7 @@ mod tests {
         let mut hdr = Vec::new();
         hdr.push(0xa2);
         hdr.push(0x01); hdr.push(0x26);
-        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
         hdr.push(0xa0); // map(0)
 
         assert!(evaluate_bmo_scope(&hdr, Some(&[0x01u8; 16])),
@@ -1457,7 +1508,7 @@ mod tests {
         let mut hdr = Vec::new();
         hdr.push(0xa2);
         hdr.push(0x01); hdr.push(0x26);
-        encode_tstr(&mut hdr, BMO_SCOPE_LABEL);
+        encode_tstr(&mut hdr, LEGACY_BMO_SCOPE_LABEL);
         hdr.extend_from_slice(&scope_cbor);
 
         assert!(!evaluate_bmo_scope(&hdr, None),

@@ -26,7 +26,7 @@ set -e
 WORKDIR=/tmp/fdo-hw-test
 SERVER="$HOME/bkgvm/server"
 FIRMWARE_DIR=/tmp/fdo-firmware-server
-TEST_IMAGE="$FIRMWARE_DIR/test.efi"
+TEST_IMAGE="${TEST_IMAGE:-$FIRMWARE_DIR/test.efi}"   # override, e.g. TEST_IMAGE=~/bkgvm/hello-efi.efi
 UKI="$FIRMWARE_DIR/ubuntu-26.04.1-live-server-fdo.efi"
 EXT_HTTP=192.168.200.30:8080
 
@@ -142,9 +142,13 @@ case "${1:-}" in
         ensure_test_image
         stop_server
 
-        echo "=== Starting TO2 server (signed BMO + scope, Model 3) ==="
+        echo "=== Starting TO2 server (signed BMO + scope, Model 3) — NEGATIVE ==="
         echo "BMO image: $TEST_IMAGE ($(du -h "$TEST_IMAGE" | cut -f1))"
         echo "Scope: not_before=2025-01-01, not_after=2030-01-01, generation=1"
+        echo "EXPECT: the device REJECTS this artifact. The EFI client has no"
+        echo "trustworthy clock and no rollback-protected storage, so time and"
+        echo "generation constraints are unevaluable and MUST fail closed"
+        echo "(errors 17/18, chunking-strategy.md 'Unevaluable constraints')."
         echo ""
         echo "On EFI shell:"
         echo "  fs0:\\EFI\\fdo-uefi.efi"
@@ -260,6 +264,10 @@ case "${1:-}" in
 
         echo "=== Starting TO2 server (unsigned meta-URL, mode 2) ==="
         echo "Meta URL: $META_URL"
+        echo "The meta-payload is unsigned and fetched over plain HTTP, so it is only"
+        echo "a pointer: image-begin pins the image hash (-bmo-meta-hash / key 8)."
+        echo "Without it the device refuses (error 19). Requires a go-fdo server"
+        echo "built 2026-10-02 or later (-bmo-meta-hash)."
         echo ""
         echo "On EFI shell:"
         echo "  fs0:\\EFI\\fdo-uefi.efi"
@@ -268,7 +276,7 @@ case "${1:-}" in
         "$SERVER" -debug server -http 0.0.0.0:8080 -db "$WORKDIR/fdo.db" \
             -ext-http "$EXT_HTTP" \
             -rv-bypass -reuse-cred -bmo-sign \
-            -bmo-meta-url "$META_URL" \
+            -bmo-meta-url "$META_URL" -bmo-meta-hash "$IMAGE_HASH" \
             2>&1 | tee "$WORKDIR/server.log"
         ;;
 

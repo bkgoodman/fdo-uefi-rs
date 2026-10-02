@@ -4,6 +4,315 @@
 
 # TODO - FDO UEFI Client
 
+# PRIORITY — Cross-Repo: Delivery & Authorization Restructure (opened 2026-10-02)
+
+This section tracks work across **four repos**. It lives here so it isn't lost;
+items are tagged by repo. Background: the permissions/authority review that
+found H4 (below), and the two articles in
+`fdo-overview-docs/articles/` (`fdo-permissions-best-practices.md`,
+`fdo-bmo-security-model.md`).
+
+## Decisions (agreed 2026-10-02)
+
+- **D1 — Channel authority is baseline, not a debug mode.** `fdo.bmo.md`
+  Security Considerations claimed unsigned messages MUST NOT be accepted,
+  contradicting its own Channel Authority section. **Fixed** in fdo-sim
+  (uncommitted).
+- **D2 — Every fetched object (image *or* meta-payload) must be authenticated**
+  by at least one of:
+  1. a hash pinned in an authorized parent (`-9` in image-begin; `4` in a meta-payload);
+  2. a signature by the key the authorized parent names (`-10`);
+  3. a signature by the Owner, or by an `x5chain` granting PERM.7 (**new** for meta);
+  4. TLS the device actually validated (`tls_ca` or a trusted system store).
+
+  None of these ⇒ refuse. A hash SHOULD always be present; omitting it is
+  allowed only with (4), with strong warnings in the spec.
+- **D3 — A meta-payload authenticated only by (1)**, i.e. the image hash is
+  pinned in image-begin but the meta itself is unauthenticated: the device takes
+  **only** the URL from it. `boot_args` (kernel cmdline — `init=/bin/sh` is code
+  execution), `tls_ca` and any other instruction-bearing field must be ignored
+  or the meta refused. *Open: ignore vs. refuse — recommend refuse (visible
+  failure).*
+- **D4 — Spec is wrong, EFI client is right** on unsigned meta with no `-9`:
+  the spec permits it (both `-10` and `-9` optional; "Meta-URL, Unsigned"
+  example ~line 1235); the client refuses (`meta_hash_decision`).
+- **D5 — Meta signed by Owner / PERM.7 `x5chain`** (D2 option 3) is added.
+  `-10` is kept for third-party publishers (see note below). **Confirmed.**
+- **D6 — Delivery, meta-payload and authorization move to
+  `chunking-strategy.md`** with **new non-negative keys** (generic, so any FSIM
+  — notably `fdo.payload` — can use them). `-6..-10` stay in `fdo.bmo` as
+  **deprecated aliases**: devices accept, new senders don't emit.
+  The authorization model's normative text moves too (today chunking-strategy
+  points *into* `fdo.bmo` — backwards).
+
+> Note on `-10` (D5): a third-party publisher (e.g. an OS vendor) serves *one*
+> meta-payload at *one* URL to *every* customer. An `x5chain` inside that
+> object would have to chain to every customer's Owner key at once —
+> impossible. Naming the publisher's key in an authorized instruction (`-10`)
+> is how a given Owner says "I trust this publisher" without the publisher
+> participating in its PKI. `x5chain` fits the Owner's *own* release team.
+
+## fdo-sim (spec) — do first
+
+- [x] `chunking-strategy.md` (2026-10-02, uncommitted, **awaiting review**):
+      begin keys `5` delivery_mode, `6` url, `7` tls_ca, `8` expected_hash,
+      `9` meta_signer (+ legacy-alias rule: accept `-6..-10`, never emit,
+      reject if both present and differ); Delivery Modes; Meta-Payload
+      (structure, pointer/informational/instruction field classes, signing:
+      `meta_signer` vs Owner/PERM.7 `x5chain`, AAD `FDO-FSIM-MetaPayload-v1`);
+      Authenticating Fetched Content (D2/D3 + decision table); full
+      authorization model moved in and generalized (incl. "MUST NOT infer peer
+      authority from Owner key availability" — the H4 lesson); FSIM
+      Declarations; Transfer Error Codes 9–19. Inline + artifact authority
+      requires `expected_hash` in the signed begin (`*-end` is unsigned).
+      All internal links verified.
+      **New items this introduced for implementations:**
+      - Scope header label is now `"fdo.scope"`; `"fdo.bmo.scope"` accepted as
+        legacy alias for fdo.bmo; both present ⇒ reject.
+      - New error **19 Unauthenticated Source** (was folded into 11/15).
+      - Unauthenticated meta carrying instruction fields ⇒ error **15**.
+      - Signed meta without `meta_signer`: verify against Owner key, or
+        `x5chain` granting PERM.7 (D5).
+- [x] `fdo.bmo.md` (2026-10-02, uncommitted; ~550 lines removed net):
+      authorization section (344 lines) replaced by BMO declarations
+      (content types, AAD, meta key 5 `boot_args` = instruction) + BMO-specific
+      rules; heading/anchor `#authorization-of-provisioning-messages` kept for
+      inbound links. CDDL uses keys `5..9` and `"fdo.scope"`; `-6..-10` and
+      `"fdo.bmo.scope"` documented as legacy aliases. Delivery Modes rewritten
+      against chunking (hash SHOULD; firmware without TLS MUST refuse an
+      un-hashed mode-1 image; meta signer table; unsigned-meta example
+      rewritten as "pointer with pinned hash"); anchor
+      `#mode-2-meta-payload-indirection` kept. Error codes 9–18 → reference to
+      generic 9–19. **Implementation Requirements had the same D1
+      contradiction** ("MUST reject unsigned", "Owner MUST wrap every
+      message") — fixed. URL Delivery Security condensed. Tooling note: the
+      example server's unsigned `-bmo-meta-url` mode is now refused unless it
+      also sends key 8.
+- [x] `fdo.payload.md`: delivery by reference via generic keys; authorization
+      by reference; declares `payload-begin` gated, content type
+      `application/cbor+fdo.payload.payload-begin`, AAD
+      `"FDO-FSIM-PayloadProvision-v1"` (**new wire identifiers**); MAY-policy
+      for documented low-risk MIME types; error codes 9–19 by reference. Also
+      fixed a pre-existing broken anchor (`#client-update-payloads`).
+- [x] `go-fdo/provisioning-security.md`: links repointed to chunking-strategy;
+      **fixed wrong PERM numbers** (said onboard = PERM.1/.2 and redirect =
+      PERM.6; correct is onboard .2–.4, redirect .1); PERM.7 no longer
+      attributed to the core FDO 2.0 spec.
+- [x] Link check across chunking-strategy, fdo.bmo, fdo.payload, fdo.defer,
+      provisioning-security: 0 broken.
+- [x] **De-duplicated delivery content (2026-10-02).** `fdo.bmo.md` had ~320
+      lines of delivery material in two places (old "Delivery Mode Fallback /
+      CDN" block, and the Delivery Modes section). Generic parts moved to
+      `chunking-strategy.md` ("Why Deliver by Reference", "Offering
+      Alternatives (Fallback)" — incl. *authentication refusal is not a reason
+      to downgrade*); BMO now keeps only firmware-specific points: inline is
+      the dependable mode, **do not rely on firmware HTTPS** (TLS a build
+      option, no root store, `TlsCaCertificate` must be provisioned, some
+      stacks refuse `http://`), memory/`total_size`, `image_type` vs meta
+      `mime_type`, `boot_args` as instruction. Removed stale examples (legacy
+      keys, HTTPS without hash, hash in `image-end` key 2 instead of 1).
+      Anchors `#delivery-modes`, `#mode-2-meta-payload-indirection`,
+      `#tooling` kept. Link check: 0 broken.
+- [ ] **Review pass by Brad** on all three spec files before implementation
+      starts.
+
+## go-fdo — priority after spec
+
+- [x] **Audit for the H4 bug** (2026-10-02, uncommitted). **Not vulnerable** —
+      an onboard-only delegate's unsigned BMO was already rejected. But it
+      erred the other way: **Owner-direct unsigned (Model 1) was rejected**
+      whenever the Owner key was known, violating "channel authority MUST be
+      enabled by default". Same root cause as H4 (one bool can't express three
+      peer states). Fixed with `fdo.PeerAuthority` in `to2_context.go`, set in
+      `to2.go` (1.01) and `to2_client_v200.go` (2.0); `fsim/bmo_device.go`
+      decision in pure `unsignedProvisioningAllowed`. Tests: 4 new unit tests
+      (Owner-direct accept, onboard-only reject ×2 messages, onboard-only relays
+      Owner-signed, peer matrix); integration `bmo-signed-negative` (asserted
+      the non-compliant behaviour) replaced by `bmo-owner-unsigned`.
+      Verified: `bmo-owner-unsigned`, `bmo-delegate-unsigned-noperm`,
+      `bmo-delegate-unsigned`, `bmo-signed` all PASS; `go test .` and
+      `./fsim/` pass; golangci-lint 0 issues on `.` and `./fsim/...` (also
+      fixed 3 pre-existing lint issues in `fsim/bmo_provision.go`).
+      Full `make test`: every unit package passes except `tpm` (known
+      pre-existing build failure, missing `openssl/aes.h` — see go-fdo
+      AGENTS.md); `go test ./examples/...` passes; `./test_examples.sh all`
+      **ALL TESTS PASSED** (48).
+- [x] **Restructure done (2026-10-02, uncommitted).** Generic code now lives
+      in `fsim/chunking`:
+      - `types.go`: `BeginMessage` keys 5–9 (`DeliveryMode`, `URL`, `TLSCA`,
+        `ExpectedHash`, `MetaSigner`); legacy `-6..-10` accepted on decode,
+        translated (never emitted) on encode; generic/alias conflict ⇒ error.
+      - `delivery.go`: `MetaPayload` (moved; `fsim.MetaPayload` is an alias)
+        with field classes; `VerifyMetaPayload` (named `meta_signer` / Owner
+        key / PERM.7 `x5chain`); `Resolve` implementing D2/D3 (evidence =
+        hash in authorized parent | signature | validated TLS; else 19;
+        unauthenticated meta = pointer only, instruction fields ⇒ 15; every
+        hash enforced; decided before downloading). `ValidatingFetcher`
+        interface — only fetchers that report validated TLS can provide TLS
+        evidence; the example client implements it.
+      - `authorization.go`: `VerifyArtifact` (content type, Owner or PERM.7
+        `x5chain` via `fdo.VerifyDelegateChain`, AAD, scope) with
+        `"fdo.scope"` + legacy `"fdo.bmo.scope"` (both ⇒ reject); scope
+        evaluated fail-closed (guid via new `fdo.WithDeviceGUID`, time via
+        clock, generation ⇒ 18 — no rollback storage). Error codes 9–19 and
+        `TransferError`.
+      - BMO device uses all of the above; signed inline `image-begin` without
+        key 8 ⇒ 15; inline begin hash now actually checked against the
+        buffer. Owner emits 5–9 and `"fdo.scope"`, auto-hashes inline images
+        in every mode. Server flag `-bmo-meta-hash`. `fsim.SignMetaPayloadWithChain`
+        + `fdo meta sign|create-signed -chain`.
+      **Pre-existing go-fdo gaps found and fixed along the way:**
+      - `DelegateHasPermission` checked **only the leaf** (spec: every cert).
+        Affects TO2 onboard/reuse/redirect/provision decisions too. Fixed +
+        `TestDelegatePermissionRequiresEveryCert`.
+      - BMO `x5chain` verification checked leaf PERM.7 + signatures only (no
+        CA bits, no every-cert rule, no key usage). Now `fdo.VerifyDelegateChain`.
+      - Device **never evaluated scope** (guid/time/generation silently
+        ignored). Now evaluated fail-closed.
+      - Device accepted URL mode without a hash, unsigned meta without a hash,
+        and `boot_args` from an unsigned meta (the same class as fdo-uefi-rs H1).
+      **Tests:** new `fsim/chunking/delivery_test.go` (begin keys, Resolve URL
+      + meta matrices, Owner/x5chain/no-PERM.7 meta, scope matrix, signer/CT/AAD);
+      6 new device tests in `fsim/bmo_url_test.go`; mutation-checked (disabling
+      the instruction-field rule or reverting to leaf-only permissions fails
+      tests). Integration: `bmo-meta-url` gained a negative leg + uses
+      `-bmo-meta-hash`; `bmo-signed-scope` rewritten (window accept / expired
+      reject / generation reject — it previously passed only because scope was
+      ignored); new `bmo-meta-delegate-signed` (x5chain meta, and `fdo meta`
+      refuses an onboard-only chain). All rejections checked for the right
+      reason in logs. **Full suite: unit (all pkgs except tpm — known openssl
+      build issue), examples, `test_examples.sh all` = 49 PASSED.**
+      golangci-lint 0 issues on `.` and `./fsim/...`; `./examples/...` has
+      only pre-existing findings (0 new); shfmt diff count unchanged.
+- [x] **`fdo.payload` device authorization** (2026-10-02). `payload-begin` is
+      now gated via the shared `fsim/provisioning_auth.go::authorizeGated`
+      (BMO uses the same function — one implementation): artifact authority
+      with `PayloadContentTypeBegin` + `cose.AADPayloadProvision`, or channel
+      authority by peer. `Payload.UnauthorizedMIMETypes` = the spec's
+      documented MAY-policy (inline only, never consulted for signed). Signed
+      inline begin without key 8 ⇒ 15; begin hash enforced in unified **and
+      streaming** mode (streaming cancels before finalize). Delivery modes
+      1/2 via `chunking.Resolve` (unified only; streaming ⇒ 14). Owner:
+      `PayloadOwner.Signer` (`ArtifactSigner`; `OwnerSigner`/`DelegateSigner`
+      gained `SignArtifact`), delivery fields, auto-hash, `AddPayloadURL` /
+      `AddPayloadMetaURL`; server `-payload-sign`; client payload fetcher.
+      Same streaming-mode gaps fixed in **BMO** `ChunkedHandler` (begin hash
+      never checked; URL modes not rejected).
+      Tests: `fsim/payload_auth_test.go` (peer matrix, MIME policy, Owner- and
+      PERM.7-signed relay, CT/AAD/tamper/no-hash negatives, no-PERM.7
+      delegate, hash in both modes, URL no-hash, streaming+URL ⇒ 14, and a
+      **Receive-wiring** test — mutation-checked: bypassing the gate fails it).
+      Integration: `payload-signed`, `payload-delegate-noperm` (rejected for
+      the right reason).
+- [x] `fdo meta verify -owner`: verifies Owner-direct or x5chain metas with
+      the device's rules (`chunking.VerifyMetaPayload`); named-key mode also
+      goes through it now. Exercised in `bmo-meta-delegate-signed`.
+- [x] **Fixed 5 pre-existing payload integration tests that could never fail
+      on content** (`payload`, `payload-fdo200`, `payload-nak`,
+      `payload-large-mtu`, `payload-default-mtu`): `RECEIVED_FILE` pointed at
+      the *source* file, so "hashes match" compared the source with itself.
+      Now `examples/<name>`, where the client actually writes.
+- [x] **Final go-fdo state:** unit (all pkgs except `tpm` — known openssl
+      build issue), examples, `test_examples.sh all` = **51 PASSED**;
+      golangci-lint 0 issues on `.`, `./cose/...`, `./fsim/...`; `./examples/...`
+      0 new; shfmt unchanged. All uncommitted.
+- [x] Removed the dead `BMO.MetaPayloadVerifier` field, its Transition
+      auto-init and the `MetaPayloadVerifier` interface. **Kept**
+      `CoseSign1Verifier` — `go-fdo-meta-tool` uses it — now a thin wrapper
+      over `chunking.VerifyMetaPayload` (one implementation). meta-tool builds
+      and `test_meta_tool.sh` passes; go-fdo full suite 51/51 after the change.
+
+## fdo-uefi-rs
+
+- [ ] **DEFERRED — No TLS in the EFI client** (decision 2026-10-02, Brad).
+      `http_api.rs` has no TLS/HTTPS; `tls_ca` (key 7 / meta key 2) is parsed
+      and unused. This is **safe, not a hole**: TLS is never counted as
+      evidence, so every fetched image must be pinned by a hash or a signed
+      meta (fail-closed, error 19). Not pursuing until firmware offers usable
+      native TLS, because:
+      (a) EFI content is already protected by hashes and signatures;
+      (b) third-party publishers (OS vendors) are served by signed
+          meta-payloads (`meta_signer`, or PERM.7 x5chain), no TLS needed;
+      (c) `fdo.payload` runs in-OS in go-fdo, which has a real TLS stack and
+          root store, so TLS-as-evidence is available where it matters.
+      If ever done: firmware EFI_TLS/HTTP protocols with `tls_ca` as trust
+      anchor, and **do not count TLS as evidence until a wrong-CA negative
+      test proves refusal.**
+- [x] **D6 keys** (2026-10-02, uncommitted): `parse_bmo_image_begin` reads
+      generic keys 5–9 and legacy `-6..-10`; differing generic/alias pair ⇒
+      malformed (rejected). Tests: generic, legacy, conflict, identical-ok.
+- [x] **D5**: meta-payload signed with no `meta_signer` is verified against
+      the Owner key or an `x5chain` granting PERM.7 (`cose::verify_meta_signed`,
+      sharing `artifact_signer_point` with `verify_bmo_signed`). `meta_signer`
+      named + unsigned meta ⇒ 12 (no downgrade). Tests: Owner-signed,
+      wrong Owner, no Owner key, PERM.7 delegate, delegate without PERM.7.
+- [x] **D3**: `check_unauthenticated_meta` — unsigned meta needs key 8 in
+      image-begin (else 19) and may carry no instruction fields (`tls_ca`,
+      `boot_args`, any FSIM/unknown key ⇒ 15). Meta parser now reads signed
+      keys (a negative key used to make the **whole parse fail**).
+      `meta_hash_decision`: every hash enforced, incl. an unauthenticated
+      meta's (previously ignored); evidence = begin hash or authenticated meta hash.
+- [x] **Scope** (`cose.rs`): label `"fdo.scope"` + legacy `"fdo.bmo.scope"`
+      (both ⇒ reject). **Behaviour change:** `not_before`/`not_after`/`generation`
+      were *logged and ignored*; now **rejected** (no trusted clock, no rollback
+      storage — spec "Unevaluable constraints" MUST). `guid` with no device GUID
+      was skipped; now rejected. **Scope was evaluated before the signature**;
+      now after (spec step 6).
+- [x] URL mode now decides on the hash **before** downloading; refusals carry
+      code 19 (`HashPolicyError::code()`), new constants 15–19.
+- [x] Mutation-checked: disabling the instruction-field rule, the PERM.7
+      check, or the alias-conflict check each fails tests. 244 tests pass;
+      `make release` clean for bmo/cose; disk image rebuilt.
+- [x] `examples/start-hw-server.sh`: `to2-scope` now labelled NEGATIVE
+      (device must reject); `to2-meta` passes `-bmo-meta-hash` so the
+      unsigned meta is a valid pointer.
+- [x] **QEMU verified (pe2, 2026-10-02)** with the new go-fdo server and EFI
+      image: start5 (TO1/TO2 crypto), start8 `--no-provision` (onboard-only
+      delegate unsigned ⇒ REFUSED — H4 end-to-end), start8 (Model 2),
+      start9 (Model 4 x5chain), start10 (Model 1 accepted), start13
+      (signature verified *then* time scope rejected, error 17), start14
+      (GUID scope both legs), start15 all three legs (pointer + pinned hash
+      accepted; no hash ⇒ error 19 and image never fetched; named-signer
+      meta). Each verdict checked against the device log line that proves it.
+- [x] **K800 hardware (2026-10-02)**: hello-world chainload via
+      `start-hw-server.sh to2-signed` (Model 3) and `to2` (Model 1) with
+      `TEST_IMAGE=~/bkgvm/hello-efi.efi` (source `~/hello-efi`, 9 KB uefi-rs
+      app): TPM HMAC + Owner signature verified, image integrity verified,
+      TO2 complete, `HELLO-EFI: Hello, world!` printed by the chainloaded app.
+- [x] **pe2 scripts updated** (backups `*.2026-09-30.bak`; pe2-only, not in
+      this repo): start10 → POSITIVE Model 1; start13 → NEGATIVE; start15
+      gained `unsigned-nohash` leg and pins the hash for `unsigned`; start8
+      verdict made mode-aware (it printed PASS for both outcomes in either
+      mode and could not fail). start10/start8 also grepped for a log string
+      ("Unsigned provisioning rejected") the client no longer emits.
+- [x] ~~pe2 QEMU scripts need updating~~ (done above). Original notes:
+      `start10-unsigned-reject.sh` expects Owner-direct unsigned BMO to be
+      **rejected** — now correctly accepted (Model 1); invert it or retire it
+      (start8 `--no-provision` is the real negative). `start13-bmo-signed-scope.sh`
+      expects time/generation scope to **pass** — now rejected; invert.
+      `start15-meta-url.sh` unsigned leg needs `-bmo-meta-hash` (else 19).
+      The pe2 `~/bkgvm/server` (Sep 30) lacks `-bmo-meta-hash`/`-payload-sign`;
+      a new build is at `go-fdo/fdo` (2026-10-02).
+- [x] `src/chunking.rs` (2026-10-02): generic delivery logic moved out of
+      `bmo.rs` (meta-payload parse/verify, unauthenticated-meta rules, the
+      three hash decisions, alias merging, `Authority`, error codes 9–19);
+      `bmo` re-exports it. Pure move: same tests (245), same warnings.
+- [x] Signed **inline** image-begin without key 8 is now refused at
+      image-begin time (`signed_begin_binds_content`), not after the transfer.
+- [ ] H4 QEMU follow-ups (see Security Audit → H4).
+
+## fdo-overview-docs
+
+- [x] `articles/fdo-bmo-security-model.md` updated to the target design
+      (2026-10-02): D2 evidence table, TLS caveats, two manifest signers
+      (`-10` vs `x5chain`), D3 (refuse), fleet-wide signed pointer, new
+      deployment rows, checklists. **This is the design reference the spec
+      edits should be checked against.**
+- [ ] Re-check the article once spec key numbers/names are final (it uses no
+      key numbers today, by design).
+
+---
+
 # Perpetual Reminders (never "completed")
 
 ## TPM_RC_RETRY (0x922) — every TPM command can return this
@@ -66,8 +375,62 @@ Native test count went 199 → 217; all new tests are negative tests that failed
 | M5 | Public keys extracted by byte-pattern scan; X5CHAIN unvalidated | Medium | **FIXED** |
 | M6 | Two independent COSE parsers over the same buffer | Medium | **OPEN** (debt) |
 | L1-L8 | Assorted | Low | **OPEN** (see below) |
+| H4 | Onboard-only delegate accepted as Owner channel authority (2026-10-02) | High | **FIXED** (native); QEMU negative **PENDING** |
 
 ## Fixed
+
+### H4 — An onboard-only delegate could choose what gets installed (2026-10-02)
+
+Found during the permissions/authority review, not by the 09-29 audit.
+`check_bmo_authorization` took `(owner_key_point: Option, delegate_has_provision: bool)`
+and treated `(Some, false)` as Model 1 (Owner-direct channel authority). But
+`fdo.rs` always passes `Some(owner_key)` — the Owner key comes from the
+voucher and is known even when a *delegate* signed `ProveOVHdr`. So a delegate
+holding only `fdo-ekt-permit-onboard-*` (no PERM.7) was indistinguishable from
+the Owner, and its **unsigned** `image-begin` / `set` was accepted with
+Channel authority — meaning its own `expected_hash` was trusted too. This
+defeats the core purpose of onboard-only delegation (third party runs the
+service, Owner decides what is installed). Contradicts `fdo.bmo.md`
+§"Why permitting channel authority is not a weakening".
+
+**Regression, not design gap.** The original Model 2 work (see "Model 2:
+Delegate channel authority" below) rejected this case. The later "Model 1 bug
+fix" (2026-09-23) made unsigned acceptable whenever the Owner key was present,
+which erased the only signal separating the two peers. No unit test covered
+`(owner key, delegate, no PERM.7, unsigned)`, so nothing caught it. The QEMU
+negative `start8-delegate-unsigned.sh --no-provision` was presumably not
+re-run after the Model 1 fix.
+
+**Fix:** `bmo::PeerAuthority { OwnerDirect, Delegate { provision }, Unauthenticated }`
+is set explicitly on each branch of `ProveOVHdr` verification in `fdo.rs` and
+passed instead of the bool. Unsigned from `Delegate { provision: false }` →
+new `BmoAuthResult::UnsignedRefused` (not authorized; maps to strictest
+authority). Owner key present + `Unauthenticated` peer also fails closed.
+Signed artifacts (Model 3/4) are still accepted from *any* peer — that is the
+intended relay path.
+
+Tests (+7, total 226 → 233), the first two verified to FAIL against the old logic:
+- `test_bmo_auth_unsigned_onboard_only_delegate_refused` (image-begin + set)
+- `test_bmo_auth_unsigned_peer_matrix` (same bytes, only peer varies — control)
+- `test_bmo_auth_onboard_only_delegate_relays_owner_signed` (+ `_tampered`)
+- `test_bmo_auth_onboard_only_delegate_relays_model4`
+- `test_bmo_auth_model4_signer_without_provision_rejected` — first
+  **device-side** Model 4 negative; previously only "server refuses to start".
+  Checked from every peer type (a PERM.7 peer must not lend its permission to
+  a signer without it).
+- `test_refused_maps_to_strictest_authority`
+
+**Remaining:**
+- [ ] Re-run `start8-delegate-unsigned.sh --no-provision` on QEMU against the
+  new build; expect `image-begin REJECTED: Provisioning not authorized`.
+  Also run it against the *old* binary to confirm it was accepting (proves the
+  script can detect the bug).
+- [ ] QEMU positive: onboard-only delegate relaying an Owner-signed BMO
+  (start8 `--no-provision` + `-bmo-sign`) — the scenario delegation exists for.
+- [ ] Device-side Model 4 negative on QEMU: needs a server/pre-signed mode that
+  emits an x5chain without PERM.7 (server currently refuses to start).
+- [ ] Error code 15 (Provisioning Not Authorized) is not carried in the result;
+  only the message text distinguishes it. Fold into the 16/17/18 item below.
 
 ### H1 — Nothing required the signature to cover the bytes we execute
 
@@ -701,6 +1064,8 @@ to the ECDH x-coordinate result before passing to KDF.
 - [x] **Model 1 bug fix** — Unsigned BMO payloads were wrongly rejected when Owner key
   was present ("no signing or delegate authority"). Fixed: Owner-direct channel
   authority (Model 1) now correctly accepts unsigned payloads. (2026-09-23)
+  **This fix introduced H4** (onboard-only delegate treated as Model 1) — see
+  Security Audit section. Corrected 2026-10-02 via `PeerAuthority`.
 - [x] **DI: flush TPM transient handles on network error** (2026-09-28) — 
   `tpm_flush_all_transient()` runs at the start of both `run_di_protocol()` and
   `perform_to2()`, cleaning up leftovers from a previous failed attempt.
@@ -919,6 +1284,7 @@ models and their status on the EFI client:
   Owner key present and no delegate PERM.7. Tested on QEMU:
   - Positive: `start8-delegate-unsigned.sh` (delegate with onboard+provision)
   - Negative: `start8-delegate-unsigned.sh --no-provision` (onboard only, rejected)
+  - **Regressed** by the 09-23 Model 1 fix; restored 2026-10-02 (H4). Needs re-run.
 
 ### Remaining work — ordered by priority
 

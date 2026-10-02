@@ -515,7 +515,7 @@ go-fdo server (e.g. pe2), then point the EFI client at it.
 ./start-hw-server.sh di              # Fresh DB + DI server (Ctrl-C after DI)
 ./start-hw-server.sh to2             # Unsigned BMO (Model 1: channel authority)
 ./start-hw-server.sh to2-signed      # Owner-signed BMO (Model 3: artifact authority)
-./start-hw-server.sh to2-scope       # Signed BMO + scope constraints (Model 3)
+./start-hw-server.sh to2-scope       # Signed BMO + time/generation scope — NEGATIVE (device must reject)
 ./start-hw-server.sh to2-uki         # Full UKI transfer (~106MB, ~10 min)
 ./start-hw-server.sh stop            # Kill server
 ./start-hw-server.sh status          # Check status + tail log

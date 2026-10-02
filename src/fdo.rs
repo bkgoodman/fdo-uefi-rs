@@ -1998,7 +1998,10 @@ pub fn perform_to2(
     // Check for delegate chain (label 258) in the unprotected header.
     // If present, validate the chain and use the delegate leaf key for
     // ProveOVHdr verification instead of the Owner key directly.
-    let mut delegate_has_provision = false;
+    // Set explicitly on each branch below. Must not be inferred later from
+    // "Owner key is present" — the Owner key is known even when a delegate
+    // signed ProveOVHdr.
+    let peer_authority: crate::bmo::PeerAuthority;
 
     if crate::cose::has_delegate_header(prove_ov_s1.unprotected_header) {
         info!("TO2: ProveOVHdr carries a delegate chain — validating...");
@@ -2029,7 +2032,9 @@ pub fn perform_to2(
 
         info!("TO2: Delegate chain verified — leaf has onboard={}, provision={}",
             chain_result.has_onboard, chain_result.has_provision);
-        delegate_has_provision = chain_result.has_provision;
+        peer_authority = crate::bmo::PeerAuthority::Delegate {
+            provision: chain_result.has_provision,
+        };
 
         // Verify ProveOVHdr signature with the delegate leaf key
         let prove_ov_aad = crate::cose::domain_aad(
@@ -2054,6 +2059,7 @@ pub fn perform_to2(
             return Err(FdoError::CryptoError(String::from(
                 "ProveOVHdr signature verification failed")));
         }
+        peer_authority = crate::bmo::PeerAuthority::OwnerDirect;
     }
 
     // Freshness: the Owner must echo the nonce it issued in HelloDeviceAck20
@@ -2239,7 +2245,7 @@ pub fn perform_to2(
                         // Check if this is a BMO message
                         if key.starts_with("fdo.bmo:") {
                             debug!("    Processing BMO message: {}", key);
-                            if let Some((resp_key, resp_value)) = process_bmo_message(&mut bmo_session, &key, &value, Some(&owner_key), delegate_has_provision, Some(guid.as_slice())) {
+                            if let Some((resp_key, resp_value)) = process_bmo_message(&mut bmo_session, &key, &value, Some(&owner_key), peer_authority, Some(guid.as_slice())) {
                                 debug!("    BMO response: {} ({} bytes)", resp_key, resp_value.len());
                                 bmo_responses.push((resp_key, resp_value));
                             }

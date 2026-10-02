@@ -161,20 +161,22 @@ to enable pure testing of all 4 security models.
 - [ ] **Tampered meta-payload rejected** — flip a byte in signed meta-payload;
   verification MUST fail.
 
-### 3c. Scope edge cases — PARTIALLY DONE
+### 3c. Scope edge cases — DONE (fail-closed)
 
-Scope parse/evaluate is tested (combined fields, empty map, fail-closed on unknowns).
-Time enforcement and generation counters are parsed but **not enforced** on UEFI
-(no trusted clock, no rollback storage). When enforcement is added, add these:
+Scope parse/evaluate is tested (combined fields, empty map, fail-closed on
+unknowns, `"fdo.scope"` + legacy `"fdo.bmo.scope"`, both-labels rejected).
+Since 2026-10-02 the UEFI client **rejects** `not_before`/`not_after`/
+`generation` outright — it has no trusted clock and no rollback storage, and
+the spec makes unevaluable constraints a MUST-reject. `guid` with no device
+GUID is rejected too. Scope is evaluated only after the signature.
 
-- [ ] **Expired scope rejected** — `not_after` in the past, trusted clock
-  available → reject.
-- [ ] **Not-yet-valid scope rejected** — `not_before` in the future, trusted
-  clock available → reject.
-- [ ] **Generation mismatch** — stored generation > artifact generation → reject.
-- [x] **Multiple scope fields combined** — GUID + not_after + generation all
-  valid → accept; any one invalid → reject.
-  (`test_scope_combined_fields_all_valid`, `test_scope_combined_guid_mismatch_fails_everything`)
+- [x] **Unevaluable fields reject, each alone** (`test_scope_each_unevaluable_field_rejects_alone`)
+- [x] **Combined guid + time + generation → reject** (`test_scope_combined_fields_all_valid`, inverted)
+- [x] **GUID mismatch fails everything** (`test_scope_combined_guid_mismatch_fails_everything`)
+- [x] **guid without device GUID → reject** (`test_scope_guid_no_device_guid_rejects`)
+- [x] **QEMU**: `start13-bmo-signed-scope.sh` (now NEGATIVE: signature verifies, then scope rejected)
+- [ ] If a trusted clock / rollback storage is ever added: expired, not-yet-valid
+  and generation-downgrade cases, and accept-within-window.
 
 ### 3d. Protocol message tampering — PARTIALLY DONE
 
