@@ -2,6 +2,59 @@
 <!-- Author: Brad Goodman <bradley.goodman@dell.com> -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
+# System Test Coverage (all projects) — 2026-10-07
+
+What is exercised end to end across go-fdo, fdo-uefi-rs and
+fido-device-onboard-rs after the FDO 2.0 Errata 1 / spec-drift work, and
+what is deliberately **not** tested yet.
+
+## Tested
+
+| Area | How | Result (2026-10-07) |
+| --- | --- | --- |
+| go-fdo unit tests (base, FSIM, sqlite, TPM, examples) | `go test` | pass |
+| go-fdo integration (DI/TO0/TO1/TO2 at 1.1 and 2.0, delegates, FSIMs, BMO incl. multi-parameter `set`) | `./test_examples.sh all` | 52 pass (RV blob skipped by design) |
+| go-fdo lint | `make lint` | clean except 4 pre-existing findings in `examples/cmd/server.go` |
+| fdo-uefi-rs native unit tests | `make test` | 256 pass |
+| fdo-uefi-rs ↔ go-fdo, TO1/TO2 crypto verification (QEMU + swtpm) | `start5-verify.sh` | pass |
+| Negative: corrupted to1d (33), ProveOVHdr20 (83), OVNextEntry20 (85), plus control (99) | `start6-negative.sh` | tampered messages abort TO2; control completes |
+| BMO Owner-signed (artifact authority) | `start7-bmo-signed.sh` | signature verified |
+| BMO delegate unsigned (PERM.7 accepted, onboard-only refused) | `start8-delegate-unsigned.sh` | pass |
+| BMO delegate-signed (x5chain) | `start9-delegate-signed.sh` | artifact verified (script's verdict grep is stale; see below) |
+| BMO Owner unsigned (channel authority, Model 1) | `start10-unsigned-reject.sh` | pass |
+| BMO wrong-key signature rejected | `start11-signed-negative.sh` | pass |
+| Signed `fdo.bmo:set` (multi-parameter) | `start12-signed-set.sh` | pass |
+| Scope: unevaluable time/generation rejected; GUID scope | `start13`, `start14` | pass |
+| Meta-URL: unsigned+pinned, unsigned-no-hash (negative), signed | `start15-meta-url.sh all` | pass |
+| **Chainload of a real EFI app** (Owner-signed BMO → verify → chainload `hello-efi.efi`) | `start7` variant using `~/bkgvm/hello-efi.efi` | "HELLO-EFI: Hello, world!" printed |
+| fido-device-onboard-rs ↔ go-fdo (DI, full flow, delegate, 4 BMO modes) | `test_rust_fdo20_interop.sh all` | 7 pass |
+
+Notes on the pe2 scripts:
+- `start7`, `start11`–`start14` deliver random bytes as `test.efi`, so their
+  chainload step always fails ("Missing MZ header"). They test verification,
+  not booting. Chainloading is covered by the `hello-efi.efi` variant above;
+  consider making that variant a permanent script.
+- `start9` passes functionally but prints no verdict: it greps for
+  "delegate-signed artifact verified OK", while the client now logs
+  "provisioning artifact verified OK".
+- `start6` and `start7` exit 0 regardless of outcome; read their output.
+- `/tmp/fdo-negative*` and `/tmp/fdo-bmo-signed*` (and their voucher/firmware
+  dirs) on pe2 are root-owned leftovers from 2026-09-30, so `start6` and
+  `start7` fail at their first `rm -rf`. They were run from copies using
+  different work directories.
+
+## Not tested (deliberately, for now)
+
+- **fido-device-onboard-rs security features that are not implemented**:
+  delegate permission checks, signed BMO provisioning, peer authority,
+  authentication of fetched content (see that repo's `TODO.md`).
+- **BMO on real hardware** (K800): not run since the errata wire-format
+  changes; the K800 still has a pre-errata `fdo-uefi.efi`.
+- **Full OS installation** (UKI / installer ISO via BMO, `start4.sh`):
+  testing stops at chainloading a hello-world EFI app.
+
+---
+
 # Native Unit Test Plan — fdo-uefi-rs
 
 Run with `make test` (no UEFI, no QEMU, no swtpm).

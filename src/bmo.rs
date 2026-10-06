@@ -365,26 +365,26 @@ pub fn build_bmo_set_response(status: u8, message: Option<&str>) -> Vec<u8> {
     enc.into_bytes()
 }
 
-/// Parse BMO set message — CBOR array of [name, value] pairs.
-/// Returns the first parameter as (name, value). The EFI client doesn't
-/// have a BIOS configuration interface, so we only log the parameters.
-fn parse_bmo_set(data: &[u8]) -> Option<(String, String)> {
+/// Parse a BMO set message — CBOR array of [name, value] pairs. Returns
+/// every parameter, or None if any is malformed (a set is atomic: one bad
+/// parameter rejects the whole message).
+fn parse_bmo_set(data: &[u8]) -> Option<Vec<(String, String)>> {
     let mut dec = CborDecoder::new(data);
 
-    // The set body is a CBOR array of [name, value] pairs
     let outer_len = dec.read_array_header().ok()?;
     if outer_len == 0 {
         return None;
     }
-
-    // Each element is a 2-element array [name, value]
-    let inner_len = dec.read_array_header().ok()?;
-    if inner_len < 2 {
-        return None;
+    let mut params = Vec::with_capacity(outer_len);
+    for _ in 0..outer_len {
+        if dec.read_array_header().ok()? != 2 {
+            return None;
+        }
+        let name = dec.read_text().ok()?;
+        let value = dec.read_text().ok()?;
+        params.push((name, value));
     }
-    let name = dec.read_text().ok()?;
-    let value = dec.read_text().ok()?;
-    Some((name, value))
+    Some(params)
 }
 
 /// Build a ServiceInfo key/value response
@@ -902,13 +902,15 @@ pub fn process_bmo_message(
                 None => value,
             };
 
-            // Parse the set message — CBOR map with "name" and "value" text keys
-            if let Some((name, val)) = parse_bmo_set(parse_data) {
-                info!("BMO: BIOS set: {}={}", name, val);
-                // EFI client logs the parameter but doesn't apply it
-                // (no BIOS configuration interface in UEFI firmware)
-                let result = build_bmo_set_response(BMO_STATUS_SUCCESS,
-                    Some(&format!("Parameter {} acknowledged", name)));
+            // A set is atomic and answered by exactly one response
+            // (fdo.bmo.md "Atomicity"). This client has no BIOS
+            // configuration interface, so it applies nothing and says so.
+            if let Some(params) = parse_bmo_set(parse_data) {
+                for (name, val) in &params {
+                    info!("BMO: BIOS set: {}={} (not applied)", name, val);
+                }
+                let result = build_bmo_set_response(BMO_STATUS_ERROR,
+                    Some(&format!("BIOS configuration not supported; none of {} parameter(s) applied", params.len())));
                 Some((BMO_KEY_SET_RESPONSE.to_string(), result))
             } else {
                 error!("BMO: Failed to parse set message");
@@ -1528,9 +1530,22 @@ mod tests {
         enc.text("enabled");
         let data = enc.into_bytes();
 
-        let (name, value) = parse_bmo_set(&data).expect("should parse set");
-        assert_eq!(name, "bios_setting");
-        assert_eq!(value, "enabled");
+        let params = parse_bmo_set(&data).expect("should parse set");
+        assert_eq!(params, vec![(String::from("bios_setting"), String::from("enabled"))]);
+
+        // Multi-parameter set: every parameter is returned
+        let mut enc = CborEncoder::new();
+        enc.array(2);
+        enc.array(2); enc.text("a"); enc.text("1");
+        enc.array(2); enc.text("b"); enc.text("2");
+        assert_eq!(parse_bmo_set(&enc.into_bytes()).unwrap().len(), 2);
+
+        // One malformed parameter rejects the whole set
+        let mut enc = CborEncoder::new();
+        enc.array(2);
+        enc.array(2); enc.text("a"); enc.text("1");
+        enc.array(1); enc.text("b");
+        assert!(parse_bmo_set(&enc.into_bytes()).is_none());
     }
 
     // ===== BMO authorization policy matrix (Go: bmo_provision_test.go) =====

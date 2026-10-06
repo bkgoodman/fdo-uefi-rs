@@ -248,22 +248,22 @@ fn get_device_model() -> String {
 }
 
 /// Build DIAppStart message (FDO 2.0)
-/// go-fdo expects: [Info_bstr_or_null, CapabilityFlags]
-/// where CapabilityFlags = [flags_bstr] (1-element array)
+/// Spec: [CapabilityFlags, VendorCapFlags, DeviceMfgInfo]
 fn build_di_app_start(device_mfg_info: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(device_mfg_info.len() + 16);
     
-    // Array of 2 elements: [Info, CapabilityFlags]
-    buf.push(0x82);
+    // Array of 3 elements
+    buf.push(0x83);
+    
+    // CapabilityFlags: bstr(1) 0x04 = bit 2 set = FDO 2.0
+    buf.push(0x41);
+    buf.push(0x04);
+    
+    // VendorCapFlags: empty array
+    buf.push(0x80);
     
     // Info: bstr .cbor DeviceMfgInfo (already bstr-wrapped)
     buf.extend_from_slice(device_mfg_info);
-    
-    // CapabilityFlags: [flags_bstr] = 1-element array
-    buf.push(0x81); // array(1)
-    // flags_bstr: single byte 0x04 = bit 2 set = FDO 2.0
-    buf.push(0x41); // bstr(1)
-    buf.push(0x04);
     
     buf
 }
@@ -513,7 +513,7 @@ impl OVHeader {
 }
 
 /// Parse DISetCredentials response to extract OVHeader
-/// Wire format: CBOR array [bstr .cbor OVHeader]
+/// Wire format (FDO 2.0): CBOR array [CapabilityFlags, VendorCapFlags, bstr .cbor OVHeader]
 /// OVHeader = [OVHProtVer, OVGuid, OVRVInfo, OVDeviceInfo, OVPubKey, OVDevCertChainHash]
 fn parse_di_set_credentials(data: &[u8]) -> Option<OVHeader> {
     if data.is_empty() {
@@ -526,29 +526,14 @@ fn parse_di_set_credentials(data: &[u8]) -> Option<OVHeader> {
     
     let mut pos: usize = 0;
     
-    // Outer wrapper: 1-element CBOR array [bstr]
-    let outer_initial = data[pos];
-    pos += 1;
-    let outer_major = outer_initial >> 5;
-    let outer_additional = outer_initial & 0x1f;
-    
-    if outer_major == 4 {
-        // Array wrapper - read count (should be 1)
-        let _count = if outer_additional < 24 {
-            outer_additional as usize
-        } else if outer_additional == 24 {
-            let n = data[pos] as usize;
-            pos += 1;
-            n
-        } else {
-            error!("DISetCredentials: unsupported array size encoding");
-            return None;
-        };
-        info!("DISetCredentials: outer array with {} element(s)", _count);
-    } else {
-        // No array wrapper, reset - the data might be just the bstr directly
-        pos = 0;
+    // 3-element array: [CapabilityFlags, VendorCapFlags, bstr .cbor OVHeader]
+    if data[pos] != 0x83 {
+        error!("DISetCredentials: expected a 3-element array, got 0x{:02x}", data[pos]);
+        return None;
     }
+    pos += 1;
+    let _capability_flags = cbor_read_bstr(data, &mut pos)?;
+    crate::cose::cbor_skip(data, &mut pos)?; // VendorCapFlags
     
     // Read bstr containing OVHeader CBOR
     let ov_header_raw = cbor_read_bstr(data, &mut pos)?;
@@ -1080,4 +1065,26 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_di_set_credentials_v20() {
+        // [CapabilityFlags h'04', VendorCapFlags [], bstr .cbor OVHeader]
+        // OVHeader = [200, guid, rvinfo [], devinfo "d", pubkey [10, 1, h'00'], null]
+        let mut ovh = vec![0x86, 0x18, 0xc8, 0x50];
+        ovh.extend_from_slice(&[0x11; 16]);
+        ovh.extend_from_slice(&[0x80, 0x61, b'd', 0x83, 0x0a, 0x01, 0x41, 0x00, 0xf6]);
+        let mut msg = vec![0x83, 0x41, 0x04, 0x80, 0x58, ovh.len() as u8];
+        msg.extend_from_slice(&ovh);
+        assert!(parse_di_set_credentials(&msg).is_some());
+
+        // The FDO 1.1 form [bstr OVHeader] is rejected
+        let mut old = vec![0x81, 0x58, ovh.len() as u8];
+        old.extend_from_slice(&ovh);
+        assert!(parse_di_set_credentials(&old).is_none());
+    }
 }
