@@ -28,8 +28,14 @@ what is deliberately **not** tested yet.
 | Meta-URL: unsigned+pinned, unsigned-no-hash (negative), signed | `start15-meta-url.sh all` | pass |
 | **Chainload of a real EFI app** (Owner-signed BMO → verify → chainload `hello-efi.efi`) | `start7` variant using `~/bkgvm/hello-efi.efi` | "HELLO-EFI: Hello, world!" printed |
 | fido-device-onboard-rs ↔ go-fdo (DI, full flow, delegate, 4 BMO modes) | `test_rust_fdo20_interop.sh all` | 7 pass |
+| **K800 hardware, post-errata (2026-10-08)**: DI at 2.0, then TO2 with `TEST_IMAGE=~/bkgvm/hello-efi.efi` | `start-hw-server.sh di`, `to2`, `to2-signed`, `to2-delegate-signed`, `to2-scope` | DI OK (OVHProtVer 200). Models 1, 3, 4: TPM HMAC + Owner/delegate signature verified, image integrity verified, `HELLO-EFI` chainloaded. `to2-scope` (negative): signature verified, then refused for scope (error 17), nothing chainloaded |
+| **quick-di (post-errata) → UEFI, QEMU** (2026-10-08) | `start5-verify.sh` with new `/home/bkg/quick-di-tpm` | TO1 + to1d verified, 2-entry voucher verified, TPM HMAC verified, TO2 complete |
+| **fdo-meta-tool meta-payloads → UEFI, QEMU** (2026-10-08) | `examples/start16-metatool.sh all` (copied to `~/bkgvm`) | unsigned pointer + pinned hash: chainloaded; named-signer signed: signature verified, chainloaded; **wrong signer key (negative)**: refused, image never fetched; **unsigned meta with `boot_args` (negative)**: refused (instruction field), image never fetched |
+| **quick-di on the K800's real TPM (Linux) → UEFI TO2 on the same K800** (2026-10-08) | `quick-di-tpm -quick -protocol-version 2.0 -rv 192.168.200.30:8080:http` (owner hierarchy), voucher imported into `/tmp/fdo-hw-test/fdo.db`, TO0 registered, `start-hw-server.sh to2-signed` | quick-di `-verify`: DAK proof OK. Device: real TO1 (not bypass) + to1d verified, 2-entry voucher + TPM HMAC verified, Owner-signed BMO verified, `HELLO-EFI` chainloaded |
+| **fdo-meta-tool signed meta on the K800** (2026-10-08) | server `-bmo-meta-url http://192.168.200.30:9091/meta.cbor:signer.cbor -bmo-sign`, same credentials | meta signature verified (named publisher), image fetched over the real network, hash verified, `HELLO-EFI` chainloaded |
 
 Notes on the pe2 scripts:
+
 - `start7`, `start11`–`start14` deliver random bytes as `test.efi`, so their
   chainload step always fails ("Missing MZ header"). They test verification,
   not booting. Chainloading is covered by the `hello-efi.efi` variant above;
@@ -48,14 +54,14 @@ Notes on the pe2 scripts:
 - **fido-device-onboard-rs security features that are not implemented**:
   delegate permission checks, signed BMO provisioning, peer authority,
   authentication of fetched content (see that repo's `TODO.md`).
-- **BMO on real hardware** (K800): not run since the errata wire-format
-  changes; the K800 still has a pre-errata `fdo-uefi.efi`.
+- ~~**BMO on real hardware** (K800)~~: done 2026-10-08, see table. Not run on
+  hardware: `to2-meta`, `to2-meta-signed`, `to2-uki`.
 - **Full OS installation** (UKI / installer ISO via BMO, `start4.sh`):
   testing stops at chainloading a hello-world EFI app.
 
 ---
 
-# Native Unit Test Plan — fdo-uefi-rs
+## Native Unit Test Plan — fdo-uefi-rs
 
 Run with `make test` (no UEFI, no QEMU, no swtpm).
 
@@ -64,10 +70,10 @@ Modeled after go-fdo unit tests (`delegate_test.go`, `voucher_test.go`,
 `fsim/bmo_url_test.go`, `fsim/chunking/chunking_test.go`, `cose/sign_test.go`)
 and integration scripts (`test_examples.sh`).
 
-## Current Coverage (157 tests)
+### Current Coverage (157 tests)
 
 | Module | Tests | Coverage |
-|--------|-------|----------|
+| ------ | ----- | -------- |
 | `cose.rs` | 49 | COSE_Sign1 parse/verify, ES256 +/-, domain AAD (v101 vs v200, **different tags not interchangeable**), scope (GUID match/mismatch/array, unknown fields fail closed, **combined fields**, **empty map**, **guid-no-device-guid**, **multiple unknowns fail closed**), BMO Model 3 verify, **BMO no content_type rejected**, **delegate-signed missing PERM.7 rejected**, delegate header detection, malformed inputs |
 | `delegate.rs` | 19 | 1/2/3-cert chains, wrong signer, self-signed rejected, empty chain, permission inheritance, redirect-only/onboard-only, reuse-cred vs new-cred, all permissions, EKU flags, DER parsing, ECDSA DER-to-RS |
 | `fdo.rs` | 41 | CborEncoder/Decoder roundtrip, all types, AES-GCM roundtrip/wrong key/tampered/**wrong nonce**/**wrong AAD**, KDF (128 vs 256), SHA-256, COSE_Encrypt0 roundtrip/**tampered ciphertext**, **session key derivation** (deterministic + different secrets), message builders, **encrypted message parsing** (wrong tag/no tag/missing IV/empty/truncated), **SetupDevice parsing** (bad nonce/replacement GUID/null GUID) |
@@ -77,9 +83,9 @@ and integration scripts (`test_examples.sh`).
 
 ---
 
-## Tier 1 — Security-Critical (COMPLETE)
+### Tier 1 — Security-Critical (COMPLETE)
 
-### 1a. Delegate permission inheritance through full chain — DONE
+#### 1a. Delegate permission inheritance through full chain — DONE
 
 **Go source:** `delegate_test.go` lines 176–637
 
@@ -99,7 +105,7 @@ now intersects permissions across the entire chain, not just the leaf.
 - [x] **Reuse-credential vs new-credential** (`test_new_cred_cannot_reuse`, `test_reuse_cred_implies_onboard`)
 - [x] **All permissions** (`test_all_permissions`)
 
-### 1b. Voucher verification — DONE
+#### 1b. Voucher verification — DONE
 
 **Go source:** `voucher_test.go` lines 134–320
 
@@ -120,7 +126,7 @@ now intersects permissions across the entire chain, not just the leaf.
 - [x] **Wrong domain AAD** (v2.0, BMO tag) → `EntrySignatureInvalid`
 - [x] **Chain break at entry 1** (attacker replaces signer) → `EntrySignatureInvalid(1)`
 
-### 1c. BMO unsigned/signed policy matrix — DONE
+#### 1c. BMO unsigned/signed policy matrix — DONE
 
 **Go source:** `fsim/bmo_provision_test.go` lines 41–266
 
@@ -138,7 +144,7 @@ to enable pure testing of all 4 security models.
 - [x] Model 4: Delegate-signed with x5chain → `SignedOk`
 - [x] Model 4: Delegate chain not rooted in owner → `SignedFailed`
 
-### 1d. COSE malformed input tests — DONE
+#### 1d. COSE malformed input tests — DONE
 
 **Go source:** `fsim/bmo_cose_verifier_test.go` lines 224–293
 
@@ -156,9 +162,9 @@ to enable pure testing of all 4 security models.
 
 ---
 
-## Tier 2 — Correctness
+### Tier 2 — Correctness
 
-### 2a. BMO hash verification
+#### 2a. BMO hash verification
 
 - [ ] **Correct hash passes** — build image-end with SHA-256 hash matching
   accumulated image data; verification succeeds.
@@ -166,7 +172,7 @@ to enable pure testing of all 4 security models.
 - [ ] **Size mismatch rejected** — total_size in image-begin doesn't match
   actual bytes received; must reject or warn.
 
-### 2b. Chunking message round-trips
+#### 2b. Chunking message round-trips
 
 **Go source:** `fsim/chunking/chunking_test.go`
 
@@ -176,7 +182,7 @@ to enable pure testing of all 4 security models.
 - [ ] **Result message encode/decode** — status + optional message.
 - [ ] **Ack message encode/decode** — accepted bool, optional reason + message.
 
-### 2c. BMO delivery mode and NAK
+#### 2c. BMO delivery mode and NAK
 
 - [ ] **Supported MIME type accepted** — device supports "application/efi",
   image-begin with that type → accept.
@@ -185,7 +191,7 @@ to enable pure testing of all 4 security models.
 - [ ] **Multi-asset preference** — first supported type is selected from an
   ordered list of offered types.
 
-### 2d. COSE known vectors
+#### 2d. COSE known vectors
 
 **Go source:** `cose/sign_test.go` lines 21–105
 
@@ -197,15 +203,15 @@ to enable pure testing of all 4 security models.
 
 ---
 
-## Tier 3 — Extended Coverage
+### Tier 3 — Extended Coverage
 
-### 3a. RV firmware metadata
+#### 3a. RV firmware metadata
 
 - [ ] **Tags 16/17/18 encode/decode** — firmware URL, path, and min-revision
   round-trip through CBOR.
 - [ ] **Anti-rollback enforcement** — generation counter rejects downgrades.
 
-### 3b. Meta-payload
+#### 3b. Meta-payload
 
 - [ ] **Meta-payload CBOR roundtrip** — URL, MIME, hash, name fields encode
   and decode correctly.
@@ -214,7 +220,7 @@ to enable pure testing of all 4 security models.
 - [ ] **Tampered meta-payload rejected** — flip a byte in signed meta-payload;
   verification MUST fail.
 
-### 3c. Scope edge cases — DONE (fail-closed)
+#### 3c. Scope edge cases — DONE (fail-closed)
 
 Scope parse/evaluate is tested (combined fields, empty map, fail-closed on
 unknowns, `"fdo.scope"` + legacy `"fdo.bmo.scope"`, both-labels rejected).
@@ -231,7 +237,7 @@ GUID is rejected too. Scope is evaluated only after the signature.
 - [ ] If a trusted clock / rollback storage is ever added: expired, not-yet-valid
   and generation-downgrade cases, and accept-within-window.
 
-### 3d. Protocol message tampering — PARTIALLY DONE
+#### 3d. Protocol message tampering — PARTIALLY DONE
 
 Transport-layer tampering (encrypted channel):
 
@@ -254,9 +260,9 @@ Still needed (requires full protocol harness, better tested via integration/QEMU
 
 ---
 
-## Test Infrastructure Notes
+### Test Infrastructure Notes
 
-### Test helpers (all `#[cfg(test)]`)
+#### Test helpers (all `#[cfg(test)]`)
 
 - `cose.rs`: `gen_test_keypair()`, `gen_test_keypair_b()`, `build_test_cose_sign1()`,
   `build_test_protected_header()`, `domain_aad()`, `encode_bstr()`, `encode_tstr()`
@@ -269,12 +275,12 @@ Still needed (requires full protocol harness, better tested via integration/QEMU
 - `bmo.rs`: `check_bmo_authorization()` (pub), `build_unsigned_image_begin()`,
   `build_signed_image_begin()`.
 
-### Chain order convention
+#### Chain order convention
 
 Following go-fdo: chains are **leaf-first** `[leaf, intermediate, root]`.
 `verify_delegate_chain` in `delegate.rs` already uses this ordering.
 
-### Permission intersection rule (IMPLEMENTED)
+#### Permission intersection rule (IMPLEMENTED)
 
 `verify_delegate_chain` now intersects permissions across the entire chain.
 A leaf certificate CANNOT claim a permission that any certificate above it

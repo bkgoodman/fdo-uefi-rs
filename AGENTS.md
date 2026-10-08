@@ -7,6 +7,7 @@ instructions. That file is .gitignored — it holds personal/environment-identif
 details.
 
 Test scripts (on the test machine):
+
 - `init-tpm.sh` — one-time: creates device credentials + voucher via quick-di
 - `start4.sh` — repeatable: runs FDO server + QEMU with swtpm, tests TO1/TO2/BMO
 - `start5-verify.sh` — fast TO1/TO2 **crypto verification** run (no BMO, ~60s).
@@ -18,6 +19,10 @@ Test scripts (on the test machine):
   85 = OVNextEntry. `OFFSET` picks the byte (default last = inside the signature).
   Always run a control (e.g. `./start6-negative.sh 99`, a type that never occurs) to
   prove failures come from the tampering and not from the proxy.
+- `start16-metatool.sh [unsigned|signed|signed-wrongkey|unsigned-bootargs|all]`
+  — meta-URL delivery with meta-payloads made by **go-fdo-meta-tool**
+  (`~/bkgvm/fdo-meta-tool`), image `hello-efi.efi`. Two negative legs. Source
+  of truth is `examples/start16-metatool.sh` in this repo; copy it to pe2.
 - `start15-meta-url.sh [unsigned|signed|all]` — **meta-URL delivery** tests.
   Creates a test image + meta-payload, hosts both on a Python HTTP server,
   runs FDO TO2 with `delivery_mode=2`. Tests unsigned meta, signed meta
