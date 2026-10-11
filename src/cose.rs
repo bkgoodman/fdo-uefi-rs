@@ -32,6 +32,7 @@ pub const AAD_TAG_OWNER_SIGN: &str = "FDO-TO0-OwnerSign-v1";
 pub const AAD_TAG_PROVE_TO_RV: &str = "FDO-TO1-ProveToRV-v1";
 pub const AAD_TAG_PROVE_DEVICE: &str = "FDO-TO2-ProveDevice-v1";
 pub const AAD_TAG_PROVE_OV_HDR: &str = "FDO-TO2-ProveOVHdr-v1";
+pub const AAD_TAG_SETUP_DEVICE: &str = "FDO-TO2-SetupDevice-v1";
 pub const AAD_TAG_OV_ENTRY: &str = "FDO-OVEntry-v1";
 
 // BMO provisioning domain separation. Must match go-fdo/fsim/bmo_provision.go.

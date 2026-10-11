@@ -4,7 +4,7 @@
 
 # TODO - FDO UEFI Client
 
-# PRIORITY — Cross-Repo: Delivery & Authorization Restructure (opened 2026-10-02)
+## PRIORITY — Cross-Repo: Delivery & Authorization Restructure (opened 2026-10-02)
 
 This section tracks work across **four repos**. It lives here so it isn't lost;
 items are tagged by repo. Background: the permissions/authority review that
@@ -12,7 +12,7 @@ found H4 (below), and the two articles in
 `fdo-overview-docs/articles/` (`fdo-permissions-best-practices.md`,
 `fdo-bmo-security-model.md`).
 
-## Decisions (agreed 2026-10-02)
+### Decisions (agreed 2026-10-02)
 
 - **D1 — Channel authority is baseline, not a debug mode.** `fdo.bmo.md`
   Security Considerations claimed unsigned messages MUST NOT be accepted,
@@ -52,7 +52,7 @@ found H4 (below), and the two articles in
 > is how a given Owner says "I trust this publisher" without the publisher
 > participating in its PKI. `x5chain` fits the Owner's *own* release team.
 
-## fdo-sim (spec) — do first
+### fdo-sim (spec) — do first
 
 - [x] `chunking-strategy.md` (2026-10-02, uncommitted, **awaiting review**):
       begin keys `5` delivery_mode, `6` url, `7` tls_ca, `8` expected_hash,
@@ -113,10 +113,11 @@ found H4 (below), and the two articles in
       keys, HTTPS without hash, hash in `image-end` key 2 instead of 1).
       Anchors `#delivery-modes`, `#mode-2-meta-payload-indirection`,
       `#tooling` kept. Link check: 0 broken.
-- [ ] **Review pass by Brad** on all three spec files before implementation
-      starts.
+- [ ] **Review pass by Brad** on all three spec files. (Implementation went
+      ahead and the spec was committed 2026-10-03; review still worth doing,
+      but it no longer gates anything.)
 
-## go-fdo — priority after spec
+### go-fdo — priority after spec
 
 - [x] **Audit for the H4 bug** (2026-10-02, uncommitted). **Not vulnerable** —
       an onboard-only delegate's unsigned BMO was already rejected. But it
@@ -222,7 +223,7 @@ found H4 (below), and the two articles in
       over `chunking.VerifyMetaPayload` (one implementation). meta-tool builds
       and `test_meta_tool.sh` passes; go-fdo full suite 51/51 after the change.
 
-## fdo-uefi-rs
+### fdo-uefi-rs
 
 - [ ] **DEFERRED — No TLS in the EFI client** (decision 2026-10-02, Brad).
       `http_api.rs` has no TLS/HTTPS; `tls_ca` (key 7 / meta key 2) is parsed
@@ -300,8 +301,17 @@ found H4 (below), and the two articles in
 - [x] Signed **inline** image-begin without key 8 is now refused at
       image-begin time (`signed_begin_binds_content`), not after the transfer.
 - [ ] H4 QEMU follow-ups (see Security Audit → H4).
+- [ ] **`boot_args` is parsed but never delivered.** `image-begin` key `-2`
+      and an authenticated meta-payload's key `5` are accepted, but
+      `chainload_image` never sets `LoadOptions` on the loaded image, so the
+      chainloaded kernel/UKI never sees them. (Found while writing the
+      unified-installer article, 2026-10-02.) If implemented: only from an
+      authenticated source (already enforced for meta), and note that
+      systemd-stub **ignores** a passed command line when Secure Boot is on
+      and the UKI has an embedded `.cmdline` — so for UKIs this is mainly
+      useful for multi-profile selection (`@N`) or non-SB setups.
 
-## fdo-overview-docs
+### fdo-overview-docs
 
 - [x] `articles/fdo-bmo-security-model.md` updated to the target design
       (2026-10-02): D2 evidence table, TLS caveats, two manifest signers
@@ -313,9 +323,9 @@ found H4 (below), and the two articles in
 
 ---
 
-# Perpetual Reminders (never "completed")
+## Perpetual Reminders (never "completed")
 
-## TPM_RC_RETRY (0x922) — every TPM command can return this
+### TPM_RC_RETRY (0x922) — every TPM command can return this
 
 Any TPM command can return `TPM_RC_RETRY` (0x922) at any time — the TPM uses
 it for lazy self-test, NV write coalescing, and internal busy states. Per TCG
@@ -330,7 +340,7 @@ and verify you're using the retry wrapper. The audit below shows where
 direct calls are intentional:
 
 | Direct call site | Purpose | Retry needed? |
-|------------------|---------|---------------|
+| ------------------ | --------- | --------------- |
 | `tpm_submit_with_retry()` itself | The retry wrapper | N/A |
 | `tpm_flush_all_transient` | FlushContext (best-effort scan) | No |
 | `tpm_flush_context` | FlushContext (cleanup) | No |
@@ -347,7 +357,7 @@ prevent this from happening again.
 
 ---
 
-# Security Audit — 2026-09-29
+## Security Audit — 2026-09-29
 
 Full-sweep review of the trust chain: every signature, hash, and certificate
 relationship, asking in each case "is this actually *checked*, or only parsed?"
@@ -357,10 +367,10 @@ Scope: `cose.rs`, `voucher.rs`, `delegate.rs`, `bmo.rs`, `fdo.rs`,
 Native test count went 199 → 217; all new tests are negative tests that failed
 (i.e. the bad input was accepted) before the corresponding fix.
 
-## Status summary
+### Status summary
 
 | # | Finding | Severity | Status |
-|---|---------|----------|--------|
+| --- | --------- | ---------- | -------- |
 | H1 | BMO image hash was optional in all three delivery modes | High | **FIXED** |
 | H2 | Infinite loop parsing a malformed EKU extension | High | **FIXED** |
 | H3a | No BasicConstraints / pathLen / chain-length limit on delegate chains | High | **FIXED** |
@@ -368,18 +378,18 @@ Native test count went 199 → 217; all new tests are negative tests that failed
 | H3c | Certificate validity dates never checked | High | **WON'T FIX** (no trusted clock) |
 | M1a | TO2 `sugar` was a hardcoded constant | Medium | **FIXED** |
 | M1b | `ProveOVHdr20` / `DoneAck20` echoed nonces never compared | Medium | **FIXED** |
-| M1c | `HelloDeviceAck20.hash_prev` never compared | Medium | **BLOCKED UPSTREAM** |
+| M1c | `HelloDeviceAck20.hash_prev` never compared | Medium | **FIXED** (device side, Errata 1, 2026-10-07); owner-side `hashPrev2` check is a go-fdo item |
 | M2 | Device ECDH key is static across sessions | Medium | **WON'T FIX** (TPM template constraints) |
 | M3 | to1d check is skippable and unbound to the endpoint | Medium | **ACCEPTED** (DoS only) |
 | M4 | DCTPM and rollback counter in unlocked TPM NV | Medium | **ACCEPTED** (physical-access equivalent) |
 | M5 | Public keys extracted by byte-pattern scan; X5CHAIN unvalidated | Medium | **FIXED** |
 | M6 | Two independent COSE parsers over the same buffer | Medium | **OPEN** (debt) |
 | L1-L8 | Assorted | Low | **OPEN** (see below) |
-| H4 | Onboard-only delegate accepted as Owner channel authority (2026-10-02) | High | **FIXED** (native); QEMU negative **PENDING** |
+| H4 | Onboard-only delegate accepted as Owner channel authority (2026-10-02) | High | **FIXED**; QEMU negative verified 2026-10-02 (start8 `--no-provision`) |
 
-## Fixed
+### Fixed
 
-### H4 — An onboard-only delegate could choose what gets installed (2026-10-02)
+#### H4 — An onboard-only delegate could choose what gets installed (2026-10-02)
 
 Found during the permissions/authority review, not by the 09-29 audit.
 `check_bmo_authorization` took `(owner_key_point: Option, delegate_has_provision: bool)`
@@ -410,6 +420,7 @@ Signed artifacts (Model 3/4) are still accepted from *any* peer — that is the
 intended relay path.
 
 Tests (+7, total 226 → 233), the first two verified to FAIL against the old logic:
+
 - `test_bmo_auth_unsigned_onboard_only_delegate_refused` (image-begin + set)
 - `test_bmo_auth_unsigned_peer_matrix` (same bytes, only peer varies — control)
 - `test_bmo_auth_onboard_only_delegate_relays_owner_signed` (+ `_tampered`)
@@ -421,10 +432,11 @@ Tests (+7, total 226 → 233), the first two verified to FAIL against the old lo
 - `test_refused_maps_to_strictest_authority`
 
 **Remaining:**
-- [ ] Re-run `start8-delegate-unsigned.sh --no-provision` on QEMU against the
-  new build; expect `image-begin REJECTED: Provisioning not authorized`.
-  Also run it against the *old* binary to confirm it was accepting (proves the
-  script can detect the bug).
+
+- [x] Re-run `start8-delegate-unsigned.sh --no-provision` on QEMU against the
+  new build — done 2026-10-02, REFUSED as expected (see PRIORITY section).
+  Not done: running it against the *old* binary to prove the script can
+  detect the bug.
 - [ ] QEMU positive: onboard-only delegate relaying an Owner-signed BMO
   (start8 `--no-provision` + `-bmo-sign`) — the scenario delegation exists for.
 - [ ] Device-side Model 4 negative on QEMU: needs a server/pre-signed mode that
@@ -432,7 +444,7 @@ Tests (+7, total 226 → 233), the first two verified to FAIL against the old lo
 - [ ] Error code 15 (Provisioning Not Authorized) is not carried in the result;
   only the message text distinguishes it. Fold into the 16/17/18 item below.
 
-### H1 — Nothing required the signature to cover the bytes we execute
+#### H1 — Nothing required the signature to cover the bytes we execute
 
 Hash verification was optional in every BMO delivery mode; all three paths
 warned and chainloaded anyway when the hash field was absent. A signed
@@ -448,14 +460,14 @@ Policy is now fail-closed and lives in three pure, unit-tested functions in
 recorded at `image-begin` and drives them.
 
 | Mode | Rule |
-|------|------|
+| ------ | ------ |
 | 0 inline | Artifact authority MUST have key `-9`. Channel authority may use the `image-end` hash (it arrives inside the Owner-bound session). No hash at all is always refused. |
 | 1 URL | Key `-9` mandatory, at every authority level — the image is fetched outside the authenticated channel. |
 | 2 meta-URL | Either a signed meta-payload (`-10`) or key `-9`. When both are present both hashes are enforced, so a signed meta-payload cannot redirect to content `image-begin` did not authorise. The hash-requirement decision is made *before* the image is downloaded. |
 
 12 new negative tests in `bmo.rs`.
 
-### H2 — Infinite loop on an attacker-supplied certificate
+#### H2 — Infinite loop on an attacker-supplied certificate
 
 `check_eku_oids` looped `while pos < seq_end` calling `read_oid`, which
 returns `None` *without advancing `pos`* when the element is not an OID. An
@@ -471,7 +483,7 @@ Fixed by skipping non-OID elements via `skip_der_element`, which guarantees
 forward progress. Test: `test_eku_non_oid_element_terminates`, which also
 asserts an OID *following* a non-OID element is still found.
 
-### H3a / H3b — Delegate chains were signature-checked and nothing else
+#### H3a / H3b — Delegate chains were signature-checked and nothing else
 
 `verify_delegate_chain` verified signatures but imposed no structural
 constraints. Added:
@@ -494,7 +506,7 @@ rejection is attributable to the CA bit), `test_single_leaf_needs_no_ca_bit`,
 Note: `build_test_cert` still builds a non-CA end-entity certificate;
 `build_test_ca_cert` is the new helper for issuer positions.
 
-### M5 — Keys came from a byte-pattern scan; X5CHAIN was decorative
+#### M5 — Keys came from a byte-pattern scan; X5CHAIN was decorative
 
 `voucher::spki_p256_point` and `delegate::extract_p256_point` located the
 public key by scanning for the bytes `03 42 00 04` and taking the next 65
@@ -517,7 +529,7 @@ externally — for a voucher, by the OVEntry signature over the key itself.
 Test: `test_spki_requires_correct_oids`, including a buffer that merely
 *contains* the old pattern with no valid SPKI around it.
 
-### M1a / M1b — TO2 freshness: random sugar, and nonce echoes actually compared
+#### M1a / M1b — TO2 freshness: random sugar, and nonce echoes actually compared
 
 Verified against the go-fdo server and reference client before changing
 anything, since these are hard aborts and a wrong guess breaks interop on a
@@ -555,9 +567,9 @@ differences — the all-zero case is the shape a truncated nonce actually
 takes, because `parse_prove_ov_hdr_payload` leaves the array zeroed when the
 bstr is shorter than 16 bytes.
 
-## Won't fix / accepted — with reasoning
+### Won't fix / accepted — with reasoning
 
-### H3c — Certificate validity dates (`notBefore`/`notAfter`)
+#### H3c — Certificate validity dates (`notBefore`/`notAfter`)
 
 **Deliberately not enforced.** We do not have a strong belief in the
 correctness or security of the real-time clock on these platforms right now.
@@ -576,7 +588,7 @@ issuing the delegate in the first place.
 Revisit if/when the "Clock policy" item below lands (trustworthy-clock
 classification + monotonic high-water mark in TPM NV).
 
-### M2 — Static device ECDH key
+#### M2 — Static device ECDH key
 
 `tpm_create_ecdh_key` uses `CreatePrimary` with a fixed template and empty
 `inSensitive`, which is deterministic — the same key every boot. The TO2 code
@@ -599,7 +611,7 @@ If revisited: the fix is to stop recreating the key by determinism and instead
 keep the transient handle alive (or save/load its context) across the DAK
 signature, which removes the reason the template has to be deterministic.
 
-### M3 — to1d is skippable and unbound to the endpoint
+#### M3 — to1d is skippable and unbound to the endpoint
 
 Reviewed and **accepted**. The observation was that (a) if TO1 fails, TO2
 proceeds with only a warning, and (b) TO2 connects to the RV URL, never to the
@@ -616,7 +628,7 @@ The residual exposure is a **denial of service** by someone who controls the RV
 server — they can point the device at a dead endpoint or suppress the redirect.
 They cannot get an unauthenticated image onto the device. Accepted as such.
 
-### M4 — DCTPM and the rollback counter live in unlocked TPM NV
+#### M4 — DCTPM and the rollback counter live in unlocked TPM NV
 
 Both NV indices are defined with `OWNERWRITE | OWNERREAD`, empty auth policy,
 empty owner auth, no `TPMA_NV_WRITE_LOCKED`, and the rollback counter is an
@@ -645,18 +657,26 @@ worth doing on its own merits — `TODO.md` already states the rule ("a counter
 that can be rewound fails permissively, worse than not implementing it") for
 BMO `generation`, and the precedent it points at has exactly that defect.
 
-## Open
+### Open
 
-### M1c — `HashPrev` / `HashPrev2` are computed by both sides and checked by neither
+#### M1c — `HashPrev` / `HashPrev2` are computed by both sides and checked by neither
 
-**Blocked upstream, not by us.** Investigated while fixing M1a/M1b.
+**Resolved for the device by FDO 2.0 Errata 1 (2026-10-07).** The spec now
+defines `hashPrev = hash[TO2.HelloDeviceProbe]` over the bytes sent (no Owner
+key in the digest). `verify_hash_prev` (`fdo.rs`) checks it right after
+HelloDeviceAck20, and go-fdo's device does the same. Still open, and a
+**go-fdo owner-side** item: `to2_server_v200.go` never checks
+`ProveDevice20.hashPrev2`. The history below is kept for context; its
+"cannot be reproduced" analysis describes the pre-errata server.
+
+*Original analysis (pre-errata):* Investigated while fixing M1a/M1b.
 
 The FDO 2.0 message-chaining hashes exist on the wire in both directions:
 the owner sends `HelloDeviceAck20.HashPrev` and the device sends
 `ProveDevice20.HashPrev2`. Neither is verified by anyone. All references in
 go-fdo:
 
-```
+```text
 to2_server_v200.go:91    HashPrev:  probeHash      <- set
 to2_client_v200.go:326   HashPrev2: ackHash        <- set
 to2_messages_v200.go:40  HashPrev  protocol.Hash   <- declared
@@ -682,13 +702,10 @@ key until the voucher walk completes in TO2 Step 3b, so any `HashPrev` check
 has to be deferred to that point — the same ordering constraint as the to1d
 check (M3).
 
-- [ ] Raise upstream in go-fdo: either define `HashPrev` over the FDO
-      `protocol.PublicKey` encoding (or drop the key from the digest
-      entirely), and verify it client-side
-- [ ] Once the encoding is specified: capture the Owner `PublicKey`'s raw
-      CBOR span during the voucher walk (same technique as
-      `prove_ov.hmac_raw`, which exists precisely because re-serialising is
-      not byte-safe) and compare `HashPrev` after Step 3b
+- [x] ~~Raise upstream in go-fdo~~ — superseded: Errata 1 defines `hashPrev`
+      over the probe only; both devices verify it.
+- [x] ~~Capture the Owner `PublicKey` span~~ — not needed under the errata
+      definition.
 - [ ] `ProveDevice20.HashPrev2` is ours to send and we already send it; no
       change needed until the server checks it
 
@@ -697,7 +714,7 @@ fixed: the device contributes freshness via random `sugar` and enforces the
 owner's nonce echo in two places. Combined with M2 (static ECDH key), session
 binding still rests on `xA.Rand`/`xB.Rand` plus those nonce checks.
 
-### M6 — Two independent COSE parsers over the same buffer
+#### M6 — Two independent COSE parsers over the same buffer
 
 `extract_cose_payload` (`fdo.rs:994`) produces what the code *acts on* —
 OVHeader, HMAC, xB. `cose::parse_cose_sign1` (`cose.rs:79`) produces what gets
@@ -721,10 +738,10 @@ No working divergence has been constructed.
       `extract_cose_payload`
 - [ ] Bounds-check `CborDecoder::skip_value`'s `pos += len`
 
-### Low
+#### Low
 
 | # | Finding | Location |
-|---|---------|----------|
+| --- | --------- | ---------- |
 | L1 | `verify_bmo_signed` calls `verify_es256` directly and never checks `s1.algorithm`, unlike `verify_sign1` | `cose.rs:285,294` |
 | L2 | rv-firmware's COSE parser only *warns* on a wrong CBOR tag and proceeds | `rv_firmware/cose_verify.rs:197` |
 | L3 | Signed firmware's `platform_type` is parsed but never checked; only `architecture` is | `rv_firmware/cose_verify.rs:104` |
@@ -734,18 +751,18 @@ No working divergence has been constructed.
 | L7 | Static IP fallback `192.168.200.26/24` still in the TCP4 path | `tcp4_http.rs:42` |
 | L8 | DI accepts the OVHeader — manufacturer key, GUID, RV info — with no authentication, over plain HTTP, from a server found by well-known DNS name (`fdo-mfg`). Everything above roots in this. Inherent to FDO DI, but it is the widest assumption in the system and is not stated as a requirement anywhere in code | `di/protocol.rs:54-160`, `main.rs:111-114` |
 
-## Bench-test coverage of the audit fixes (`make test`, no QEMU, no hardware)
+### Bench-test coverage of the audit fixes (`make test`, no QEMU, no hardware)
 
 Audited 2026-09-29 by asking, for each fix, "would `make test` catch a
 regression here?" — then proving it by mutation rather than assuming.
 
-### Covered, and verified non-vacuous
+#### Covered, and verified non-vacuous
 
 Each of these was confirmed by reverting the fix in place and watching the
 test go red:
 
 | Mutation applied | Test that caught it |
-|---|---|
+| --- | --- |
 | `SignedOk => BmoAuthority::Channel` (downgrade signed artifacts) | `test_auth_result_maps_to_authority`, `test_signed_begin_composes_to_hash_requirement` |
 | drop `inner_sig_alg != outer_sig_alg` check | `test_signature_algorithm_binding` |
 | skip the x5chain per-link `verify_es256` | `test_x5chain_internal_linkage` |
@@ -753,7 +770,7 @@ test go red:
 Full list: 26 tests across H1 (12 hash-policy + 3 authority-mapping), H2 (1),
 H3a (4), H3b (1), M5 (2), M1b (3).
 
-### Gaps found while doing this, and what was done
+#### Gaps found while doing this, and what was done
 
 1. **H3b and the X5CHAIN linkage had no tests at all.** Both fixes shipped in
    the same session as the tests for everything else and were simply missed.
@@ -769,14 +786,14 @@ H3a (4), H3b (1), M5 (2), M1b (3).
    step is a tested pure function (`BmoAuthResult::to_authority`). The
    duplicate logic is deleted.
 
-### Structurally NOT coverable by `make test` — needs QEMU or hardware
+#### Structurally NOT coverable by `make test` — needs QEMU or hardware
 
 These are `#[cfg(target_os = "uefi")]` and depend on the TPM or the network
 stack, so no native test can reach them. They are covered only by the QEMU
 scripts:
 
 | Not covered natively | Why | Covered by |
-|---|---|---|
+| --- | --- | --- |
 | M1a random `sugar` | `tpm_get_random` in `perform_to2_hello` | `start5-verify.sh` |
 | M1b nonce checks *at their call sites* | inside `perform_to2` | `start5-verify.sh`, tamper proxy |
 | H1 policy *invocation* in the three delivery paths | `process_bmo_*` are UEFI-only | `start7`, `start15` |
@@ -787,7 +804,7 @@ cannot be tested natively is that it is wired in and reached. That residual
 risk is what the QEMU negative tests exist for — which is the argument for
 running them rather than treating 225 green tests as sufficient.
 
-### Not coverable by `make test` at all — the pe2 shell scripts
+#### Not coverable by `make test` at all — the pe2 shell scripts
 
 `make test` is `cargo test`; it cannot say anything about `~/bkgvm/*.sh`.
 The script-safety issues found on 2026-09-29 (missing `trap` handlers
@@ -797,7 +814,7 @@ prints the kills it would issue instead of issuing them. Currently there is
 **no automated check of any kind** over those scripts. See the script-safety
 notes below.
 
-## Process note
+### Process note
 
 Per the "Signature Work: Definition of Done" rule in `AGENTS.md`, none of the
 findings above had a negative test at the time they were found — including the
@@ -819,7 +836,7 @@ code must have its decision logic factored into a pure function that the
 UEFI code calls.** Not copied — called. Otherwise the tested implementation
 and the shipped implementation are different code.
 
-## Test-environment script safety (pe2, 2026-09-29)
+### Test-environment script safety (pe2, 2026-09-29)
 
 Reviewed `~/bkgvm/*.sh` after a concern that the scripts might be killing
 unrelated QEMU processes.
@@ -854,7 +871,7 @@ Three real issues found, none of which is the one feared:
   three lines and it is `sudo`. Fix: compare `/proc/$pid/comm` to the
   recorded name before killing.
 
-## Native Unit Tests (2026-09-24)
+### Native Unit Tests (2026-09-24)
 
 The crate is split into `src/lib.rs` (all modules) and `src/main.rs` (UEFI entry point).
 UEFI dependencies (`uefi`, `uefi-raw`) are target-conditional, and UEFI-specific code
@@ -864,7 +881,7 @@ on native Linux with no QEMU or swtpm.
 **199 tests** across 7 modules, ~0.15s:
 
 | Module | Tests | Key coverage |
-|--------|-------|-------------|
+| -------- | ------- | ------------- |
 | `cose.rs` | 49 | COSE_Sign1 parse/verify, ES256 +/-, domain AAD (v101 vs v200, cross-tag), scope (GUID/combined/fail-closed/empty), BMO signed verify (Model 3/4, no content_type, delegate missing PERM.7), malformed inputs |
 | `delegate.rs` | 19 | 1/2/3-cert chains, permission inheritance (intermediate/root missing), self-signed rejected, all 5 OID flags, redirect-only/onboard-only, reuse-cred vs new-cred |
 | `fdo.rs` | 41 | CBOR encoder/decoder, AES-GCM (wrong key/nonce/AAD/tampered), KDF (128 vs 256), COSE_Encrypt0 (tampered), encrypted message parsing (wrong tag/no tag/missing IV/empty/truncated), SetupDevice parsing, session key derivation |
@@ -881,7 +898,7 @@ Test helpers in `cose.rs` (`gen_test_keypair`, `build_test_cose_sign1`),
 `build_ov_entry_payload`, `hmac_sha256`) generate P-256 keys, X.509 certs,
 and voucher structures for testing.
 
-## Meta-Payload Delivery (delivery_mode 2) — implemented 2026-09-24
+### Meta-Payload Delivery (delivery_mode 2) — implemented 2026-09-24
 
 BMO meta-URL delivery allows image downloads from external servers with
 security anchored in the FDO trust chain:
@@ -914,7 +931,7 @@ AAD constant `AAD_TAG_META_PAYLOAD` in `cose.rs`.
 QEMU-verified: both unsigned and signed meta-payload delivery tested
 end-to-end against go-fdo server (`start15-meta-url.sh` on pe2).
 
-## DNS Hostname Resolution — implemented 2026-09-25
+### DNS Hostname Resolution — implemented 2026-09-25
 
 DNS hostnames are now supported in HTTP URLs (RV lists, meta-payload URLs, etc.):
 
@@ -926,6 +943,7 @@ DNS hostnames are now supported in HTTP URLs (RV lists, meta-payload URLs, etc.)
   `EFI_UDP4_PROTOCOL` (DNS A-record queries, port 53).
 
 **Components** (`src/dns.rs`):
+
 - `encode_dns_name()` / `build_dns_query()` — DNS packet builder (pure, testable)
 - `parse_dns_response()` — DNS response parser with compression support (pure)
 - `discover_dns_server()` — reads DNS server IP from `Ip4Config2` after DHCP
@@ -937,7 +955,7 @@ DNS hostnames are now supported in HTTP URLs (RV lists, meta-payload URLs, etc.)
 QEMU-verified: meta-payload with hostname `fdo-test.local` in image URL —
 device resolved hostname, fetched image, hash VERIFIED, TO2 complete.
 
-### Future: TLS/HTTPS and IPv6
+#### Future: TLS/HTTPS and IPv6
 
 - **TLS/HTTPS:** Not currently feasible — UEFI firmware does not readily
   support TLS in our TCP4 HTTP stack. If a UEFI TLS stack becomes available,
@@ -950,11 +968,12 @@ device resolved hostname, fetched image, hash VERIFIED, TO2 complete.
   For very large images, streaming download + incremental SHA-256 would reduce
   peak memory usage.
 
-## Current Status
+### Current Status
 
-### Completed
+#### Completed
 
-#### Device Initialization (DI) Protocol - FULLY TESTED 2026-08-10
+##### Device Initialization (DI) Protocol - FULLY TESTED 2026-08-10
+
 - [x] DI module structure (src/di/)
 - [x] DeviceMfgInfo CBOR encoding as array matching go-fdo custom.DeviceMfgInfo struct order
 - [x] DIAppStart message builder with CapabilityFlags (FDO 2.0 URL /fdo/200/msg/)
@@ -971,7 +990,8 @@ device resolved hostname, fetched image, hash VERIFIED, TO2 complete.
 - [x] HTTP session token (Authorization: Bearer) threading across DI messages
 - [x] **End-to-end DI verified** against go-fdo server on pe2 QEMU+swtpm
 
-#### Core Infrastructure
+##### Core Infrastructure
+
 - [x] Manual CBOR encoder for no_std UEFI environment
 - [x] TO1.HelloRV message builder (CBOR serialization)
 - [x] TO2.HelloDeviceProbe message builder (CBOR serialization)
@@ -986,14 +1006,15 @@ device resolved hostname, fetched image, hash VERIFIED, TO2 complete.
 - [x] TPM 2.0 protocol detection
 - [x] SNP network driver initialization
 
-### TO2 Protocol - FULLY TESTED 2026-08-14
+#### TO2 Protocol - FULLY TESTED 2026-08-14
+
 - [x] TO2.HelloDeviceProbe (msg 80) - sends device GUID, nonce, capabilities
 - [x] TO2.HelloDeviceAck20 (msg 81) - parses server nonce, kex/cipher suites (supports both FDO 1.1 and 2.0 formats)
 - [x] TO2.ProveDevice20 (msg 82) - COSE_Sign1 with TPM signature, ECDH xA public key
 - [x] TO2.ProveOVHdr20 (msg 83) - parses OV header, server's xB public key
 - [x] TO2.GetOVNextEntry/OVNextEntry (msg 84/85) - fetches ownership voucher entries
 - [x] ECDH shared secret computation via TPM
-- [x] FDO KDF for session key derivation (SEK/SVK) 
+- [x] FDO KDF for session key derivation (SEK/SVK)
 - [x] AES-256-GCM encryption/decryption (A256GCM cipher suite 3)
 - [x] COSE_Encrypt0 message format (tag 16)
 - [x] TO2.DeviceSvcInfoRdy20 (msg 86) - encrypted, signals ready for service info
@@ -1004,7 +1025,7 @@ device resolved hostname, fetched image, hash VERIFIED, TO2 complete.
 - [x] FDO 2.0 URL paths (/fdo/200/msg/) for all TO1/TO2 messages
 - [x] **End-to-end DI+TO2 verified** on OnLogic k800 real hardware (2026-08-14)
 
-### RESOLVED: COSE Encryption Auth Failure
+#### RESOLVED: COSE Encryption Auth Failure
 
 **Root Cause:** FDO shared secret includes random bytes from both key exchange parameters.
 Per go-fdo kex/ecdh.go:300: `shared_secret = ECDH_x || xB.Rand || xA.Rand`
@@ -1013,11 +1034,13 @@ Per go-fdo kex/ecdh.go:300: `shared_secret = ECDH_x || xB.Rand || xA.Rand`
 to the ECDH x-coordinate result before passing to KDF.
 
 **Additional Fixes:**
+
 - DeviceSvcInfoRdy20: Encode as array `[null]` not just `null`
 - OwnerSvcInfo20: Handle null response (no service info)
 - Done20: Include 2 fields `[nonce, replacement_hmac]` (hmac=null for credential reuse)
 
-### BMO FSIM (Bare Metal Onboarding) - INLINE TRANSFER VERIFIED 2026-08-14
+#### BMO FSIM (Bare Metal Onboarding) - INLINE TRANSFER VERIFIED 2026-08-14
+
 - [x] BMO module structure (bmo.rs)
 - [x] BMO message parsing (image-begin, image-data-N, image-end)
 - [x] BMO session state machine
@@ -1066,7 +1089,7 @@ to the ECDH x-coordinate result before passing to KDF.
   authority (Model 1) now correctly accepts unsigned payloads. (2026-09-23)
   **This fix introduced H4** (onboard-only delegate treated as Model 1) — see
   Security Audit section. Corrected 2026-10-02 via `PeerAuthority`.
-- [x] **DI: flush TPM transient handles on network error** (2026-09-28) — 
+- [x] **DI: flush TPM transient handles on network error** (2026-09-28) —
   `tpm_flush_all_transient()` runs at the start of both `run_di_protocol()` and
   `perform_to2()`, cleaning up leftovers from a previous failed attempt.
   Additionally, `tpm_create_and_persist_signing_key()` and
@@ -1076,7 +1099,8 @@ to the ECDH x-coordinate result before passing to KDF.
   (main.rs and rv_firmware/mod.rs) retry up to 3 times with a 5-second delay.
   NOT_FOUND (no server URL) exits immediately without retry.
 
-### RV-Based Firmware Delivery (rv-firmware feature) - E2E VERIFIED 2026-08-25
+#### RV-Based Firmware Delivery (rv-firmware feature) - E2E VERIFIED 2026-08-25
+
 - [x] HTTP GET added to dual-stack (tcp4_http.rs + http_api.rs dispatcher)
 - [x] COSE_Sign1 parsing and ECDSA P-256 (ES256) signature verification via `p256` crate
 - [x] RV extension tag parsing (FirmwarePath/FirmwareURL/MinFirmwareRev from DCTPM)
@@ -1102,10 +1126,11 @@ to the ECDH x-coordinate result before passing to KDF.
 - [ ] `.fwh` header-only pre-validation (download header first, check rev, then full image)
 - [ ] Replace placeholder platform key constants with real key from fdo-meta-tool
 
-### Pending
+#### Pending
+
 - [ ] Credential replacement after successful TO2
 
-## CRITICAL: Owner-side authentication (found 2026-09-18, implemented 2026-09-18)
+### CRITICAL: Owner-side authentication (found 2026-09-18, implemented 2026-09-18)
 
 TO2 is specified as *mutual* authentication. Only the device→owner direction was
 implemented. Every check that would let the device authenticate the party it was
@@ -1114,7 +1139,7 @@ a bootable image from, **any** peer that could answer the TO2 URL. The `default`
 feature set did not even include `p256`/`ecdsa`, so the installer image contained no
 ECDSA verification code at all and was structurally incapable of checking a signature.
 
-### Status: code complete, NOT yet tested end-to-end
+#### Status: code complete, NOT yet tested end-to-end
 
 | # | Check | Was | Now |
 | - | ----- | --- | --- |
@@ -1147,11 +1172,11 @@ Supporting work:
   used hardcoded IVs and `Done`'s 8-byte tail was *identical* to the ServiceInfo round
   IVs — collision-free only because the round counter never reached `0xD00E0304`.
 
-### Verified on pe2 QEMU + swtpm (2026-09-18)
+#### Verified on pe2 QEMU + swtpm (2026-09-18)
 
 Positive run (`~/bkgvm/start5-verify.sh`, no BMO so TO2 completes in seconds):
 
-```
+```text
 TO1 Step 1 complete: HelloRV -> HelloRVAck
 TO1 Step 2 complete: ProveToRV -> RVRedirect        <- real TPM sig accepted by RV
 TO1 complete: to1d blob 129 bytes (verified in TO2)
@@ -1180,7 +1205,7 @@ flipping one byte of the chosen response):
 The control run matters: it establishes that the failures above are caused by the
 tampering and not by having a proxy in the path.
 
-### Remaining
+#### Remaining
 
 - [x] **TPM transient handle cleanup on network error** (2026-09-28) —
   `tpm_flush_all_transient()` at the start of both DI and TO2 cleans up
@@ -1201,7 +1226,7 @@ tampering and not by having a proxy in the path.
 - [ ] Fold TO1 error-response handling into TO2 as well — TO2 still sniffs for a
   5-element CBOR array rather than checking `Message-Type: 255`.
 
-### Bugs found while testing
+#### Bugs found while testing
 
 - [x] **TO1 never sent its session token.** `perform_to1_hello` used `http_post`
   (no auth) and discarded the bearer token from the HelloRVAck response, so
@@ -1215,7 +1240,7 @@ tampering and not by having a proxy in the path.
   This is the same class of failure as the original audit: a success path that never
   checked whether it had actually succeeded.
 
-### Why this was invisible — and the process fix
+#### Why this was invisible — and the process fix
 
 The TO2 checklist was worded as plumbing ("**parses** OV header", "**fetches** voucher
 entries"), marked `[x]`, under a heading reading "FULLY TESTED". Those words were
@@ -1228,7 +1253,7 @@ real but only ever demonstrated interoperability with a *cooperative* server.
 the negative test passes — i.e. until a bad signature is shown to fail the protocol.**
 "Onboarding completed" is not evidence that anything was verified.
 
-### Exploitability (pre-fix)
+#### Exploitability (pre-fix)
 
 An active attacker who could answer the TO2 URL — rogue DHCP/DNS on the provisioning
 LAN, ARP spoofing, a spoofed RV server (gap 4 made this the easy path, since the
@@ -1241,19 +1266,19 @@ The Phase-1 rv-firmware stub was and is unaffected: it verifies its payload agai
 compiled-in platform key, so Stage 1 → Stage 2 was always signature-checked. It was
 Stage 2 → Stage 3 (TO2 delivering the installer/UKI) that was unauthenticated.
 
-## BMO Provisioning Authorization — Four Security Models
+### BMO Provisioning Authorization — Four Security Models
 
 See `go-fdo/provisioning-security.md` for the high-level narrative. The four
 models and their status on the EFI client:
 
 | Model | Description | EFI status | QEMU tested? |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | Owner service, unsigned payloads | **Working** (channel authority) | Yes (`start4.sh`, `start5-verify.sh`) |
 | 2 | Delegate service, unsigned payloads | **Working** (delegate chain validated, PERM.7 checked) | Yes (`start8-delegate-unsigned.sh`, positive + negative) |
 | 3 | Owner-signed payloads (COSE_Sign1 tag 18) | **Working** (image-begin + set + scope + GUID) | Yes (`start7-bmo-signed.sh`, `start11-signed-negative.sh`, `start12-signed-set.sh`, `start13-bmo-signed-scope.sh`, `start14-scope-guid.sh`) |
 | 4 | Delegate-signed payloads (x5chain) | **Working** (x5chain validated, PERM.7 checked, leaf key verified) | Yes (`start9-delegate-signed.sh`, positive + server-side negative) |
 
-### Completed prerequisites
+#### Completed prerequisites
 
 - [x] **ImageBegin field-numbering fix** (2026-09-18)
 - [x] **Prefer the authorising hash** (2026-09-18)
@@ -1286,9 +1311,9 @@ models and their status on the EFI client:
   - Negative: `start8-delegate-unsigned.sh --no-provision` (onboard only, rejected)
   - **Regressed** by the 09-23 Model 1 fix; restored 2026-10-02 (H4). Needs re-run.
 
-### Remaining work — ordered by priority
+#### Remaining work — ordered by priority
 
-#### Model 3 completion (Owner-signed)
+##### Model 3 completion (Owner-signed)
 
 - [x] **Signed `fdo.bmo:set` handling** (2026-09-23) — `process_bmo_message` now
   calls `unwrap_bmo_signed` for `fdo.bmo:set` with the same signed/unsigned gate
@@ -1323,7 +1348,7 @@ models and their status on the EFI client:
   Superseded. Add alongside the existing 15. Currently scope failures return
   generic rejection; specific error codes would improve diagnostics.
 
-#### Model 4: Delegate-signed BMO artifacts (x5chain)
+##### Model 4: Delegate-signed BMO artifacts (x5chain)
 
 - [x] **Delegate TO2 support** — Done (see "Completed prerequisites" above).
   `delegate.rs` provides full X.509 chain validation with no external x509 crate.
@@ -1337,7 +1362,7 @@ models and their status on the EFI client:
     - Positive: `start9-delegate-signed.sh` (delegate with PERM.7 signs BMO)
     - Negative: `start9-delegate-signed.sh --no-provision` (server refuses to start)
 
-#### Scope infrastructure
+##### Scope infrastructure
 
 - [ ] **Clock policy** — `not_before`/`not_after` need a trustworthy clock.
   Classify UEFI `GetTime()` as trustworthy only with working RTC and plausible
@@ -1350,7 +1375,7 @@ models and their status on the EFI client:
 - [ ] **Strict provisioning policy** (MAY) — operator switch to require artifact
   authority even from a peer that holds provisioning authority. Default off.
 
-### Historical notes
+#### Historical notes
 
 The original TODO items for "Voucher walk -> TO2-proven Owner key" and
 "Artifact authority, Owner-direct" are now completed (see above). The old text
@@ -1358,7 +1383,7 @@ described `perform_to2()` as never verifying ProveOVHdr — that was accurate at
 the time but is no longer true. The current code at `fdo.rs:1927-1971`
 implements full voucher chain verification and ProveOVHdr signature checking.
 
-### Blocked on other repos
+#### Blocked on other repos
 
 - [x] **`go-fdo-meta-tool`: scope encoding.** The meta-tool now supports `-guid`,
   `-not-before`, `-not-after`, `-generation` flags on `provision sign`. Scope is
@@ -1372,33 +1397,35 @@ implements full voucher chain verification and ProveOVHdr signature checking.
   added to the server CLI. Scope is included in the COSE protected header when
   any scope flag is set alongside `-bmo-sign` or `-bmo-delegate-provision`.
 
-### Recently Completed (2026-08-10)
+#### Recently Completed (2026-08-10)
+
 - [x] Error response handling: Message-Type header parsing, FDO error body decoder (error_code, msg_type, error_string)
 - [x] Negative test verified: intentionally wrong KeyType produces clean error log with server message
 - [x] KeyType constants fixed to match go-fdo values (P-256=10, P-384=11)
 - [x] Session token (Authorization: Bearer) threading across DI messages
 - [x] HttpPostResponse struct with body, auth_token, and message_type fields
 
-## Resolved Blockers
+### Resolved Blockers
 
-### OVMF Network Stack (RESOLVED)
+#### OVMF Network Stack (RESOLVED)
 
 **Issue:** Standard OVMF builds did not expose IP4Config2 or HTTP protocols.
 
 **Solution:** Add `-device virtio-rng-pci` to QEMU and call `connect_controller()` to trigger driver binding.
 
 **Result:**
+
 - SNP driver: ✅ Found and initialized
 - IP4Config2: ✅ Available after connect_controller()
 - HTTP protocol: ✅ Working
 
-### HTTP POST Support (RESOLVED)
+#### HTTP POST Support (RESOLVED)
 
 **Issue:** uefi-rs 0.38 does not expose `HttpMethod::POST` publicly.
 
 **Resolution:** Implemented HTTP POST using raw UEFI HTTP protocol directly, bypassing the uefi-rs HttpHelper wrapper.
 
-## Technical Debt
+### Technical Debt
 
 - Unused warning suppressions needed for FDO message constants
 - Error enum fields not fully utilized
@@ -1407,33 +1434,33 @@ implements full voucher chain verification and ProveOVHdr signature checking.
 - TLS not implemented (HTTP only for now) - acceptable for initial development
 - **Key exchange suite configuration** - Currently hardcoded to ECDH256 (P-256). Need config option to select/limit between key types/sizes (ECDH256 vs ECDH384). Would require TPM P-384 key creation support.
 
-### Hacks / Hardcoded Values to Remove
+#### Hacks / Hardcoded Values to Remove
 
 - [x] **Hardcoded DI server address** - Removed. DI server URL now via `-di` CLI flag or well-known DNS names (`_fdo._tcp`, `fdo-mfg`). See README Command-Line Options. (2026-08-15)
 - [ ] **Static IP fallback** - TCP4 module falls back to static IP `192.168.200.26/24` when DHCP fails (or times out). This should be removed; rely on DHCP only, or make configurable via UEFI variable.
 - [x] **Hardcoded RV/owner URL fallback** - Removed. RV URL now parsed from DCTPM credential (key 5, RvInfo). CLI override via `-rv` flag. (2026-08-15)
 
-### Network / NIC Improvements
+#### Network / NIC Improvements
 
 - [x] **Skip NICs with zeroed MAC addresses** - Non-exclusive GET_PROTOCOL MAC check, skip zeroed MACs (2026-08-14)
 - [x] **Cache working NIC handle** - AtomicI8 cache reuses last working ServiceBinding handle (2026-08-14)
 - [x] **DHCP investigation** - Resolved. DHCP works on OnLogic k800 when using the correct NIC (Handle #3, MAC f9:bd). Added link detection via SNP `media_present` to skip NICs without cable. (2026-08-14)
 - [ ] **TCP4 reconnect stuck** - On second run (after DI), TCP4 connection attempts get stuck. May be related to ServiceBinding handles not being properly cleaned up from the first connection.
 
-### TPM Persistent Handle Limitation (Documented)
+#### TPM Persistent Handle Limitation (Documented)
 
 - UEFI TCG2 on OnLogic k800 cannot access persistent handles (ReadPublic returns 0x902). EvictControl succeeds (keys visible from Linux), but UEFI can't read them on next boot.
 - **Workaround**: Recreate DAK/HMAC keys via `CreatePrimary` each boot (deterministic — same hierarchy + template = same key). No persistent handles needed.
 - This may be OnLogic-specific or a general UEFI TCG2 limitation. Need to test on other hardware (Dell T360).
 
-## Test Environment
+### Test Environment
 
 - pe2 VM with QEMU, OVMF firmware
 - go-fdo server for protocol testing  
 - swtpm for TPM simulation
 - **Use `~/bkgvm/start3.sh`** - handles swtpm dual-socket setup, DI, voucher import, and QEMU launch correctly
 
-### swtpm/QEMU Setup Note
+#### swtpm/QEMU Setup Note
 
 When starting swtpm for QEMU, you must connect to the `swtpm-server` socket first before QEMU can connect to `swtpm-ctrl`. Example:
 
@@ -1451,12 +1478,13 @@ echo -n "" | timeout 1 nc -U "$WORKDIR/swtpm-server" 2>/dev/null || true
 # Now QEMU can connect to swtpm-ctrl
 ```
 
-### Known Issues
+#### Known Issues
+
 - swtpm requires initial connection to server socket before QEMU can use ctrl socket
 - Server must use correct database matching the voucher from DI
 - GUID in client must match what quick-di-tpm created (reads from TPM NV automatically)
 
-## FWImageHash Verification (2026-09-01)
+### FWImageHash Verification (2026-09-01)
 
 - [x] **Verify `FWImageHash` against the extracted EFI image** in
   `src/rv_firmware/cose_verify.rs`. The hash was previously parsed into
@@ -1468,7 +1496,7 @@ echo -n "" | timeout 1 nc -U "$WORKDIR/swtpm-server" 2>/dev/null || true
     SHA-256 both `5daf1c35...20bb3529`, so extraction is byte-exact.
   - Same gap existed in `efi-fdo-bmo/src/cose_verify.c` and was fixed there too.
 
-## Chainload Crash Investigation — corrections (2026-09-01)
+### Chainload Crash Investigation — corrections (2026-09-01)
 
 - The old comment in `chainload.rs` claiming AMI firmware does not apply PE
   relocations for `FromBuffer` loads was **wrong** and has been replaced.
@@ -1485,7 +1513,7 @@ echo -n "" | timeout 1 nc -U "$WORKDIR/swtpm-server" 2>/dev/null || true
 - [ ] Re-evaluate whether the file-first load order in `chainload_image()` should
   be reverted to buffer-first, once the A/B result is known.
 
-## Bug: teardown_network() left the session with no NIC (2026-09-01)
+### Bug: teardown_network() left the session with no NIC (2026-09-01)
 
 Found during the K800 A/B test. `chainload_image()` calls `teardown_network()`,
 which does `disconnect_controller(handle, None, None)` on every SNP handle.
@@ -1507,7 +1535,7 @@ That unbinds ALL drivers from the NIC — including SnpDxe, which uninstalls
   as a mitigation for a crash whose cause is still unproven, and the K800
   control test (leg 0, `-chainload`, no network) passed without it mattering.
 
-## K800 Chainload Investigation — RESULT (2026-09-01)
+### K800 Chainload Investigation — RESULT (2026-09-01)
 
 Both legs passed on OnLogic K800 hardware.
 
@@ -1517,13 +1545,13 @@ Both legs passed on OnLogic K800 hardware.
 - **Leg A** full DI/TO1/TO2 -> BMO -> chainload of the same PE, buffer mode —
   SUCCESS. Payload ran, returned, NICs reconnected, clean exit.
 
-### Conclusion: chainloading was never broken
+#### Conclusion: chainloading was never broken
 
 The "AMI firmware does not apply PE relocations for FromBuffer" theory is
 disproven on hardware. Memory loading works. The `FromDevicePath` rewrite was
 unnecessary and the default order is back to buffer-first.
 
-### Still unknown
+#### Still unknown
 
 **We never reproduced the original crash in this session.** We cannot claim to
 have fixed it. Remaining candidates, in order:
@@ -1537,18 +1565,18 @@ have fixed it. Remaining candidates, in order:
 - [ ] Pre-fix, `teardown_network()` left the session with no NIC. Failures caused
   by that would have looked like a chainload problem but were not.
 
-### Minor tech debt introduced
+#### Minor tech debt introduced
 
 - [ ] `LOAD_MODE` in `chainload.rs` is a `static mut` accessed through `unsafe`.
   Fine for single-threaded UEFI boot services, but a `Cell`/`OnceCell` or an
   explicit parameter threaded through `chainload_image()` would be cleaner.
 
-## Teardown Necessity Test (2026-09-01)
+### Teardown Necessity Test (2026-09-01)
 
 Added `-no-teardown` to skip `teardown_network()` before `StartImage`, so we can
 find out whether the mitigation added in 405ef3b is load-bearing or pure risk.
 
-```
+```text
 fdo-uefi.efi -no-teardown -load-mode buffer -di http://192.168.200.30:8080 -rv http://192.168.200.30:8080
 ```
 
@@ -1558,14 +1586,14 @@ fdo-uefi.efi -no-teardown -load-mode buffer -di http://192.168.200.30:8080 -rv h
 - Chainload crashes -> teardown is load-bearing and the DHCP-timer theory behind
   it is confirmed. Keep it, and record the evidence here.
 
-### Tech debt
+#### Tech debt
 
 - [ ] `SKIP_TEARDOWN` in `chainload.rs` is another `static mut` behind `unsafe`,
   same pattern as `LOAD_MODE`. If both survive, fold them into a single
   `ChainloadConfig` struct passed into `chainload_image()` rather than two
   mutable globals.
 
-## Console Verbosity Reduction (2026-09-01)
+### Console Verbosity Reduction (2026-09-01)
 
 Console I/O dominates runtime: a full run is 5-10 minutes on screen versus ~19s
 redirected to a file. Reduced default log volume by ~62% of lines / ~72% of
@@ -1582,7 +1610,7 @@ characters, measured against a captured 362-line run.
 - [x] Kept exactly one progress line per HTTP round:
   `TCP4 HTTP POST to <url> (N bytes)`.
 
-### Security note
+#### Security note
 
 The suppressed output included the AES session key (`COSE: key`) and the derived
 SEK preview, printed to console on every encrypted round. These are now `debug!`.
@@ -1590,7 +1618,7 @@ SEK preview, printed to console on every encrypted round. These are now `debug!`
 - [ ] Consider removing the key material dumps entirely rather than leaving them
   behind `-v`. Printing session keys is a bad default even in a debug build.
 
-## Load Mode: buffer is now the default and there is no fallback (2026-09-01)
+### Load Mode: buffer is now the default and there is no fallback (2026-09-01)
 
 Removed `LoadMode::Auto`. `chainload_image()` loads from memory
 (`LoadImageSource::FromBuffer`) and fails loudly if that does not work.
@@ -1612,14 +1640,14 @@ a warning that it is writing the payload to the ESP.
 - [ ] If `-load-mode file` goes unused for a while, delete `load_via_temp_file()`
   and the flag outright (~100 lines).
 
-## ServiceInfo/BMO Round Logging Collapsed (2026-09-01)
+### ServiceInfo/BMO Round Logging Collapsed (2026-09-01)
 
 The BMO transfer loop was the dominant console cost: ~11 INFO lines per
 ServiceInfo round, and a 51 KB payload takes ~54 rounds (~590 lines).
 
 Now exactly ONE line per round, emitted at the end of the round with progress:
 
-```
+```text
   Round 22: BMO 19266 bytes (37%)
 ```
 
@@ -1634,7 +1662,7 @@ each protocol message themselves.
 
 Percentage is only shown when the server sent a `total_size` in image-begin.
 
-## Network Teardown Now OFF by Default (2026-09-01)
+### Network Teardown Now OFF by Default (2026-09-01)
 
 `-no-teardown` replaced by `-teardown` (inverted): the teardown is off unless
 explicitly requested.
@@ -1659,13 +1687,13 @@ Consequences:
 - [ ] If `-teardown` goes unused, delete `teardown_network()` /
   `reconnect_network()` and the flag (~70 lines).
 
-## Three-Stage Chain Test (2026-09-01)
+### Three-Stage Chain Test (2026-09-01)
 
 Stage 1 (RV firmware delivery) confirmed working on K800 with the hello payload.
 Next: full chain, where each stage is a genuinely separate binary.
 
 | Stage | Build | Size | Role |
-|-------|-------|-----:|------|
+| ------- | ------- | -----: | ------ |
 | 1 | `--no-default-features --features uefi-http,tcp4-http,rv-firmware,di` | 258.5 KiB | On ESP. Reads DCTPM, downloads + verifies COSE, chainloads Stage 2 |
 | 2 | `--no-default-features --features uefi-http,tcp4-http,fdo-installer` | 359.5 KiB | Delivered via COSE. Runs TO1/TO2 + BMO, chainloads Stage 3 |
 | 3 | `test-keys/payload_image.efi` | 50 KiB | Hello-world EFI app |
@@ -1681,14 +1709,14 @@ Signed with `fdo-meta-tool platform sign -rev 2` (go-fdo-meta-tool). The Python
 `tools/sign_firmware.py` in efi-fdo-bmo needs `cbor2`, which is not installed and
 there is no pip on this host.
 
-### Anti-rollback consequence
+#### Anti-rollback consequence
 
 The TPM counter at NV 0x01D10002 ratchets on every successful verification. It
 was at 1 after the hello-payload test; Stage 2 is rev 2, so after this test the
 counter becomes 2 and **the rev-1 hello payload can no longer be delivered via
 Stage 1**. Re-sign it at a higher rev if it is needed again.
 
-### Known issues
+#### Known issues
 
 - [ ] `fdo-meta-tool platform verify` fails on its own output for images this
   size: "byte array exceeds max size: 230986". A decoder limit in the tool, not
@@ -1704,8 +1732,7 @@ Stage 1**. Re-sign it at a higher rev if it is needed again.
   Content-Length or on the peer going quiet, with `MAX_RESPONSE_BYTES`
   (512 MB) as a memory-exhaustion sanity bound rather than an expected limit.
 
-
-## Anti-Rollback Semantics — clarification (2026-09-01)
+### Anti-Rollback Semantics — clarification (2026-09-01)
 
 Recording this because it was nearly mis-filed as a bug.
 
@@ -1721,7 +1748,7 @@ Current behaviour is already correct for a chainload-from-RAM design:
 So "rev 1 can no longer be delivered after rev 2" is the intended security
 property, not a regression.
 
-### Not implemented, and deliberately so
+#### Not implemented, and deliberately so
 
 Skipping the download when `RVMinFirmwareRev` is not newer than what we already
 have would be a valid optimisation for a FLASH-update design: no point fetching
@@ -1731,14 +1758,14 @@ with nothing to execute.
 
 - [ ] Revisit if a flash-resident Stage 2 is ever introduced.
 
-## RV Info in DCTPM — verified (2026-09-01)
+### RV Info in DCTPM — verified (2026-09-01)
 
 Question: does DI provision enough into the TPM that a chainloaded Stage 2 (which
 gets no command line) can find the owner? **Yes.**
 
 Decoded from the server's msg/11 DISetCredentials response for the 14:49 DI:
 
-```
+```text
 [2,  c0a8c81e]                                          owner IP 192.168.200.30
 [3,  0x1f90]                                            port 8080
 [16, "/signed_payload.cose"]                            RVFirmwarePath
@@ -1754,7 +1781,7 @@ Caveat: past logs are ambiguous about whether the URL came from CLI or TPM,
 because `-rv` was always passed. The distinguishing log line is
 `Using CLI-provided RV/Owner URL` vs `Using RV URL from device credential`.
 
-## -force-di must skip the RV firmware check (2026-09-01)
+### -force-di must skip the RV firmware check (2026-09-01)
 
 The firmware URL and min revision live in the DCTPM written at DI time, and the
 RV firmware check runs BEFORE the credential check. So `-force-di` against a
@@ -1771,11 +1798,12 @@ first; the new firmware config takes effect on the next boot.
   firmware stub", recommended OEM config) so it can re-provision itself. A pure
   `rv-firmware` Stage 1 cannot, and would need a separate DI binary deployed.
 
-## Build Size Analysis — all 8 feature combinations
+### Build Size Analysis — all 8 feature combinations
 
-### Current (2026-10-01)
+#### Current (2026-10-01)
 
 Since the 2026-09-01 baseline, the `fdo-installer` feature gained:
+
 - Delegation support (x5chain X.509 chain validation in `delegate.rs`)
 - Signed BMO (COSE_Sign1 tag 18 verification for image-begin + set)
 - `fdo.bmo.scope` evaluation (guid, not_before, not_after, generation)
@@ -1790,7 +1818,7 @@ UEFI binary size.
 Release builds, `x86_64-unknown-uefi`, all with `uefi-http,tcp4-http`:
 
 | `di` | `fdo-installer` | `rv-firmware` | Bytes | Size | over base | Δ from Sep-01 |
-|:----:|:---------------:|:-------------:|------:|-----:|----------:|-------------:|
+| :----: | :---------------: | :-------------: | ------: | -----: | ----------: | -------------: |
 | | | | 52,224 | 51 KiB | base | +0 |
 | ✓ | | | 184,832 | 180.5 KiB | +129.5 KiB | +18.5 KiB |
 | | | ✓ | 197,120 | 192.5 KiB | +141.5 KiB | +14.5 KiB |
@@ -1803,15 +1831,16 @@ Release builds, `x86_64-unknown-uefi`, all with `uefi-http,tcp4-http`:
 Marginal cost, alone vs added to a build that already has the other two:
 
 | Feature | alone | incremental |
-|---------|---------:|-----------:|
+| --------- | ---------: | -----------: |
 | `di` | +129.5 KiB | +33.5 KiB |
 | `fdo-installer` | +308.5 KiB | +179 KiB |
 | `rv-firmware` | +141.5 KiB | +41 KiB |
 
-### Where the growth went
+#### Where the growth went
 
 The installer-only build has grown **+133.5 KiB** since the Sep-01 baseline
 (from 226→359.5 KiB). Major contributors include:
+
 - **Delegation** (`delegate.rs`): X.509 chain validation, ASN.1 DER parsing,
   OID matching, signature verification for x5chain — replaces the need for an
   external x509 crate.
@@ -1826,10 +1855,10 @@ The installer-only build has grown **+133.5 KiB** since the Sep-01 baseline
 The base transport build remains exactly 51 KiB. The DI-only and
 RV-firmware-only builds have grown to 180.5 KiB and 192.5 KiB respectively.
 
-### Previous (2026-09-01 baseline)
+#### Previous (2026-09-01 baseline)
 
 | `di` | `fdo-installer` | `rv-firmware` | Size |
-|:----:|:---------------:|:-------------:|---------:|
+| :----: | :---------------: | :-------------: | ---------: |
 | | | | 51 KiB |
 | ✓ | | | 162 KiB |
 | | | ✓ | 178 KiB |
@@ -1839,7 +1868,7 @@ RV-firmware-only builds have grown to 180.5 KiB and 192.5 KiB respectively.
 | | ✓ | ✓ | 306 KiB |
 | ✓ | ✓ | ✓ | 340 KiB |
 
-### Observations
+#### Observations
 
 - The everything binary grew from 340→437.5 KiB (+97.5 KiB, +28.7%).
 - The transports alone remain exactly 51 KiB — no change.
@@ -1848,11 +1877,11 @@ RV-firmware-only builds have grown to 180.5 KiB and 192.5 KiB respectively.
 - Incrementally, `fdo-installer` now costs +179 KiB when added to the
   `di` + `rv-firmware` build.
 
-### Stripped sizes: still identical (verified, 2026-09-23)
+#### Stripped sizes: still identical (verified, 2026-09-23)
 
 `RUSTFLAGS="-C strip=symbols"` produces byte-identical output:
 
-```
+```text
 di,fdo-installer,rv-firmware  409 KiB   -> 409 KiB
 ```
 

@@ -720,24 +720,25 @@ impl<'a> CborDecoder<'a> {
 }
 
 /// TO1.HelloRVAck parsed response (FDO 2.0)
-/// CBOR: [nonce4, sig_info, capability_flags, optional vendor_unique]
+/// CBOR: [CapabilityFlags, VendorCapFlags, NonceTO1Proof]
 #[derive(Debug)]
 pub struct To1HelloRvAck {
     pub nonce4: [u8; 16],
-    pub sig_type: i32,
     pub capability_flags: Vec<u8>,
 }
 
 /// Parse TO1.HelloRVAck response (FDO 2.0 format)
-/// FDO 2.0: [nonce4, sig_info, capability_flags, kex_suite_names, cipher_suite_names]
+/// FDO 2.0: [CapabilityFlags (bstr), VendorCapFlags ([* tstr]), NonceTO1Proof]
 fn parse_to1_hello_rv_ack(data: &[u8]) -> Result<To1HelloRvAck, FdoError> {
     let mut dec = CborDecoder::new(data);
     
     let arr_len = dec.read_array_len()?;
-    // FDO 1.1: 3-4 elements, FDO 2.0: 5 elements
-    if arr_len < 3 || arr_len > 5 {
-        return Err(FdoError::CborError(format!("HelloRVAck expected 3-5 elements, got {}", arr_len)));
+    if arr_len != 3 {
+        return Err(FdoError::CborError(format!("HelloRVAck expected 3 elements, got {}", arr_len)));
     }
+    
+    let capability_flags = dec.read_bytes()?;
+    dec.skip_value()?; // VendorCapFlags
     
     // nonce4 - 16 byte nonce
     let nonce_bytes = dec.read_bytes()?;
@@ -747,28 +748,8 @@ fn parse_to1_hello_rv_ack(data: &[u8]) -> Result<To1HelloRvAck, FdoError> {
     let mut nonce4 = [0u8; 16];
     nonce4.copy_from_slice(&nonce_bytes);
     
-    // sig_info - array [sig_type, info]
-    let sig_info_len = dec.read_array_len()?;
-    if sig_info_len != 2 {
-        return Err(FdoError::CborError(format!("sig_info expected 2 elements, got {}", sig_info_len)));
-    }
-    let sig_type = dec.read_int()?;
-    dec.skip_value()?; // info (empty bstr)
-    
-    // capability_flags - bstr
-    let capability_flags = dec.read_bytes()?;
-    
-    // FDO 2.0 additional fields - skip if present
-    if arr_len >= 4 {
-        dec.skip_value()?; // kex_suite_names
-    }
-    if arr_len >= 5 {
-        dec.skip_value()?; // cipher_suite_names
-    }
-    
     Ok(To1HelloRvAck {
         nonce4,
-        sig_type,
         capability_flags,
     })
 }
@@ -780,13 +761,62 @@ pub struct To1RvRedirect {
     pub to1d_cose: Vec<u8>,  // Raw COSE_Sign1 bytes
 }
 
-/// Parse TO1.RVRedirect response
-/// The response is a COSE_Sign1 structure containing TO1D
+/// Parse TO1.RVRedirect response (FDO 2.0):
+/// `[numTo1ds, idxTo1ds, [to1d, ...]]`. Without Delegation there is exactly
+/// one blob. Fetching further blobs with TO1.RVMore is not supported, so the
+/// first blob is used.
 fn parse_to1_rv_redirect(data: &[u8]) -> Result<To1RvRedirect, FdoError> {
-    // RVRedirect is just a COSE_Sign1, store raw bytes
+    let mut dec = CborDecoder::new(data);
+    if dec.read_array_len()? != 3 {
+        return Err(FdoError::CborError(String::from("RVRedirect expected 3 elements")));
+    }
+    let num = dec.read_uint()?;
+    let idx = dec.read_uint()?;
+    let len = dec.read_array_len()?;
+    if idx != 0 || len == 0 || num < len as u64 {
+        return Err(FdoError::CborError(format!(
+            "malformed RVRedirect: numTo1ds={} idxTo1ds={} len={}", num, idx, len)));
+    }
+    let start = dec.pos;
+    dec.skip_value()?;
     Ok(To1RvRedirect {
-        to1d_cose: data.to_vec(),
+        to1d_cose: data[start..dec.pos].to_vec(),
     })
+}
+
+/// Parse a `CertChainOrNull` (X5CHAIN array of DER bstrs, or null).
+fn read_cert_chain_or_null(dec: &mut CborDecoder) -> Result<Option<Vec<Vec<u8>>>, FdoError> {
+    if dec.peek_null() {
+        dec.read_null()?;
+        return Ok(None);
+    }
+    let len = dec.read_array_len()?;
+    if len == 0 {
+        return Err(FdoError::CborError(String::from("empty delegate chain")));
+    }
+    let mut certs = Vec::with_capacity(len);
+    for _ in 0..len {
+        certs.push(dec.read_bytes()?);
+    }
+    Ok(Some(certs))
+}
+
+/// Extract the delegate chain from a to1d payload. FDO 2.0 payloads are
+/// `[RVTO2Addr, Hash, DelegateChain .cbor CertChainOrNull]`; a 2-element
+/// payload (created for a FDO 1.x voucher) has no delegate chain.
+pub fn to1d_delegate_chain(payload: &[u8]) -> Result<Option<Vec<Vec<u8>>>, FdoError> {
+    let mut dec = CborDecoder::new(payload);
+    let len = dec.read_array_len()?;
+    match len {
+        2 => Ok(None),
+        3 => {
+            dec.skip_value()?; // RVTO2Addr
+            dec.skip_value()?; // to0d hash
+            let wrapped = dec.read_bytes()?;
+            read_cert_chain_or_null(&mut CborDecoder::new(&wrapped))
+        }
+        _ => Err(FdoError::CborError(format!("to1d payload has {} elements", len))),
+    }
 }
 
 /// Build TO1.ProveToRV message (type 32).
@@ -872,39 +902,26 @@ pub fn build_to1_prove_to_rv(
 }
 
 /// Build TO1.HelloRV message (type 30)
-/// CBOR array: [guid, sig_info, capability_flags]
+/// CBOR array: [CapabilityFlags, VendorCapFlags, Guid]
 pub fn build_to1_hello_rv(guid: &[u8; 16]) -> Vec<u8> {
     let mut enc = CborEncoder::new();
     
-    // Array of 3 elements
     enc.array(3);
-    
-    // GUID as bstr
+    enc.bytes(&[CAPB0_SUP_FDO20]); // CapabilityFlags
+    enc.array(0); // VendorCapFlags
     enc.bytes(guid);
-    
-    // SigInfo as array [sig_type, info]
-    enc.array(2);
-    enc.neg_int(-7); // ES256
-    enc.bytes(&[]); // empty info
-    
-    // CapabilityFlags as bstr (FDO 2.0 = 0x02)
-    enc.bytes(&[0x02]);
     
     enc.into_bytes()
 }
 
 /// Build TO2.HelloDeviceProbe message (type 80)
-/// CBOR array: [capability_flags, guid, max_msg_size, hash_types, sugar]
+/// CBOR array: [CapabilityFlags, VendorCapFlags, Guid, maxDeviceMessageSize, hashTypes, sugar]
 pub fn build_to2_hello_device_probe(guid: &[u8; 16], sugar: &[u8]) -> Vec<u8> {
     let mut enc = CborEncoder::new();
     
-    // Array of 5 elements
-    enc.array(5);
-    
-    // CapabilityFlags as array [flags_bstr, optional vendor]
-    enc.array(2);
-    enc.bytes(&[0x02]); // FDO 2.0
-    enc.buf.push(0xf6); // null for vendor_unique
+    enc.array(6);
+    enc.bytes(&[CAPB0_SUP_FDO20]); // CapabilityFlags
+    enc.array(0); // VendorCapFlags
     
     // GUID as bstr
     enc.bytes(guid);
@@ -939,7 +956,25 @@ pub struct To2HelloDeviceAck {
     pub kex_suite: i8,
     pub cipher_suite: i8,
     pub max_owner_msg_size: u16,
+    pub hash_prev_type: i32,
     pub hash_prev: Vec<u8>,
+}
+
+/// Hash type this client offers in HelloDeviceProbe.hashTypes (SHA-256).
+pub const HASH_TYPE_SHA256: i32 = -16;
+
+/// Verify HelloDeviceAck20.hashPrev = hash[TO2.HelloDeviceProbe as sent].
+/// The only hash type offered (and accepted) is SHA-256.
+pub fn verify_hash_prev(hash_type: i32, hash_value: &[u8], probe: &[u8]) -> Result<(), FdoError> {
+    if hash_type != HASH_TYPE_SHA256 {
+        return Err(FdoError::ProtocolError(format!(
+            "HelloDeviceAck20 hashPrev uses hash type {} (only SHA-256 was offered)", hash_type)));
+    }
+    if hash_value != sha256(probe).as_slice() {
+        return Err(FdoError::ProtocolError(String::from(
+            "HelloDeviceAck20 hashPrev does not match HelloDeviceProbe")));
+    }
+    Ok(())
 }
 
 impl To2HelloDeviceAck {
@@ -1009,6 +1044,11 @@ pub struct To2ProveOvHdr20Payload {
     pub nonce_to2_prove_ov: [u8; 16],
     pub xb_key_exchange: Vec<u8>,  // Server's ECDH public key
     pub max_owner_msg_size: u16,
+    /// Raw CBOR of `OwnerPubKey` (a convenience copy; the Owner key used for
+    /// verification is derived from the voucher).
+    pub owner_pub_key_raw: Vec<u8>,
+    /// `DelegateChain` (DER certificates, leaf first), if a Delegate signed.
+    pub delegate_chain: Option<Vec<Vec<u8>>>,
 }
 
 /// Extract the payload from a COSE_Sign1 message **without** verifying it.
@@ -1051,14 +1091,15 @@ fn extract_cose_payload(data: &[u8]) -> Result<Vec<u8>, FdoError> {
 }
 
 /// Parse TO2.ProveOVHdr20 payload
-/// CBOR: [ov_header, num_ov_entries, hmac, nonce, xb_key_exchange, max_owner_msg_size]
-fn parse_prove_ov_hdr_payload(data: &[u8]) -> Result<To2ProveOvHdr20Payload, FdoError> {
+/// CBOR: [ov_header, num_ov_entries, hmac, nonce, xb_key_exchange,
+///        max_owner_msg_size, OwnerPubKey, DelegateChain]
+pub fn parse_prove_ov_hdr_payload(data: &[u8]) -> Result<To2ProveOvHdr20Payload, FdoError> {
     let mut dec = CborDecoder::new(data);
     
-    // Expect 6-element array
+    // Expect 8-element array
     let arr_len = dec.read_array_len()?;
-    if arr_len < 6 {
-        return Err(FdoError::CborError(format!("ProveOVHdr payload expected 6 elements, got {}", arr_len)));
+    if arr_len != 8 {
+        return Err(FdoError::CborError(format!("ProveOVHdr payload expected 8 elements, got {}", arr_len)));
     }
     
     // ov_header (bstr)
@@ -1097,6 +1138,14 @@ fn parse_prove_ov_hdr_payload(data: &[u8]) -> Result<To2ProveOvHdr20Payload, Fdo
     
     // max_owner_msg_size (uint)
     let max_owner_msg_size = dec.read_uint()? as u16;
+
+    // OwnerPubKey (PublicKey)
+    let owner_start = dec.pos;
+    dec.skip_value()?;
+    let owner_pub_key_raw = data[owner_start..dec.pos].to_vec();
+
+    // DelegateChain (CertChainOrNull)
+    let delegate_chain = read_cert_chain_or_null(&mut dec)?;
     
     Ok(To2ProveOvHdr20Payload {
         ov_header,
@@ -1106,7 +1155,102 @@ fn parse_prove_ov_hdr_payload(data: &[u8]) -> Result<To2ProveOvHdr20Payload, Fdo
         nonce_to2_prove_ov,
         xb_key_exchange,
         max_owner_msg_size,
+        owner_pub_key_raw,
+        delegate_chain,
     })
+}
+
+/// Build the TO2.ProveDevice20 EAT payload (the bytes signed by the DAK):
+/// `{10: NonceTO2ProveDv, 256: UEID, -257: TO2ProveDevicePayload20}`.
+/// `fdo_payload` is the already-encoded TO2ProveDevicePayload20 array.
+pub fn build_to2_prove_device_eat(guid: &[u8; 16], nonce_to2_prove_dv: &[u8; 16], fdo_payload: &[u8]) -> Vec<u8> {
+    let mut enc = CborEncoder::new();
+    enc.encode_map(3);
+    // EAT nonce claim (10)
+    enc.uint(10);
+    enc.bytes(nonce_to2_prove_dv);
+    // UEID claim (256): RAND type 0x01 followed by the GUID
+    enc.uint(256);
+    let mut ueid = Vec::with_capacity(17);
+    ueid.push(0x01);
+    ueid.extend_from_slice(guid);
+    enc.bytes(&ueid);
+    // EAT-FDO claim (-257): CBOR negative integer, argument 256
+    enc.buf.extend_from_slice(&[0x39, 0x01, 0x00]);
+    enc.raw_bytes(fdo_payload);
+    enc.into_bytes()
+}
+
+/// Disposition decoded from a verified TO2.SetupDevice20.
+#[derive(Debug, PartialEq)]
+pub enum SetupDisposition {
+    /// DispResale: new credentials. Carries the replacement GUID.
+    Resale { guid: [u8; 16] },
+    /// DispCredReuse: keep the current credentials.
+    CredReuse,
+}
+
+/// Check a decrypted TO2.SetupDevice20 (FDO 2.0 Errata 1):
+///
+/// * DispResale: MUST be signed by `ReplacementCred.Owner2PubKey` (proof of
+///   possession), and `ReplacementCred.NonceTO2SetupDv` MUST equal the
+///   nonce this Device sent in DeviceSvcInfoRdy20.
+/// * DispCredReuse: signed by the ProveOVHdr20 signer (`peer_point`). The
+///   Device MAY skip verification; this client verifies.
+/// * DispDisable: not supported.
+pub fn check_setup_device20(
+    data: &[u8],
+    setup_nonce: &[u8; 16],
+    peer_point: &[u8],
+) -> Result<SetupDisposition, FdoError> {
+    let s1 = crate::cose::parse_cose_sign1(data)
+        .ok_or_else(|| FdoError::CborError(String::from("SetupDevice20 is not a COSE_Sign1")))?;
+    let aad = crate::cose::domain_aad(crate::cose::AAD_TAG_SETUP_DEVICE, FDO_PROTOCOL_VERSION);
+
+    let mut dec = CborDecoder::new(s1.payload);
+    if dec.read_array_len()? != 3 {
+        return Err(FdoError::CborError(String::from("SetupDevice20 payload expected 3 elements")));
+    }
+    let disposition = dec.read_uint()?;
+    match disposition {
+        1 => {
+            // ReplacementCred = [RendezvousInfo, Guid, NonceTO2SetupDv, Owner2PubKey]
+            if dec.peek_null() || dec.read_array_len()? != 4 {
+                return Err(FdoError::ProtocolError(String::from(
+                    "SetupDevice20 DispResale requires ReplacementCred")));
+            }
+            dec.skip_value()?; // RendezvousInfo
+            let guid_bytes = dec.read_bytes()?;
+            let nonce = dec.read_bytes()?;
+            let owner2_start = dec.pos;
+            dec.skip_value()?;
+            let owner2_point = crate::voucher::parse_fdo_public_key(&s1.payload[owner2_start..dec.pos])
+                .map_err(|e| FdoError::CryptoError(format!("SetupDevice20 Owner2PubKey: {:?}", e)))?;
+            if !crate::cose::verify_sign1(&s1, &aad, &owner2_point) {
+                return Err(FdoError::CryptoError(String::from(
+                    "SetupDevice20 signature does not verify against Owner2PubKey")));
+            }
+            if nonce.as_slice() != setup_nonce {
+                return Err(FdoError::ProtocolError(String::from("SetupDevice20 nonce mismatch")));
+            }
+            let guid: [u8; 16] = guid_bytes.as_slice().try_into()
+                .map_err(|_| FdoError::CborError(String::from("SetupDevice20 GUID is not 16 bytes")))?;
+            Ok(SetupDisposition::Resale { guid })
+        }
+        2 => {
+            if !dec.peek_null() {
+                return Err(FdoError::ProtocolError(String::from(
+                    "SetupDevice20 DispCredReuse must not carry ReplacementCred")));
+            }
+            if !crate::cose::verify_sign1(&s1, &aad, peer_point) {
+                return Err(FdoError::CryptoError(String::from(
+                    "SetupDevice20 signature does not verify against the ProveOVHdr20 signer")));
+            }
+            Ok(SetupDisposition::CredReuse)
+        }
+        3 => Err(FdoError::ProtocolError(String::from("SetupDevice20 DispDisable is not supported"))),
+        d => Err(FdoError::ProtocolError(format!("SetupDevice20 has unknown DispositionCode {}", d))),
+    }
 }
 
 /// Parse FDO 1.1 HelloDeviceAck (5 elements)
@@ -1138,12 +1282,13 @@ fn parse_to2_hello_device_ack_v11(dec: &mut CborDecoder) -> Result<To2HelloDevic
         kex_suite: 1, // Default ECDH256
         cipher_suite,
         max_owner_msg_size,
+        hash_prev_type: 0,
         hash_prev: Vec::new(), // Not in FDO 1.1 HelloDeviceAck
     })
 }
 
 /// Parse TO2.HelloDeviceAck (type 61 for FDO 1.1, type 81 for FDO 2.0)
-/// FDO 2.0 CBOR: [capability_flags, guid, max_owner_msg_size, kex_suites, cipher_suites, nonce, hash_prev]
+/// FDO 2.0 CBOR: [CapabilityFlags, VendorCapFlags, guid, max_owner_msg_size, kex_suites, cipher_suites, nonce, hash_prev]
 /// FDO 1.1 CBOR: [nonce5, owner_guid, max_owner_msg_size, cipher_suite, a_key_exchange]
 pub fn parse_to2_hello_device_ack(data: &[u8]) -> Result<To2HelloDeviceAck, FdoError> {
     let mut dec = CborDecoder::new(data);
@@ -1172,31 +1317,24 @@ pub fn parse_to2_hello_device_ack(data: &[u8]) -> Result<To2HelloDeviceAck, FdoE
         return parse_to2_hello_device_ack_v11(&mut dec);
     }
     
-    // Handle FDO 2.0 format (7 elements)
-    if arr_len < 7 {
-        return Err(FdoError::CborError(format!("HelloDeviceAck expected 5 (v1.1) or 7 (v2.0) elements, got {}", arr_len)));
+    // Handle FDO 2.0 format (8 elements)
+    if arr_len != 8 {
+        return Err(FdoError::CborError(format!("HelloDeviceAck expected 5 (v1.1) or 8 (v2.0) elements, got {}", arr_len)));
     }
-    debug!("Parsing FDO 2.0 HelloDeviceAck20 (7 elements)");
+    debug!("Parsing FDO 2.0 HelloDeviceAck20 (8 elements)");
     
-    // capability_flags (element 0) - array of [flags_bstr, optional vendor_unique]
-    let cap_arr_len = dec.read_array_len()?;
-    let capability_flags = if cap_arr_len > 0 {
-        dec.read_bytes()?
-    } else {
-        Vec::new()
-    };
-    // Skip vendor_unique if present
-    for _ in 1..cap_arr_len {
-        dec.skip_value()?;
-    }
-    
-    // Skip guid (element 1)
+    // CapabilityFlags (element 0) - bstr
+    let capability_flags = dec.read_bytes()?;
+    // VendorCapFlags (element 1)
     dec.skip_value()?;
     
-    // max_owner_message_size (element 2)
+    // Skip guid (element 2)
+    dec.skip_value()?;
+    
+    // max_owner_message_size (element 3)
     let max_owner_msg_size = dec.read_uint()? as u16;
     
-    // kex_suites array (element 3) - strings like "ECDH256", skip for now
+    // kex_suites array (element 4) - strings like "ECDH256", skip for now
     let kex_len = dec.read_array_len()?;
     let mut kex_suite: i8 = 0;
     for i in 0..kex_len {
@@ -1211,7 +1349,7 @@ pub fn parse_to2_hello_device_ack(data: &[u8]) -> Result<To2HelloDeviceAck, FdoE
         }
     }
     
-    // cipher_suites array (element 4) - take first
+    // cipher_suites array (element 5) - take first
     let cipher_len = dec.read_array_len()?;
     let cipher_suite = if cipher_len > 0 {
         dec.read_int()? as i8
@@ -1223,16 +1361,16 @@ pub fn parse_to2_hello_device_ack(data: &[u8]) -> Result<To2HelloDeviceAck, FdoE
         dec.skip_value()?;
     }
     
-    // nonce_to2_prove_dv (element 5) - 16 bytes
+    // nonce_to2_prove_dv (element 6) - 16 bytes
     let nonce_bytes = dec.read_bytes()?;
     let mut nonce_to2_prove_dv = [0u8; 16];
     if nonce_bytes.len() >= 16 {
         nonce_to2_prove_dv.copy_from_slice(&nonce_bytes[..16]);
     }
     
-    // hash_prev (element 6) - Hash array [type, bytes]
+    // hash_prev (element 7) - Hash array [type, bytes]
     let hash_arr_len = dec.read_array_len()?;
-    let _hash_type = dec.read_int()?; // hash algorithm (e.g., -16 = SHA-256)
+    let hash_prev_type = dec.read_int()?; // hash algorithm (e.g., -16 = SHA-256)
     let hash_prev = if hash_arr_len > 1 {
         dec.read_bytes()?
     } else {
@@ -1245,6 +1383,7 @@ pub fn parse_to2_hello_device_ack(data: &[u8]) -> Result<To2HelloDeviceAck, FdoE
         kex_suite,
         cipher_suite,
         max_owner_msg_size,
+        hash_prev_type,
         hash_prev,
     })
 }
@@ -1338,15 +1477,17 @@ pub fn build_to2_get_ov_next_entry(entry_num: u8) -> Vec<u8> {
 }
 
 /// Build TO2.DeviceSvcInfoRdy20 message (type 86) - plaintext before encryption
-/// Format: [max_owner_service_info_sz] - CBOR array with one element (null means no limit)
-pub fn build_device_svc_info_rdy(max_owner_svc_info_sz: Option<u16>) -> Vec<u8> {
+/// Format: [ReplacementHMac (always null), maxOwnerServiceInfoSz, NonceTO2SetupDV_Prep]
+/// The ReplacementHMac field is not used (FDO 2.0 Errata 1).
+pub fn build_device_svc_info_rdy(max_owner_svc_info_sz: Option<u16>, nonce_to2_setup_dv: &[u8; 16]) -> Vec<u8> {
     let mut enc = CborEncoder::new();
-    // FDO 2.0: Struct encoded as CBOR array with one element
-    enc.array(1);
+    enc.array(3);
+    enc.null(); // ReplacementHMac: not used
     match max_owner_svc_info_sz {
         Some(sz) => enc.uint(sz),
         None => enc.null(),
     }
+    enc.bytes(nonce_to2_setup_dv);
     enc.into_bytes()
 }
 
@@ -1432,61 +1573,6 @@ pub fn parse_encrypted_message(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), FdoErr
     Ok((nonce, ciphertext))
 }
 
-/// Parsed SetupDevice20 message
-pub struct SetupDevice20 {
-    pub nonce_to2_setup_dv: [u8; 16],
-    pub replacement_guid: Option<[u8; 16]>,
-    pub max_device_svc_info_sz: u16,
-}
-
-/// Parse SetupDevice20 response: [nonce, replacement_guid, replacement_rv_info, max_device_svc_info_sz]
-pub fn parse_setup_device(data: &[u8]) -> Result<SetupDevice20, FdoError> {
-    let mut dec = CborDecoder::new(data);
-    let arr_len = dec.read_array_header()?;
-    if arr_len != 4 {
-        return Err(FdoError::CborError(format!("SetupDevice20 expected 4 elements, got {}", arr_len)));
-    }
-    
-    // nonce_to2_setup_dv (16 bytes)
-    let nonce_bytes = dec.read_bytes()?;
-    if nonce_bytes.len() != 16 {
-        return Err(FdoError::CborError(format!("SetupDevice nonce expected 16 bytes, got {}", nonce_bytes.len())));
-    }
-    let mut nonce = [0u8; 16];
-    nonce.copy_from_slice(&nonce_bytes);
-    
-    // replacement_guid (optional, null or 16 bytes)
-    let replacement_guid = if dec.peek_null() {
-        dec.read_null()?;
-        None
-    } else {
-        let guid_bytes = dec.read_bytes()?;
-        if guid_bytes.len() != 16 {
-            return Err(FdoError::CborError(format!("SetupDevice guid expected 16 bytes, got {}", guid_bytes.len())));
-        }
-        let mut guid = [0u8; 16];
-        guid.copy_from_slice(&guid_bytes);
-        Some(guid)
-    };
-    
-    // replacement_rv_info (optional, skip for now)
-    if dec.peek_null() {
-        dec.read_null()?;
-    } else {
-        // Skip RV info - it's a complex structure we don't need yet
-        dec.skip_value()?;
-    }
-    
-    // max_device_service_info_sz
-    let max_device_svc_info_sz = dec.read_u16()?;
-    
-    Ok(SetupDevice20 {
-        nonce_to2_setup_dv: nonce,
-        replacement_guid,
-        max_device_svc_info_sz,
-    })
-}
-
 /// Build devmod ServiceInfo (required by FDO spec)
 /// Returns array of [key, value] pairs for devmod module
 pub fn build_devmod_service_info() -> Vec<u8> {
@@ -1545,10 +1631,11 @@ pub fn build_devmod_service_info() -> Vec<u8> {
 }
 
 /// Build TO2.DeviceSvcInfo message (type 88)
-/// Format: [is_more, service_info_array]
+/// Format: [ReplacementHMacOrNull (always null), is_more, service_info_array]
 pub fn build_device_svc_info(is_more: bool, service_info: &[u8]) -> Vec<u8> {
     let mut enc = CborEncoder::new();
-    enc.array(2);
+    enc.array(3);
+    enc.null(); // ReplacementHMacOrNull: not used (FDO 2.0 Errata 1)
     enc.bool_val(is_more);
     if service_info.is_empty() {
         enc.array(0); // Empty array
@@ -1633,13 +1720,14 @@ pub fn parse_service_info_array(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, F
 }
 
 /// Build TO2.Done20 message (type 90)
-/// Format: [nonce_to2_setup_dv, replacement_hmac]
-/// replacement_hmac is null for credential reuse
-pub fn build_to2_done(nonce_to2_setup_dv: &[u8; 16]) -> Vec<u8> {
+/// Format: [NonceTO2ProveDv, ReplacementHMac]
+/// ReplacementHMac is null: credential reuse, or this client declining resale
+/// (it does not install replacement credentials).
+pub fn build_to2_done(nonce_to2_prove_dv: &[u8; 16]) -> Vec<u8> {
     let mut enc = CborEncoder::new();
     enc.array(2);
-    enc.bytes(nonce_to2_setup_dv);
-    enc.null(); // ReplacementHMAC - null for credential reuse
+    enc.bytes(nonce_to2_prove_dv);
+    enc.null();
     enc.into_bytes()
 }
 
@@ -1649,7 +1737,7 @@ pub struct DoneAck {
 }
 
 /// Parse TO2.DoneAck message (type 91)
-/// Format: [nonce_to2_prove_dv]
+/// Format: [NonceTO2SetupDv]
 pub fn parse_to2_done_ack(data: &[u8]) -> Result<DoneAck, FdoError> {
     let mut dec = CborDecoder::new(data);
     let arr_len = dec.read_array_header()?;
@@ -1714,6 +1802,9 @@ pub fn perform_to2_hello(owner_url: &str, guid: &[u8; 16]) -> Result<(To2HelloDe
     // Parse HelloDeviceAck20
     let ack = parse_to2_hello_device_ack(&response)?;
     debug!("  Nonce: {:02x?}", ack.nonce_to2_prove_dv);
+
+    // hashPrev must be the hash of the probe we sent
+    verify_hash_prev(ack.hash_prev_type, &ack.hash_prev, &hello_probe)?;
     
     // Return raw response for hash_prev2 computation
     Ok((ack, auth_token, response))
@@ -1788,8 +1879,14 @@ pub fn perform_to2(
         warn!("Server prefers ECDH384 but device only supports ECDH256");
     }
     
-    // Echo the server's nonce for anti-replay (per FDO 2.0 spec)
-    let nonce_to2_prove_ov_prep = ack.nonce_to2_prove_dv;
+    // NonceTO2ProveOV is generated by the Device; the Owner must return it
+    // in its signed ProveOVHdr20, proving that message is fresh. (The
+    // Owner's NonceTO2ProveDv goes in the EAT nonce claim instead.)
+    let prove_ov_rand = tpm::tpm_get_random(16)
+        .ok_or_else(|| FdoError::CryptoError(String::from(
+            "TPM GetRandom failed for NonceTO2ProveOV")))?;
+    let mut nonce_to2_prove_ov_prep = [0u8; 16];
+    nonce_to2_prove_ov_prep.copy_from_slice(&prove_ov_rand);
     
     // Compute hash_prev2 (SHA-256 of HelloDeviceAck response)
     let hash_prev2 = sha256(&hello_ack_raw);
@@ -1804,14 +1901,15 @@ pub fn perform_to2(
     debug!("TO2: Flushing ECDH transient handle 0x{:08x} before signing...", ecdh_key.handle);
     tpm::tpm_flush_context(ecdh_key.handle);
     
-    // Build the payload bytes
-    let payload = build_to2_prove_device_payload(
+    // Build the EAT: nonce claim NonceTO2ProveDv, FDO claim the payload
+    let fdo_payload = build_to2_prove_device_payload(
         kex_suite_str,
         ack.cipher_suite,
         &xa_public_key,
         &nonce_to2_prove_ov_prep,
         &hash_prev2,
     );
+    let payload = build_to2_prove_device_eat(guid, &ack.nonce_to2_prove_dv, &fdo_payload);
     
     // Build the protected header
     let protected = build_cose_protected_header();
@@ -1995,24 +2093,19 @@ pub fn perform_to2(
     let prove_ov_s1 = crate::cose::parse_cose_sign1(&response_prove_ov)
         .ok_or_else(|| FdoError::CborError(String::from("ProveOVHdr is not a valid COSE_Sign1")))?;
 
-    // Check for delegate chain (label 258) in the unprotected header.
+    // A delegate chain, if present, is in the signed ProveOVHdr20 payload.
     // If present, validate the chain and use the delegate leaf key for
     // ProveOVHdr verification instead of the Owner key directly.
     // Set explicitly on each branch below. Must not be inferred later from
     // "Owner key is present" — the Owner key is known even when a delegate
     // signed ProveOVHdr.
     let peer_authority: crate::bmo::PeerAuthority;
+    // The key that signed ProveOVHdr20: also the SetupDevice20 signer for
+    // DispCredReuse (FDO 2.0 Errata 1).
+    let prove_ov_signer: Vec<u8>;
 
-    if crate::cose::has_delegate_header(prove_ov_s1.unprotected_header) {
+    if let Some(cert_ders) = prove_ov.delegate_chain.as_ref() {
         info!("TO2: ProveOVHdr carries a delegate chain — validating...");
-
-        // Extract DER certificates from label 258
-        let cert_ders = crate::delegate::extract_delegate_chain_from_unprotected(
-            prove_ov_s1.unprotected_header,
-        ).ok_or_else(|| {
-            error!("TO2: Failed to parse delegate chain from ProveOVHdr");
-            FdoError::CryptoError(String::from("delegate chain parse failed"))
-        })?;
 
         // Build a reference slice for the validation function
         let cert_refs: Vec<&[u8]> = cert_ders.iter().map(|c| c.as_slice()).collect();
@@ -2047,6 +2140,7 @@ pub fn perform_to2(
                 "ProveOVHdr signature verification failed (delegate)")));
         }
         info!("TO2: ProveOVHdr signature VERIFIED against delegate leaf key");
+        prove_ov_signer = chain_result.leaf_key_point;
     } else {
         // No delegate — verify ProveOVHdr directly against the Owner key
         let prove_ov_aad = crate::cose::domain_aad(
@@ -2060,16 +2154,17 @@ pub fn perform_to2(
                 "ProveOVHdr signature verification failed")));
         }
         peer_authority = crate::bmo::PeerAuthority::OwnerDirect;
+        prove_ov_signer = owner_key.clone();
     }
 
-    // Freshness: the Owner must echo the nonce it issued in HelloDeviceAck20
-    // and that we returned in ProveDevice20. Checked only now, after the
+    // Freshness: the Owner must echo the NonceTO2ProveOV this Device
+    // generated and sent in ProveDevice20. Checked only now, after the
     // signature above — a nonce comparison on unauthenticated bytes proves
     // nothing, and answering it early would hand an attacker an oracle.
     // Without this, a recorded ProveOVHdr from a previous session replays.
     verify_nonce_echo(
         "ProveOVHdr20",
-        &ack.nonce_to2_prove_dv,
+        &nonce_to2_prove_ov_prep,
         &prove_ov.nonce_to2_prove_ov,
     )?;
     // Verify the TO1 rendezvous blob against the same Owner key. Per FDO, if
@@ -2081,26 +2176,33 @@ pub fn perform_to2(
         Some(blob) if !blob.is_empty() => {
             let s1 = crate::cose::parse_cose_sign1(blob)
                 .ok_or_else(|| FdoError::CborError(String::from("to1d is not a valid COSE_Sign1")))?;
-            let aad = crate::cose::domain_aad(
-                crate::cose::AAD_TAG_OWNER_SIGN,
-                FDO_PROTOCOL_VERSION,
-            );
-            if crate::cose::has_delegate_header(s1.unprotected_header) {
+            // The voucher's protocol version (OVHProtVer) decides the to1d
+            // AAD, as for voucher entries (FDO 2.0 Errata 1, E7). The header
+            // was authenticated by its HMAC in verify_voucher above.
+            let ovh_protver = crate::voucher::parse_ov_header(&prove_ov.ov_header)
+                .map_err(|e| FdoError::CborError(format!("OVHeader parse: {:?}", e)))?
+                .protver;
+            let aad = crate::cose::domain_aad(crate::cose::AAD_TAG_OWNER_SIGN, ovh_protver);
+            // FDO 2.0: a delegate chain, if any, is in the signed to1d payload
+            let to1d_chain = to1d_delegate_chain(s1.payload).map_err(|e| {
+                error!("TO2: Failed to parse delegate chain from to1d: {:?}", e);
+                FdoError::CryptoError(String::from("to1d delegate chain parse failed"))
+            })?;
+            if let Some(cert_ders) = to1d_chain {
                 // to1d was signed by a delegate. Validate the chain and use
                 // the delegate leaf key for signature verification.
                 info!("TO2: to1d was signed by a delegate — validating chain...");
-                let cert_ders = crate::delegate::extract_delegate_chain_from_unprotected(
-                    s1.unprotected_header,
-                ).ok_or_else(|| {
-                    error!("TO2: Failed to parse delegate chain from to1d");
-                    FdoError::CryptoError(String::from("to1d delegate chain parse failed"))
-                })?;
                 let cert_refs: Vec<&[u8]> = cert_ders.iter().map(|c| c.as_slice()).collect();
                 let chain_result = crate::delegate::verify_delegate_chain(&cert_refs, &owner_key)
                     .ok_or_else(|| {
                         error!("TO2: to1d delegate chain VERIFICATION FAILED");
                         FdoError::CryptoError(String::from("to1d delegate chain verification failed"))
                     })?;
+                if !chain_result.has_redirect {
+                    error!("TO2: to1d delegate lacks fdo-ekt-permit-redirect");
+                    return Err(FdoError::CryptoError(String::from(
+                        "to1d delegate lacks redirect permission")));
+                }
                 if !crate::cose::verify_sign1(&s1, &aad, &chain_result.leaf_key_point) {
                     error!("TO2: to1d SIGNATURE VERIFICATION FAILED against delegate leaf key.");
                     return Err(FdoError::CryptoError(String::from(
@@ -2134,7 +2236,14 @@ pub fn perform_to2(
     // UKI, 65535 needs ~420. 65535 is the protocol ceiling (the field is a
     // uint16). Must stay under the http.rs rx_body buffer with room for COSE +
     // HTTP overhead, and requires the Response() drain loop in http.rs.
-    let device_svc_info_rdy = build_device_svc_info_rdy(Some(65535));
+    // NonceTO2SetupDv: generated by the Device, returned by the Owner in
+    // SetupDevice20 (resale) and DoneAck20.
+    let setup_rand = tpm::tpm_get_random(16)
+        .ok_or_else(|| FdoError::CryptoError(String::from(
+            "TPM GetRandom failed for NonceTO2SetupDv")))?;
+    let mut nonce_to2_setup_dv = [0u8; 16];
+    nonce_to2_setup_dv.copy_from_slice(&setup_rand);
+    let device_svc_info_rdy = build_device_svc_info_rdy(Some(65535), &nonce_to2_setup_dv);
     debug!("  Plaintext: {} bytes, hex: {:02x?}", device_svc_info_rdy.len(), &device_svc_info_rdy);
     
     // AES-GCM IV. Every message in this session is encrypted under the same
@@ -2162,11 +2271,14 @@ pub fn perform_to2(
     let setup_device_plain = cose_decrypt0_a256gcm(&session_keys.sek, &response)?;
     debug!("  SetupDevice20 plaintext: {} bytes", setup_device_plain.len());
     
-    // Parse SetupDevice20: [nonce_to2_setup_dv, replacement_guid, replacement_rv_info, max_device_svc_info_sz]
-    let setup_device = parse_setup_device(&setup_device_plain)?;
-    info!("TO2 Step 4 complete: SetupDevice20 received");
-    debug!("  nonce_to2_setup_dv: {:02x?}", &setup_device.nonce_to2_setup_dv[..8]);
-    debug!("  max_device_svc_info_sz: {}", setup_device.max_device_svc_info_sz);
+    // SetupDevice20 is a COSE_Sign1: verify per its DispositionCode
+    let disposition = check_setup_device20(&setup_device_plain, &nonce_to2_setup_dv, &prove_ov_signer)?;
+    info!("TO2 Step 4 complete: SetupDevice20 received ({:?})", disposition);
+    if let SetupDisposition::Resale { .. } = disposition {
+        // Replacement credentials are not installed by this client, so it
+        // declines resale by sending a null ReplacementHMac in Done20.
+        warn!("TO2: Owner requested resale; this client declines (null ReplacementHMac)");
+    }
     
     // Step 5: ServiceInfo exchange loop (DeviceSvcInfo/OwnerSvcInfo)
     info!("TO2 Step 5: ServiceInfo exchange...");
@@ -2304,8 +2416,8 @@ pub fn perform_to2(
     // and never return.
     info!("TO2 Step 6: Sending Done...");
     
-    // Build Done (msg 90): [nonce_to2_setup_dv]
-    let done_msg = build_to2_done(&setup_device.nonce_to2_setup_dv);
+    // Build Done (msg 90): [NonceTO2ProveDv, ReplacementHMac]
+    let done_msg = build_to2_done(&ack.nonce_to2_prove_dv);
     debug!("  Done plaintext: {} bytes", done_msg.len());
     
     // Encrypt and send. Same session counter — previously a hardcoded IV whose
@@ -2324,15 +2436,13 @@ pub fn perform_to2(
     let done_ack_plain = cose_decrypt0_a256gcm(&session_keys.sek, &response)?;
     debug!("  DoneAck plaintext: {} bytes", done_ack_plain.len());
     
-    // Parse DoneAck: [nonce_to2_prove_dv] - echo of our original nonce
+    // Parse DoneAck: [NonceTO2SetupDv] - echo of the nonce we sent in DeviceSvcInfoRdy20
     let done_ack = parse_to2_done_ack(&done_ack_plain)?;
 
-    // The owner echoes the same nonce here as in ProveOVHdr20 (go-fdo
-    // to2_server_v200.go:412 reads it back from session state). Abort on
-    // mismatch — this is the last chance to notice we finished a protocol
-    // run against a different session than the one we started, and the very
-    // next thing this function does is chainload.
-    verify_nonce_echo("DoneAck20", &ack.nonce_to2_prove_dv, &done_ack.nonce)?;
+    // Abort on mismatch — this is the last chance to notice we finished a
+    // protocol run against a different session than the one we started, and
+    // the very next thing this function does is chainload.
+    verify_nonce_echo("DoneAck20", &nonce_to2_setup_dv, &done_ack.nonce)?;
 
     info!("TO2 Step 6 complete: DoneAck received");
     
@@ -2505,7 +2615,6 @@ pub fn perform_to1(
     
     info!("TO1 Step 1 complete: HelloRV -> HelloRVAck");
     debug!("  Nonce4: {:02x?}", ack.nonce4);
-    debug!("  SigType: {}", ack.sig_type);
     debug!("  CapabilityFlags: {:02x?}", ack.capability_flags);
     
     // Step 2: ProveToRV -> RVRedirect
@@ -2817,24 +2926,41 @@ mod tests {
 
     #[test]
     fn test_build_to1_hello_rv() {
+        // Spec: [CapabilityFlags, VendorCapFlags, Guid]
         let guid = [0x42u8; 16];
         let msg = build_to1_hello_rv(&guid);
-        // Should be a valid CBOR array with the GUID
         let mut dec = CborDecoder::new(&msg);
-        let arr_len = dec.read_array_header().unwrap();
-        assert!(arr_len >= 1);
-        let guid_bytes = dec.read_bytes().unwrap();
-        assert_eq!(guid_bytes, &guid);
+        assert_eq!(dec.read_array_header().unwrap(), 3);
+        assert_eq!(dec.read_bytes().unwrap(), &[CAPB0_SUP_FDO20]);
+        assert_eq!(dec.read_array_header().unwrap(), 0);
+        assert_eq!(dec.read_bytes().unwrap(), &guid);
     }
 
     #[test]
     fn test_build_to2_hello_device_probe() {
+        // Spec: [CapabilityFlags, VendorCapFlags, Guid, maxDeviceMessageSize, hashTypes, sugar]
         let guid = [0x42u8; 16];
         let sugar = [0xaa; 16];
         let msg = build_to2_hello_device_probe(&guid, &sugar);
         let mut dec = CborDecoder::new(&msg);
-        let arr_len = dec.read_array_header().unwrap();
-        assert!(arr_len >= 2);
+        assert_eq!(dec.read_array_header().unwrap(), 6);
+        assert_eq!(dec.read_bytes().unwrap(), &[CAPB0_SUP_FDO20]);
+        assert_eq!(dec.read_array_header().unwrap(), 0);
+        assert_eq!(dec.read_bytes().unwrap(), &guid);
+    }
+
+    #[test]
+    fn test_parse_to1_hello_rv_ack_spec_layout() {
+        // [h'87', ["com.example.test"], nonce] as sent by go-fdo
+        let mut enc = CborEncoder::new();
+        enc.array(3);
+        enc.bytes(&[0x87]);
+        enc.array(1);
+        enc.text("com.example.test");
+        enc.bytes(&[0x11; 16]);
+        let ack = parse_to1_hello_rv_ack(&enc.into_bytes()).unwrap();
+        assert_eq!(ack.capability_flags, vec![0x87]);
+        assert_eq!(ack.nonce4, [0x11; 16]);
     }
 
     #[test]
@@ -3009,51 +3135,215 @@ mod tests {
             "a difference in the first byte must be caught");
     }
 
-    // --- SetupDevice: wrong nonce length ---
+    // --- FDO 2.0 Errata 1 / spec-drift wire formats ---
 
-    #[test]
-    fn test_parse_setup_device_bad_nonce_length() {
-        let mut enc = CborEncoder::new();
-        enc.array(4);
-        enc.bytes(&[0x01; 8]); // 8-byte nonce instead of 16
-        enc.null();             // replacement_guid
-        enc.null();             // replacement_rv_info
-        enc.uint(1024);         // max_device_svc_info_sz
-        let result = parse_setup_device(&enc.into_bytes());
-        assert!(result.is_err(), "8-byte nonce must be rejected");
+    /// FDO PublicKey [pkType=10 (SECP256R1), pkEnc=1 (X509), SPKI] for a P-256 point.
+    fn test_fdo_public_key(point: &[u8]) -> Vec<u8> {
+        let mut spki = vec![0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce,
+            0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+            0x03, 0x42, 0x00];
+        spki.extend_from_slice(point);
+        let mut out = vec![0x83, 0x0a, 0x01];
+        crate::cose::encode_bstr(&mut out, &spki);
+        out
     }
 
-    // --- SetupDevice: valid with replacement GUID ---
+    fn signed_setup_device(payload: &[u8], sk: &p256::ecdsa::SigningKey) -> Vec<u8> {
+        let aad = crate::cose::domain_aad(crate::cose::AAD_TAG_SETUP_DEVICE, FDO_PROTOCOL_VERSION);
+        crate::cose::build_test_cose_sign1(
+            &crate::cose::build_test_protected_header(None), payload, &aad, &[0xa0], sk)
+    }
+
+    fn resale_payload(owner2_point: &[u8], nonce: &[u8; 16]) -> Vec<u8> {
+        let mut enc = CborEncoder::new();
+        enc.array(3);
+        enc.uint(1); // DispResale
+        enc.array(4);
+        enc.array(0); // RendezvousInfo
+        enc.bytes(&[0xBB; 16]); // Guid
+        enc.bytes(nonce);
+        enc.raw_bytes(&test_fdo_public_key(owner2_point));
+        enc.uint(1300);
+        enc.into_bytes()
+    }
+
+    fn reuse_payload() -> Vec<u8> {
+        let mut enc = CborEncoder::new();
+        enc.array(3);
+        enc.uint(2); // DispCredReuse
+        enc.null();
+        enc.null();
+        enc.into_bytes()
+    }
 
     #[test]
-    fn test_parse_setup_device_with_replacement_guid() {
+    fn test_setup_device20_resale_owner2_signed() {
+        let (owner2_sk, owner2_pt) = crate::cose::gen_test_keypair();
+        let (_, peer_pt) = crate::cose::gen_test_keypair_b();
         let nonce = [0x42u8; 16];
-        let guid = [0xBBu8; 16];
-        let mut enc = CborEncoder::new();
-        enc.array(4);
-        enc.bytes(&nonce);
-        enc.bytes(&guid);       // replacement GUID
-        enc.null();             // replacement_rv_info
-        enc.uint(2048);
-        let result = parse_setup_device(&enc.into_bytes()).unwrap();
-        assert_eq!(result.nonce_to2_setup_dv, nonce);
-        assert_eq!(result.replacement_guid, Some(guid));
-        assert_eq!(result.max_device_svc_info_sz, 2048);
+        let msg = signed_setup_device(&resale_payload(&owner2_pt, &nonce), &owner2_sk);
+        assert_eq!(check_setup_device20(&msg, &nonce, &peer_pt).unwrap(),
+            SetupDisposition::Resale { guid: [0xBB; 16] });
     }
 
-    // --- SetupDevice: null GUID (credential reuse) ---
+    #[test]
+    fn test_setup_device20_resale_not_signed_by_owner2_rejected() {
+        let (_, owner2_pt) = crate::cose::gen_test_keypair();
+        let (peer_sk, peer_pt) = crate::cose::gen_test_keypair_b();
+        let nonce = [0x42u8; 16];
+        // Signed by the TO2 peer, not by Owner2: no proof of possession
+        let msg = signed_setup_device(&resale_payload(&owner2_pt, &nonce), &peer_sk);
+        assert!(check_setup_device20(&msg, &nonce, &peer_pt).is_err());
+    }
 
     #[test]
-    fn test_parse_setup_device_null_guid() {
-        let nonce = [0x01u8; 16];
+    fn test_setup_device20_resale_wrong_nonce_rejected() {
+        let (owner2_sk, owner2_pt) = crate::cose::gen_test_keypair();
+        let msg = signed_setup_device(&resale_payload(&owner2_pt, &[0x01; 16]), &owner2_sk);
+        assert!(check_setup_device20(&msg, &[0x02; 16], &owner2_pt).is_err());
+    }
+
+    #[test]
+    fn test_setup_device20_resale_tampered_signature_rejected() {
+        let (owner2_sk, owner2_pt) = crate::cose::gen_test_keypair();
+        let nonce = [0x42u8; 16];
+        let mut msg = signed_setup_device(&resale_payload(&owner2_pt, &nonce), &owner2_sk);
+        let last = msg.len() - 1;
+        msg[last] ^= 0x01;
+        assert!(check_setup_device20(&msg, &nonce, &owner2_pt).is_err());
+    }
+
+    #[test]
+    fn test_setup_device20_reuse_peer_signed() {
+        let (peer_sk, peer_pt) = crate::cose::gen_test_keypair();
+        let (_, other_pt) = crate::cose::gen_test_keypair_b();
+        let msg = signed_setup_device(&reuse_payload(), &peer_sk);
+        assert_eq!(check_setup_device20(&msg, &[0; 16], &peer_pt).unwrap(), SetupDisposition::CredReuse);
+        assert!(check_setup_device20(&msg, &[0; 16], &other_pt).is_err(),
+            "reuse signed by a key other than the ProveOVHdr20 signer must be rejected");
+    }
+
+    #[test]
+    fn test_setup_device20_disable_and_unknown_rejected() {
+        let (sk, pt) = crate::cose::gen_test_keypair();
+        for disp in [3u16, 9] {
+            let mut enc = CborEncoder::new();
+            enc.array(3);
+            enc.uint(disp);
+            enc.null();
+            enc.null();
+            let msg = signed_setup_device(&enc.into_bytes(), &sk);
+            assert!(check_setup_device20(&msg, &[0; 16], &pt).is_err());
+        }
+    }
+
+    #[test]
+    fn test_verify_hash_prev() {
+        let probe = build_to2_hello_device_probe(&[0x42; 16], &[0xaa; 16]);
+        let good = sha256(&probe);
+        assert!(verify_hash_prev(HASH_TYPE_SHA256, &good, &probe).is_ok());
+        assert!(verify_hash_prev(HASH_TYPE_SHA256, &[0u8; 32], &probe).is_err());
+        assert!(verify_hash_prev(-43, &good, &probe).is_err(), "SHA-384 was not offered");
+    }
+
+    #[test]
+    fn test_build_device_svc_info_rdy_layout() {
+        let nonce = [0x33u8; 16];
+        let msg = build_device_svc_info_rdy(Some(65535), &nonce);
+        let mut dec = CborDecoder::new(&msg);
+        assert_eq!(dec.read_array_header().unwrap(), 3);
+        assert!(dec.peek_null(), "ReplacementHMac must be null");
+        dec.read_null().unwrap();
+        assert_eq!(dec.read_uint().unwrap(), 65535);
+        assert_eq!(dec.read_bytes().unwrap(), nonce);
+    }
+
+    #[test]
+    fn test_build_device_svc_info_and_done_layout() {
+        let msg = build_device_svc_info(false, &[]);
+        let mut dec = CborDecoder::new(&msg);
+        assert_eq!(dec.read_array_header().unwrap(), 3);
+        dec.read_null().unwrap();
+        assert!(!dec.read_bool().unwrap());
+
+        let nonce = [0x44u8; 16];
+        let done = build_to2_done(&nonce);
+        let mut dec = CborDecoder::new(&done);
+        assert_eq!(dec.read_array_header().unwrap(), 2);
+        assert_eq!(dec.read_bytes().unwrap(), nonce, "Done20 echoes NonceTO2ProveDv");
+        dec.read_null().unwrap();
+    }
+
+    #[test]
+    fn test_prove_device_eat_claims() {
+        let guid = [0x42u8; 16];
+        let nonce = [0x55u8; 16];
+        let eat = build_to2_prove_device_eat(&guid, &nonce, &[0x80]);
+        let mut dec = CborDecoder::new(&eat);
+        assert_eq!(dec.read_map_header().unwrap(), 3);
+        assert_eq!(dec.read_uint().unwrap(), 10);
+        assert_eq!(dec.read_bytes().unwrap(), nonce);
+        assert_eq!(dec.read_uint().unwrap(), 256);
+        let ueid = dec.read_bytes().unwrap();
+        assert_eq!(ueid[0], 0x01);
+        assert_eq!(&ueid[1..], &guid);
+        assert_eq!(dec.read_int().unwrap(), -257);
+        assert_eq!(dec.read_array_header().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_parse_prove_ov_hdr_payload_v20() {
         let mut enc = CborEncoder::new();
-        enc.array(4);
-        enc.bytes(&nonce);
-        enc.null();             // null GUID = credential reuse
-        enc.null();             // replacement_rv_info
-        enc.uint(512);
-        let result = parse_setup_device(&enc.into_bytes()).unwrap();
-        assert_eq!(result.replacement_guid, None);
+        enc.array(8);
+        enc.bytes(&[0x01, 0x02]);      // OVHeader bstr
+        enc.uint(2);                    // NumOVEntries
+        enc.array(2); enc.uint(5); enc.bytes(&[0x11; 32]); // HMac
+        enc.bytes(&[0x22; 16]);         // NonceTO2ProveOV
+        enc.bytes(&[0x33; 8]);          // xB
+        enc.uint(65535);                // maxOwnerMessageSize
+        enc.raw_bytes(&test_fdo_public_key(&crate::cose::gen_test_keypair().1)); // OwnerPubKey
+        enc.array(1); enc.bytes(&[0x30, 0x00]); // DelegateChain
+        let p = parse_prove_ov_hdr_payload(&enc.into_bytes()).unwrap();
+        assert_eq!(p.nonce_to2_prove_ov, [0x22; 16]);
+        assert_eq!(p.delegate_chain, Some(vec![vec![0x30, 0x00]]));
+        assert!(!p.owner_pub_key_raw.is_empty());
+    }
+
+    #[test]
+    fn test_rv_redirect_and_to1d_delegate_chain() {
+        // to1d payload with null DelegateChain (bstr .cbor null)
+        let mut payload = CborEncoder::new();
+        payload.array(3);
+        payload.array(0);
+        payload.array(2); payload.neg_int(-16); payload.bytes(&[0; 32]);
+        payload.bytes(&[0xf6]);
+        let payload = payload.into_bytes();
+        assert_eq!(to1d_delegate_chain(&payload).unwrap(), None);
+
+        // 2-element (FDO 1.x voucher) payload: no chain
+        let mut p11 = CborEncoder::new();
+        p11.array(2); p11.array(0); p11.array(2); p11.neg_int(-16); p11.bytes(&[0; 32]);
+        assert_eq!(to1d_delegate_chain(&p11.into_bytes()).unwrap(), None);
+
+        // Delegate chain present
+        let mut chain = CborEncoder::new();
+        chain.array(1); chain.bytes(&[0x30, 0x01]);
+        let mut pd = CborEncoder::new();
+        pd.array(3); pd.array(0); pd.array(2); pd.neg_int(-16); pd.bytes(&[0; 32]);
+        pd.bytes(&chain.into_bytes());
+        assert_eq!(to1d_delegate_chain(&pd.into_bytes()).unwrap(), Some(vec![vec![0x30, 0x01]]));
+
+        // RVRedirect wrapper: [1, 0, [to1d]]
+        let (sk, _) = crate::cose::gen_test_keypair();
+        let to1d = crate::cose::build_test_cose_sign1(
+            &crate::cose::build_test_protected_header(None), &payload, &[], &[0xa0], &sk);
+        let mut r = CborEncoder::new();
+        r.array(3); r.uint(1); r.uint(0); r.array(1); r.raw_bytes(&to1d);
+        assert_eq!(parse_to1_rv_redirect(&r.into_bytes()).unwrap().to1d_cose, to1d);
+
+        let mut bad = CborEncoder::new();
+        bad.array(3); bad.uint(1); bad.uint(1); bad.array(1); bad.raw_bytes(&to1d);
+        assert!(parse_to1_rv_redirect(&bad.into_bytes()).is_err(), "idxTo1ds != 0 must be rejected");
     }
 
     // --- KDF: different key lengths produce different keys ---
