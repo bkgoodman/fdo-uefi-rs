@@ -247,6 +247,22 @@ fn get_device_model() -> String {
     String::from("FDO UEFI Reference Device")
 }
 
+/// Build DI.AppStart (type 10).
+/// This fdo-server build expects [ DeviceMfgInfo, CapabilityFlags ].
+/// DeviceMfgInfo is a CBOR bstr. CapabilityFlags is a bare bstr, not an array.
+fn build_di_app_start(device_mfg_info: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(device_mfg_info.len() + 4);
+
+    // Array of 2 elements: [Info, CapabilityFlags]
+    buf.push(0x82);
+
+    // Info: already a CBOR bstr wrapping the manufacturing-info array.
+    buf.extend_from_slice(device_mfg_info);
+
+    // CapabilityFlags: bstr(1). Do not wrap this in 0x81.
+    buf.push(0x41);
+    buf.push(CAPABILITY_FLAGS_FDO20 as u8);
+
 /// Build DIAppStart message (FDO 2.0)
 /// Spec: [CapabilityFlags, VendorCapFlags, DeviceMfgInfo]
 fn build_di_app_start(device_mfg_info: &[u8]) -> Vec<u8> {
