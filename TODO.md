@@ -323,6 +323,40 @@ found H4 (below), and the two articles in
 
 ---
 
+## TPM spec alignment (opened 2026-10-21, deferred)
+
+Spec: `~/internet-of-things-specs/securing-fdo-in-tpm.bs`, branch
+`bgoodman-tpm` (commits 95adc93..6ec5bf0). Test any change on QEMU+swtpm
+and on real hardware (K800).
+
+- [ ] **NV handle collision**: `rv_firmware/anti_rollback.rs` uses
+  `0x01D10002` (FWREV), which the TPM spec's Table 5 assigns to the
+  optional DCOV index. One of them has to move (check the
+  `bgoodman-rv-firmware` spec branch for what it allocates).
+- [ ] **DCTPM define attributes**: `build_nv_define_space_cmd` sets only
+  `OWNERWRITE|OWNERREAD`; spec Table 9 adds `AUTHWRITE`, `AUTHREAD`,
+  `NO_DA`, `PLATFORMCREATE` (SHOULD), and `WRITE_STCLEAR` (adopted
+  2026-10-21 for the optional per-boot write lock; relevant to M4 below).
+- [ ] **DCTPM magic not verified**: `read_fdo_credentials` skips items 0-3
+  (magic, DCActive, ...) without checking `DCTPMMagic`; spec says readers
+  MUST verify it and treat a mismatch as "no credentials".
+- [ ] **Key attributes**: signing key (`build_create_primary_signing_cmd`,
+  0x00040472) lacks `adminWithPolicy`; spec Table 11 also now says
+  `noDA = 1` for the DAK and HMAC key.
+- [ ] Stale comment/constant: `FDO_NV_INDEX_DCTPM = 0x01C10130`
+  ("go-fdo uses 0x01C10130 (standard)") — spec has only 0x01D10001.
+- [ ] **Device key authPolicy = `PolicyCommandCode(TPM_CC_Certify)`**
+  (spec Table 10/12, adopted 2026-10-23, SHOULD), together with the
+  `adminWithPolicy` fix above. SHA256 digest `048e9a3a…65850`. Signing
+  must still work with an empty password. Prerequisite for the
+  `fdo.tpm-quote` FSIM device side (~/fdo-sim/fsim-repository/fdo.tpm-quote.md).
+- [ ] **FDO 2.0 ECDH `ShSe` order** (`src/fdo.rs` ~2013, "per go-fdo
+  kex/ecdh.go:300"): builds `ecdh || xb_rand || xa_rand`; the spec order is
+  `Shx || DeviceRandom || OwnerRandom` = `ecdh || xa_rand || xb_rand` at 2.0.
+  Flag day with go-fdo and fido-device-onboard-rs. Cross-repo tracking:
+  workstream `fdo20-spec-issues`; spec background (editorial A/B prose fix)
+  filed in the upstream spec tracker 2026-10-24.
+
 ## Perpetual Reminders (never "completed")
 
 ### TPM_RC_RETRY (0x922) — every TPM command can return this
@@ -1064,6 +1098,16 @@ to the ECDH x-coordinate result before passing to KDF.
 - [x] **120MB UKI with full initrd** - Rebuilt UKI with full 91MB Ubuntu initrd + go-fdo client binary + custom init script. Custom init replaces casper (which expected squashfs on CD-ROM) with minimal boot: mounts proc/sys/dev, starts udevd, runs DHCP, drops to shell. Network working (10.0.2.15). go-fdo client available at /usr/local/bin/fdo. (2026-09-03)
 - [x] **Pre-allocate image buffer** - Done for inline mode (bmo.rs reserves total_size on image-begin)
 - [ ] **Transfer speed optimization** - 120MB at 65KB/round takes ~10-12 minutes. Consider larger chunks if server supports it
+      *(Superseded 2026-10-22: with the 64 KB MTU work, inline runs much
+      faster on the QEMU host: 111,148,002 B in 1,704 rounds, 48 s, in
+      `fdo-uki-build` run 2026-10-20 15:39; Fedora 290 MB ~1.5 min. See
+      "Inline BMO is ~40× slower over QEMU's iPXE e1000e driver" below.)*
+- [x] **Windows UKI (488 MiB) via BMO URL delivery + chainload** (2026-10-22, QEMU/OVMF): signed image-begin, hash-pinned URL fetch, `BMO: Image ready for boot (512194560 bytes, integrity verified)`, chainload into winpe-uki-stub → wimboot → WinPE. Details: `../fdo-uki-build/TEST-WINDOWS.md`.
+- [ ] **BMO URL delivery is capped at 512 MiB per image** — see the section
+      "BMO image size limits (512 MiB HTTP cap, whole image in RAM)" at the
+      end of this file.
+- [ ] **Inline BMO is ~40× slower over QEMU's iPXE e1000e driver** — see the
+      section of that name at the end of this file.
 - [ ] **Stage 2: go-fdo-endpoint** - Run go-fdo-endpoint client inside booted UKI to receive configuration (autoinstall.yaml, ISO payload) from orchestrator via FSIMs. See go-fdo-endpoint project for hook-based FSIM processing.
 - [x] **Watchdog bumped to 1800s (30 min)** for 106MB UKI transfer on k800 hardware (2026-09-15)
 - [x] **SNP initialization bug fixed** - `ensure_network_configured()` had SNP start guarded by `#[cfg(not(feature = "uefi-http"))]`, meaning the default build (which includes both uefi-http and tcp4-http) never started SNP on real hardware. TCP4 Configure returned INVALID_PARAMETER on all 6 handles. Fixed by always starting SNP unconditionally. (2026-09-15)
@@ -1891,3 +1935,89 @@ and `[profile.release]` already has `lto = true`, `opt-level = "z"`.
 - [ ] The only remaining lever is content, not flags: `.rdata` is likely ~80 KiB
   now with the added log strings from scope/delegation. A build-time feature to
   compile out non-error logging would be the next real saving.
+
+## BMO image size limits (512 MiB HTTP cap, whole image in RAM) (opened 2026-10-22)
+
+Found while delivering a Windows UKI (`../winpe-uki-stub`, `../fdo-uki-build/TODO-WINDOWS.md`).
+Linux UKIs (106–290 MB) are far below every limit here; a Windows UKI is not.
+
+**What limits a BMO image today**
+
+| Path | Limit | Where | What happens past it |
+| --- | --- | --- | --- |
+| URL / meta-URL delivery, TCP4 transport | **512 MiB** response body | `tcp4_http.rs` `MAX_RESPONSE_BYTES` (`512 * 1024 * 1024`), checked in both receive loops (`Response exceeded` / `Download exceeded`) | download aborted; `http_get` returns `None`; device reports **`BMO_ERROR_URL_FETCH_FAILED`**, not "too big" |
+| URL delivery, EFI_HTTP transport (`http.rs`, tried first) | none found | `http.rs` `http_get` | unbounded; limited only by allocation |
+| Inline delivery | none | `bmo.rs`: `image_buffer.reserve(begin.total_size)` | an owner-declared `total_size` is reserved as-is; an absurd value makes the allocation fail (→ panic → warm reboot) |
+| All modes | available RAM | whole image buffered, then `LoadImage(FromBuffer)` | peak ≈ 3× image for a Windows UKI: download buffer + loaded image + bootmgr RAM disk (4 GiB guest was enough for 488 MiB) |
+
+**Why the cap exists:** a sanity bound so a runaway or hostile server cannot
+exhaust memory (comment at `tcp4_http.rs:19`); it is not a protocol limit and
+not derived from anything the owner declared.
+
+**Impact today:** the stock Windows Server 2025 Setup `boot.wim` gives a
+519.6 MiB UKI → cannot be URL-delivered. The WinPE-only export (index 1)
+gives 488 MiB → fits with **~23 MiB** spare, and Stage 2 adds
+`fdo-endpoint.exe` (~11 MiB stripped). One more agent or driver set and the
+Windows UKI no longer fits.
+
+**Workaround that works today:** inline delivery has no cap. The 488 MiB
+Windows UKI went inline (signed image-begin) in 151 s on QEMU (2026-10-22),
+once the client's TO2 ran over virtio-net (see the iPXE e1000e section).
+
+**To do**
+
+- [ ] Replace the fixed cap with a bound derived from `image-begin`
+      `total_size` (which the signed/authenticated image-begin carries),
+      checked against available memory *before* the download starts;
+      refuse early with a size error instead of failing mid-transfer.
+- [ ] Hash while streaming (incremental SHA-256 over received chunks) so the
+      hash check does not need a second pass; pre-allocate exactly
+      `total_size` (already done for inline).
+- [ ] Bound the inline `reserve(total_size)` the same way (memory check,
+      clean refusal) instead of trusting the declared size.
+- [ ] Map "too big" to `BMO_ERROR_SIZE_EXCEEDED` in URL/meta-URL mode
+      (today it surfaces as `URL_FETCH_FAILED`, which sends the owner looking
+      at the network).
+- [ ] Decide whether EFI_HTTP (`http.rs`) needs the same bound (it has none).
+- [ ] Spec (fdo-sim `fdo.bmo.md` / `chunking-strategy.md`): let the device
+      advertise its maximum image size per delivery mode (devmod or
+      `fdo.bmo:` key) so the owner can pick a mode/image before sending, and
+      give "image too large" its own error code if it lacks one.
+- [ ] Longer term: avoid holding the whole image in RAM (e.g. a RAM-disk /
+      block-device target for ISO-type images) — needed for images that
+      approach installed RAM.
+- [ ] Tests: unit-test the bound/refusal decision as a pure function
+      (AGENTS.md rule); QEMU negative test with a >cap image expecting the
+      size error, and a just-under-cap positive test.
+
+## Inline BMO is ~40× slower over QEMU's iPXE e1000e driver (opened 2026-10-22)
+
+**Cause found (QEMU):** per-round speed depends on which NIC driver the client
+runs TO2 over, not on signing, image type, size, KVM/TCG or RAM.
+
+| Firmware-visible NIC(s) | 111 MB Ubuntu UKI inline | 488 MiB Windows UKI inline |
+| --- | --- | --- |
+| virtio-net only (OVMF VirtioNetDxe) | **33 s** (1,704 rounds, ~20 ms/round) | — |
+| virtio-net + e1000e *without* option ROM (`-device e1000e,romfile=`) | — | **151 s**, signed (~3.4 MB/s) |
+| e1000e with QEMU's iPXE EFI ROM only | — | 10 % after ~10 min |
+| virtio-net + e1000e with iPXE ROM | <10 % after 150 s | <10 % after 7 min |
+
+tcpdump (host loopback, owner on :8080), slow case, per round: guest connect
+→ HTTP request ~0.50 s (very regular), request → response 0.6–1.0 s (part of
+that was owner SQLite fsync on a rotating disk; see go-fdo `TODO.md`
+"Performance"). With two NICs, the client evidently uses the iPXE-driven
+e1000e. URL delivery (one GET) is unaffected either way.
+
+- [ ] Find what in `tcp4_http.rs` / `http.rs` costs ~0.5 s per connection on
+      an iPXE SNP (polling granularity? connect-token wait? MNP poll?). Every
+      inline round opens a new connection (`Connection: close`), so any
+      per-connect delay multiplies by thousands of rounds.
+- [ ] Consider HTTP keep-alive across TO2 rounds (one connection for the whole
+      ServiceInfo exchange) — removes the per-round connect entirely.
+- [ ] Multi-NIC: pick the NIC that actually reached the owner (e.g. the one
+      DHCP/TO1 succeeded on) and stay on it, instead of the first SNP.
+- [ ] **K800 check:** 5 Intel NICs and slow BMO transfers historically
+      (106 MB UKI needed the 30-min watchdog). Measure per-round time there and
+      see whether the same per-connection delay applies to AMI's Intel driver.
+- Harness note: `fdo-uki-build/windows/spike/start17-winpe-uki.sh` now gives
+  the e1000e `romfile=` so OVMF ignores it (WinPE still uses it).

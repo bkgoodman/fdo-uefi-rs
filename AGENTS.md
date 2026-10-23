@@ -44,6 +44,20 @@ verification happens at all; "onboarding completed" is not evidence that anythin
 verified. This is how the TO2 owner-authentication gap (see `TODO.md` CRITICAL section)
 went unnoticed through multiple "FULLY TESTED" sign-offs.
 
+## Known Limits (BMO image size)
+
+- **URL / meta-URL delivery over TCP4 aborts above 512 MiB**
+  (`tcp4_http.rs` `MAX_RESPONSE_BYTES`) and reports `URL_FETCH_FAILED`, not a
+  size error. Inline delivery has no cap (it reserves the owner's
+  `total_size`). Every mode holds the whole image in RAM before chainloading.
+  A Windows UKI (WinPE) is ~488 MiB and close to the cap. Details and plan:
+  `TODO.md` "BMO image size limits".
+- Inline BMO runs ~40× slower when the client's TO2 goes over QEMU's iPXE
+  e1000e EFI driver instead of virtio-net (every round opens a new
+  connection; ~1 s each vs ~20 ms). In QEMU give extra Intel NICs
+  `romfile=`. `TODO.md` "Inline BMO is ~40× slower over QEMU's iPXE e1000e
+  driver".
+
 ## Be Careful
 
 About commands such as `apt` and others which require user-interaction as they may hang agent work.
