@@ -62,6 +62,21 @@ went unnoticed through multiple "FULLY TESTED" sign-offs.
 
 About commands such as `apt` and others which require user-interaction as they may hang agent work.
 
+## TPM spec check on QEMU + swtpm (`test-uefi-tpm.sh`)
+
+Runs on the QEMU host (pe2): fdo-uefi DI into a fresh swtpm, then go-fdo's
+`fdo-client-tpm client -tpm-check` against the TPM state fdo-uefi left (DCTPM
+attributes, key templates, Certify-only Device key policy), then TO1/TO2 with
+a small BMO EFI app. Arguments go to fdo-uefi through `startup.nsh` (this
+repo's `Shell.efi` as the boot loader). Needs a go-fdo server and a
+`-tags tpm` go-fdo client (`go-fdo/examples`). See the script header for the
+variables; example:
+
+```bash
+FDO_SERVER=bin/fdo-server FDO_CLIENT_TPM=bin/fdo-client-tpm FDO_UEFI=fdo-uefi.efi \
+  SHELL_EFI=Shell.efi BMO_EFI=~/bkgvm/hello-efi.efi ./test-uefi-tpm.sh
+```
+
 ## Native Unit Tests (256 tests)
 
 ```bash

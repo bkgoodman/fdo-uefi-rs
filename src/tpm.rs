@@ -1254,8 +1254,15 @@ pub fn read_fdo_credentials() -> Option<FdoCredentials> {
             return None;
         }
         
-        // Skip items 0-3 (Magic, Active, Version, DeviceInfo)
-        for idx in 0..4 {
+        // Item 0: DCTPMMagic. Readers SHALL treat a mismatch as no credentials.
+        let magic = read_cbor_uint(&data, &mut pos)?;
+        if magic != crate::tpm_policy::DCTPM_MAGIC {
+            warn!("DCTPM: magic 0x{:08x} != 0x{:08x}; treating as no credentials", magic, crate::tpm_policy::DCTPM_MAGIC);
+            return None;
+        }
+
+        // Skip items 1-3 (Active, Version, DeviceInfo)
+        for idx in 1..4 {
             if !skip_cbor_value(&data, &mut pos) {
                 warn!("DCTPM: failed to skip item {}", idx);
                 return None;
@@ -1295,6 +1302,7 @@ pub fn read_fdo_credentials() -> Option<FdoCredentials> {
         let mut guid: Option<[u8; 16]> = None;
         let mut device_key_handle: Option<u32> = None;
         let mut hmac_key_handle: Option<u32> = None;
+        let mut magic_ok = false;
         
         for _ in 0..num_items {
             if pos >= data.len() {
@@ -1320,6 +1328,14 @@ pub fn read_fdo_credentials() -> Option<FdoCredentials> {
             };
             
             match key {
+                0 => {
+                    let magic = read_cbor_uint(&data, &mut pos)?;
+                    if magic != crate::tpm_policy::DCTPM_MAGIC {
+                        warn!("DCTPM: magic 0x{:08x} != 0x{:08x}; treating as no credentials", magic, crate::tpm_policy::DCTPM_MAGIC);
+                        return None;
+                    }
+                    magic_ok = true;
+                }
                 4 => {
                     // GUID (16-byte bstr)
                     let guid_bytes = read_cbor_bstr(&data, &mut pos)?;
@@ -1352,6 +1368,10 @@ pub fn read_fdo_credentials() -> Option<FdoCredentials> {
             }
         }
         
+        if !magic_ok {
+            warn!("DCTPM: no magic (key 0); treating as no credentials");
+            return None;
+        }
         match (guid, device_key_handle, hmac_key_handle) {
             (Some(g), Some(dk), Some(hk)) => {
                 return Some(FdoCredentials { guid: g, device_key_handle: dk, hmac_key_handle: hk });
@@ -2347,7 +2367,9 @@ fn build_evict_control_cmd(object_handle: u32, persistent_handle: u32) -> Vec<u8
 }
 
 /// Write data to TPM NV index (defines space if needed)
-pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
+/// Define `nv_index` with `attributes` and `data.len()` bytes (undefining any
+/// previous definition first), then write `data` with one TPM2_NV_Write.
+pub fn tpm_nv_write(nv_index: u32, data: &[u8], attributes: u32) -> bool {
     let tcg_handle = match boot::get_handle_for_protocol::<Tcg>() {
         Ok(h) => h,
         Err(_) => return false,
@@ -2366,7 +2388,7 @@ pub fn tpm_nv_write(nv_index: u32, data: &[u8]) -> bool {
     }
 
     // Define NV space with exact size for new data
-    let define_cmd = build_nv_define_space_cmd(nv_index, data.len() as u16);
+    let define_cmd = build_nv_define_space_cmd(nv_index, data.len() as u16, attributes);
     debug!("NV DefineSpace cmd ({} bytes) for index 0x{:08x}, size={}", define_cmd.len(), nv_index, data.len());
     
     match tpm_submit_with_retry(&mut tcg, &define_cmd, 64) {
@@ -2428,7 +2450,7 @@ fn build_nv_undefine_space_cmd(nv_index: u32) -> Vec<u8> {
 }
 
 /// Build TPM2_NV_DefineSpace command
-fn build_nv_define_space_cmd(nv_index: u32, size: u16) -> Vec<u8> {
+fn build_nv_define_space_cmd(nv_index: u32, size: u16, attributes: u32) -> Vec<u8> {
     let mut cmd = Vec::with_capacity(64);
     
     cmd.extend_from_slice(&[0u8; 10]);
@@ -2465,10 +2487,8 @@ fn build_nv_define_space_cmd(nv_index: u32, size: u16) -> Vec<u8> {
     pack_u16(&mut alg, TPM2_ALG_SHA256);
     cmd.extend_from_slice(&alg);
     
-    // attributes: JUST ownerwrite | ownerread (absolute minimum)
-    // OWNERWRITE (bit 1) = 0x02, OWNERREAD (bit 17) = 0x20000
-    // 0x00020002 in big-endian: [0x00, 0x02, 0x00, 0x02]
-    cmd.extend_from_slice(&[0x00, 0x02, 0x00, 0x02]);
+    // attributes (TPMA_NV), chosen by the caller
+    cmd.extend_from_slice(&attributes.to_be_bytes());
     
     // authPolicy (empty)
     cmd.extend_from_slice(&[0, 0]);

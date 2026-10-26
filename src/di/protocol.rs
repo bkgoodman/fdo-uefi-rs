@@ -182,7 +182,10 @@ pub fn run_di_protocol(cli_url: Option<&str>) -> Status {
     // 11. Write DCTPM to NV index
     info!("Writing DCTPM to TPM NV...");
     let dctpm = build_dctpm(&ov_header, FDO_DAK_HANDLE, FDO_HMAC_HANDLE);
-    if !tpm::tpm_nv_write(FDO_NV_INDEX_DCTPM, &dctpm) {
+    // Spec Table 9 attributes; index defined at 512 bytes, structure first,
+    // zero padding after it (readers decode the first CBOR item).
+    let dctpm = crate::tpm_policy::dctpm_padded(&dctpm);
+    if !tpm::tpm_nv_write(FDO_NV_INDEX_DCTPM, &dctpm, crate::tpm_policy::DCTPM_NV_ATTRIBUTES) {
         error!("Failed to write DCTPM to NV");
         return Status::DEVICE_ERROR;
     }

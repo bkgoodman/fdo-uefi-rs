@@ -53,7 +53,8 @@ pub fn update_firmware_rev_counter(new_rev: u64) -> bool {
 
     info!("Anti-rollback: Ratcheting counter {} -> {}", current, new_rev);
     let bytes = new_rev.to_le_bytes();
-    if tpm::tpm_nv_write(FDO_NV_INDEX_FWREV, &bytes) {
+    // OWNERWRITE | OWNERREAD (unchanged; FWREV is not part of the TPM spec)
+    if tpm::tpm_nv_write(FDO_NV_INDEX_FWREV, &bytes, 0x0002_0002) {
         info!("Anti-rollback: Counter updated successfully");
         true
     } else {

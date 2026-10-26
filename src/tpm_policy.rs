@@ -38,6 +38,40 @@ pub const DEVICE_KEY_AUTH_POLICY_SHA256: [u8; 32] = [
     0xf0, 0x7a, 0xc7, 0xfa, 0x33, 0x25, 0xb3, 0xd4, 0x9a, 0x21, 0xdd, 0x51, 0x94, 0xc6, 0x58, 0x50,
 ];
 
+/// TPMA_NV bits (TPM 2.0 Part 2, 13.4).
+pub const TPMA_NV_OWNERWRITE: u32 = 0x0000_0002;
+pub const TPMA_NV_AUTHWRITE: u32 = 0x0000_0004;
+pub const TPMA_NV_WRITE_STCLEAR: u32 = 0x0000_4000;
+pub const TPMA_NV_OWNERREAD: u32 = 0x0002_0000;
+pub const TPMA_NV_AUTHREAD: u32 = 0x0004_0000;
+pub const TPMA_NV_NO_DA: u32 = 0x0200_0000;
+
+/// DCTPM index attributes, spec Table 9 (Owner hierarchy, no PLATFORMCREATE):
+/// OWNERWRITE, AUTHWRITE, OWNERREAD, AUTHREAD, NO_DA, WRITE_STCLEAR.
+pub const DCTPM_NV_ATTRIBUTES: u32 = TPMA_NV_OWNERWRITE
+    | TPMA_NV_AUTHWRITE
+    | TPMA_NV_OWNERREAD
+    | TPMA_NV_AUTHREAD
+    | TPMA_NV_NO_DA
+    | TPMA_NV_WRITE_STCLEAR;
+
+/// DCTPM magic ("FDO1"). Readers SHALL treat a mismatch as no credentials.
+pub const DCTPM_MAGIC: u32 = 0x4644_4F31;
+
+/// DCTPM index size defined at DI (spec: minimum 384, 512 RECOMMENDED). The
+/// structure is the first CBOR item; the rest is zero.
+pub const DCTPM_DEFAULT_SIZE: usize = 512;
+
+/// The DCTPM index contents: the encoded structure, zero-padded to
+/// max(DCTPM_DEFAULT_SIZE, len).
+pub fn dctpm_padded(structure: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::from(structure);
+    if out.len() < DCTPM_DEFAULT_SIZE {
+        out.resize(DCTPM_DEFAULT_SIZE, 0);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,6 +84,21 @@ mod tests {
         h.update(0x0000_016Cu32.to_be_bytes()); // TPM_CC_PolicyCommandCode
         h.update(0x0000_0148u32.to_be_bytes()); // TPM_CC_Certify
         assert_eq!(h.finalize().as_slice(), &DEVICE_KEY_AUTH_POLICY_SHA256);
+    }
+
+    #[test]
+    fn dctpm_attributes_value() {
+        // Was 0x00020002 (OWNERWRITE | OWNERREAD only).
+        assert_eq!(DCTPM_NV_ATTRIBUTES, 0x0206_4006);
+    }
+
+    #[test]
+    fn dctpm_padding() {
+        let p = dctpm_padded(&[0x8a, 1, 2]);
+        assert_eq!(p.len(), DCTPM_DEFAULT_SIZE);
+        assert_eq!(&p[..3], &[0x8a, 1, 2]);
+        assert!(p[3..].iter().all(|&b| b == 0));
+        assert_eq!(dctpm_padded(&[7u8; 600]).len(), 600);
     }
 
     #[test]

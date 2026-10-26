@@ -333,11 +333,15 @@ and on real hardware (K800).
   `0x01D10002` (FWREV), which the TPM spec's Table 5 assigns to the
   optional DCOV index. One of them has to move (check the
   `bgoodman-rv-firmware` spec branch for what it allocates).
-- [ ] **DCTPM define attributes**: `build_nv_define_space_cmd` sets only
+- [x] **DONE 2026-10-27: DCTPM define attributes** (`tpm_policy::DCTPM_NV_ATTRIBUTES`
+  0x02064006; index defined at 512 bytes, zero padding). Baseline before the
+  fix (go-fdo `client -tpm-check` on QEMU+swtpm, `test-uefi-tpm.sh`): 29 PASS,
+  4 FAIL (AUTHWRITE, AUTHREAD, NO_DA, WRITE_STCLEAR); after: all PASS.
+  Original: `build_nv_define_space_cmd` sets only
   `OWNERWRITE|OWNERREAD`; spec Table 9 adds `AUTHWRITE`, `AUTHREAD`,
   `NO_DA`, `PLATFORMCREATE` (SHOULD), and `WRITE_STCLEAR` (adopted
   2026-10-21 for the optional per-boot write lock; relevant to M4 below).
-- [ ] **DCTPM magic not verified**: `read_fdo_credentials` skips items 0-3
+- [x] **DONE 2026-10-27: DCTPM magic not verified** (now checked, array and map forms): `read_fdo_credentials` skips items 0-3
   (magic, DCActive, ...) without checking `DCTPMMagic`; spec says readers
   MUST verify it and treat a mismatch as "no credentials".
 - [x] **DONE 2026-10-24 (uncommitted): Key attributes**: both keys now
@@ -345,9 +349,9 @@ and on real hardware (K800).
   it already had `noDA`. HMAC key gained `noDA`).
 - [ ] Stale comment/constant: `FDO_NV_INDEX_DCTPM = 0x01C10130`
   ("go-fdo uses 0x01C10130 (standard)") — spec has only 0x01D10001.
-- [x] **DONE 2026-10-24 (uncommitted, `src/tpm_policy.rs`; NOT yet checked on a
-  TPM: needs a fdo-uefi DI in QEMU + `tpm2_readpublic`/`tpm2_certify`, and K800)
-  Device key authPolicy = `PolicyCommandCode(TPM_CC_Certify)`**
+- [x] **DONE 2026-10-24 (`src/tpm_policy.rs`; verified 2026-10-27 on QEMU+swtpm with
+  go-fdo `client -tpm-check`: policy digest, Certify via policy, ObjectChangeAuth
+  refused; K800 pending) Device key authPolicy = `PolicyCommandCode(TPM_CC_Certify)`**
   (spec Table 10/12, adopted 2026-10-23, SHOULD), together with the
   `adminWithPolicy` fix above. SHA256 digest `048e9a3a…65850`. Signing
   must still work with an empty password. Prerequisite for the
