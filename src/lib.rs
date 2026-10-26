@@ -24,6 +24,9 @@ pub mod chainload;
 // DNS resolver — pure packet logic on all targets; UDP4 transport is UEFI-only
 pub mod dns;
 
+// FDO TPM spec key template constants (pure; used by tpm.rs)
+pub mod tpm_policy;
+
 // --- Pure + mixed modules (protocol logic, crypto, parsing) ---
 // These compile on both UEFI and native targets.
 #[cfg(any(feature = "fdo-installer", feature = "rv-firmware"))]

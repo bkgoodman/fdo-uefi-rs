@@ -340,17 +340,20 @@ and on real hardware (K800).
 - [ ] **DCTPM magic not verified**: `read_fdo_credentials` skips items 0-3
   (magic, DCActive, ...) without checking `DCTPMMagic`; spec says readers
   MUST verify it and treat a mismatch as "no credentials".
-- [ ] **Key attributes**: signing key (`build_create_primary_signing_cmd`,
-  0x00040472) lacks `adminWithPolicy`; spec Table 11 also now says
-  `noDA = 1` for the DAK and HMAC key.
+- [x] **DONE 2026-10-24 (uncommitted): Key attributes**: both keys now
+  `tpm_policy::FDO_KEY_ATTRIBUTES` = 0x000404F2 (DAK gained `adminWithPolicy`;
+  it already had `noDA`. HMAC key gained `noDA`).
 - [ ] Stale comment/constant: `FDO_NV_INDEX_DCTPM = 0x01C10130`
   ("go-fdo uses 0x01C10130 (standard)") — spec has only 0x01D10001.
-- [ ] **Device key authPolicy = `PolicyCommandCode(TPM_CC_Certify)`**
+- [x] **DONE 2026-10-24 (uncommitted, `src/tpm_policy.rs`; NOT yet checked on a
+  TPM: needs a fdo-uefi DI in QEMU + `tpm2_readpublic`/`tpm2_certify`, and K800)
+  Device key authPolicy = `PolicyCommandCode(TPM_CC_Certify)`**
   (spec Table 10/12, adopted 2026-10-23, SHOULD), together with the
   `adminWithPolicy` fix above. SHA256 digest `048e9a3a…65850`. Signing
   must still work with an empty password. Prerequisite for the
   `fdo.tpm-quote` FSIM device side (~/fdo-sim/fsim-repository/fdo.tpm-quote.md).
-- [ ] **FDO 2.0 ECDH `ShSe` order** (`src/fdo.rs` ~2013, "per go-fdo
+- [x] **FIXED 2026-10-24 (uncommitted; `build_ecdh_shse` + KAT; QEMU TO2 vs fixed
+  go-fdo PASS, vs pre-fix server fails at msg 86) FDO 2.0 ECDH `ShSe` order** (`src/fdo.rs` ~2013, "per go-fdo
   kex/ecdh.go:300"): builds `ecdh || xb_rand || xa_rand`; the spec order is
   `Shx || DeviceRandom || OwnerRandom` = `ecdh || xa_rand || xb_rand` at 2.0.
   Flag day with go-fdo and fido-device-onboard-rs. Cross-repo tracking:

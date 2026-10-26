@@ -1938,12 +1938,12 @@ fn build_create_primary_signing_cmd() -> Vec<u8> {
     pack_u16(&mut alg, TPM2_ALG_SHA256);
     cmd.extend_from_slice(&alg);
     
-    // objectAttributes: fixedTPM | fixedParent | sensitivedataOrigin | userWithAuth | sign
-    // 0x00040472
-    cmd.extend_from_slice(&[0x00, 0x04, 0x04, 0x72]);
+    // objectAttributes per FDO TPM spec Table 11 (0x000404F2)
+    cmd.extend_from_slice(&crate::tpm_policy::FDO_KEY_ATTRIBUTES.to_be_bytes());
     
-    // authPolicy (empty)
-    cmd.extend_from_slice(&[0, 0]);
+    // authPolicy = PolicyCommandCode(TPM_CC_Certify), spec Table 12
+    cmd.extend_from_slice(&(crate::tpm_policy::DEVICE_KEY_AUTH_POLICY_SHA256.len() as u16).to_be_bytes());
+    cmd.extend_from_slice(&crate::tpm_policy::DEVICE_KEY_AUTH_POLICY_SHA256);
     
     // parameters.eccDetail
     // symmetric = TPM_ALG_NULL
@@ -2124,11 +2124,11 @@ fn build_create_primary_hmac_cmd() -> Vec<u8> {
     pack_u16(&mut alg, TPM2_ALG_SHA256);
     cmd.extend_from_slice(&alg);
     
-    // objectAttributes: fixedTPM | fixedParent | sensitivedataOrigin | userWithAuth | adminWithPolicy | sign
-    // 0x000400F2 (per FDO TPM spec Table 11: adminWithPolicy only affects admin ops, not user ops like HMAC)
-    cmd.extend_from_slice(&[0x00, 0x04, 0x00, 0xF2]);
+    // objectAttributes per FDO TPM spec Table 11 (0x000404F2; adminWithPolicy
+    // only affects admin ops, not user ops like HMAC)
+    cmd.extend_from_slice(&crate::tpm_policy::FDO_KEY_ATTRIBUTES.to_be_bytes());
     
-    // authPolicy (empty)
+    // authPolicy (empty, spec Table 12: no ADMIN role for the HMAC key)
     cmd.extend_from_slice(&[0, 0]);
     
     // parameters.keyedHashDetail
