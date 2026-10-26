@@ -26,6 +26,8 @@ pub mod dns;
 
 // FDO TPM spec key template constants (pure; used by tpm.rs)
 pub mod tpm_policy;
+// DCTPM structure helpers (pure; DCMinFirmwareRev)
+pub mod dctpm;
 
 // --- Pure + mixed modules (protocol logic, crypto, parsing) ---
 // These compile on both UEFI and native targets.

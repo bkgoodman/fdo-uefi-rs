@@ -4,63 +4,79 @@
 //
 // Anti-Rollback Protection for RV-Based Firmware Delivery
 //
-// Maintains a monotonic firmware revision counter in TPM NV storage.
-// The effective minimum revision is MAX(RVMinFirmwareRev, persisted counter).
+// Maintains the monotonic minimum firmware revision in DCTPM.DCMinFirmwareRev.
+// The effective minimum revision is MAX(RVMinFirmwareRev, DCMinFirmwareRev).
 // After successful signature verification, the counter is ratcheted up.
 
 use log::{info, warn};
-use crate::tpm;
+use crate::{dctpm, tpm, tpm_policy};
 
-/// TPM NV index for firmware revision counter (Profile A)
-const FDO_NV_INDEX_FWREV: u32 = 0x01D10002;
+// The ratchet lives in DCTPM.DCMinFirmwareRev (TPM spec, DCTPM item 10).
+// Earlier builds used a separate NV index 0x01D10002, which the TPM spec
+// assigns to DCOV; that index is no longer read or written.
 
-/// Read the persisted firmware revision counter from TPM NV.
-/// Returns 0 if the index doesn't exist (first boot).
+/// Read DCMinFirmwareRev from DCTPM. Returns 0 if DCTPM is missing, has no
+/// such item (older ten-item DCTPM), or cannot be parsed.
 pub fn read_firmware_rev_counter() -> u64 {
-    match tpm::tpm_nv_read(FDO_NV_INDEX_FWREV) {
-        Some(data) => {
-            if data.len() == 8 {
-                let rev = u64::from_le_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
-                ]);
-                info!("Anti-rollback: Persisted rev counter = {}", rev);
+    match tpm::tpm_nv_read(tpm_policy::DCTPM_NV_INDEX) {
+        Some(data) => match dctpm::min_firmware_rev(&data) {
+            Some(rev) => {
+                info!("Anti-rollback: DCMinFirmwareRev = {}", rev);
                 rev
-            } else {
-                warn!("Anti-rollback: Invalid counter size {} (expected 8)", data.len());
+            }
+            None => {
+                warn!("Anti-rollback: DCTPM not parseable; treating minimum as 0");
                 0
             }
-        }
+        },
         None => {
-            info!("Anti-rollback: No counter found (first boot)");
+            info!("Anti-rollback: No DCTPM (minimum 0)");
             0
         }
     }
 }
 
-/// Write (ratchet) the firmware revision counter to TPM NV.
-/// Only writes if the new value is greater than the current persisted value.
+/// Raise (ratchet) DCMinFirmwareRev in DCTPM. Never lowers it. Writes DCTPM in
+/// place with one NV_Write when the updated structure fits the index;
+/// otherwise (an old exact-size index) redefines it at the spec size.
 pub fn update_firmware_rev_counter(new_rev: u64) -> bool {
     if new_rev == 0 {
         return true; // Nothing to persist
     }
-
-    let current = read_firmware_rev_counter();
+    let data = match tpm::tpm_nv_read(tpm_policy::DCTPM_NV_INDEX) {
+        Some(d) => d,
+        None => {
+            warn!("Anti-rollback: No DCTPM; cannot persist minimum revision");
+            return false;
+        }
+    };
+    let current = dctpm::min_firmware_rev(&data).unwrap_or(0);
     if new_rev <= current {
         info!("Anti-rollback: Rev {} <= current {}, no update needed", new_rev, current);
         return true;
     }
-
-    info!("Anti-rollback: Ratcheting counter {} -> {}", current, new_rev);
-    let bytes = new_rev.to_le_bytes();
-    // OWNERWRITE | OWNERREAD (unchanged; FWREV is not part of the TPM spec)
-    if tpm::tpm_nv_write(FDO_NV_INDEX_FWREV, &bytes, 0x0002_0002) {
-        info!("Anti-rollback: Counter updated successfully");
-        true
+    let updated = match dctpm::with_min_firmware_rev(&data, new_rev) {
+        Some(u) => u,
+        None => {
+            warn!("Anti-rollback: DCTPM not parseable; not updating");
+            return false;
+        }
+    };
+    info!("Anti-rollback: Ratcheting DCMinFirmwareRev {} -> {}", current, new_rev);
+    let ok = if updated.len() <= data.len() {
+        let mut padded = updated;
+        padded.resize(data.len(), 0);
+        tpm::tpm_nv_write_in_place(tpm_policy::DCTPM_NV_INDEX, &padded)
     } else {
-        warn!("Anti-rollback: Failed to write counter to TPM NV");
-        false
+        warn!("Anti-rollback: DCTPM index too small ({} < {}); redefining (not atomic)", data.len(), updated.len());
+        tpm::tpm_nv_write(tpm_policy::DCTPM_NV_INDEX, &tpm_policy::dctpm_padded(&updated), tpm_policy::DCTPM_NV_ATTRIBUTES)
+    };
+    if ok {
+        info!("Anti-rollback: DCMinFirmwareRev updated");
+    } else {
+        warn!("Anti-rollback: Failed to write DCTPM");
     }
+    ok
 }
 
 /// Check if a firmware revision passes the anti-rollback check.

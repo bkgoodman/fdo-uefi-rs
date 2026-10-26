@@ -765,8 +765,8 @@ fn build_dctpm(ov_header: &OVHeader, dak_handle: u32, hmac_handle: u32) -> Vec<u
     let mut buf = Vec::with_capacity(256);
     
     // DCTPM = [DCTPMMagic, DCActive, ProtVer, DeviceInfo, GUID, RVInfo, PubKeyHash, 
-    //          DeviceKeyType, DeviceKeyHandle, HMACKeyHandle]
-    buf.push(0x8a); // array(10)
+    //          DeviceKeyType, DeviceKeyHandle, HMACKeyHandle, DCMinFirmwareRev]
+    buf.push(0x8b); // array(11)
     
     // DCTPMMagic = 0x46444F31 ("FDO1")
     buf.push(0x1a); // uint32
@@ -826,6 +826,9 @@ fn build_dctpm(ov_header: &OVHeader, dak_handle: u32, hmac_handle: u32) -> Vec<u
     buf.push((hmac_handle >> 16) as u8);
     buf.push((hmac_handle >> 8) as u8);
     buf.push(hmac_handle as u8);
+    
+    // DCMinFirmwareRev: seeded from RVMinFirmwareRev (RV tag 18), 0 = no minimum
+    buf.extend_from_slice(&crate::dctpm::encode_uint(crate::dctpm::rv_min_firmware_rev(&ov_header.rv_info)));
     
     buf
 }

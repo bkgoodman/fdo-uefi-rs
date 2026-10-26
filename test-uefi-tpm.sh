@@ -23,6 +23,8 @@
 #   WORK            work directory (default /tmp/fdo-uefi-tpm)
 #   PORT            server port (default 19999)
 #   PHASES          subset, e.g. "A B" (default "A B C")
+#   DI_SERVER_FLAGS extra server flags for phase A, e.g. "-rv-firmware-rev 5"
+#                   (DCTPM.DCMinFirmwareRev should then be seeded with 5)
 #
 # Exit status: non-zero if DI or TO2 fails. Phase B only records -tpm-check
 # results (its exit status is reported, not fatal).
@@ -145,7 +147,8 @@ for p in $PHASES; do
 		rm -rf "$WORK" && mkdir -p "$WORK/tpm"
 		echo "binaries:" && md5sum "$FDO_SERVER" "$FDO_CLIENT_TPM" "$FDO_UEFI"
 		"$FDO_SERVER" server -db "$WORK/fdo.db" -initOnly >/dev/null 2>&1
-		start_server || exit 1
+		# shellcheck disable=SC2086
+		start_server ${DI_SERVER_FLAGS:-} || exit 1
 		boot "\\fdo-uefi.efi -di http://10.0.2.2:$PORT" || exit 1
 		grep -E "GUID|NV |DCTPM|Device Initialization" "$WORK/qemu-A.log" | head -20
 		if grep -q "Device Initialization COMPLETE" "$WORK/qemu-A.log" &&

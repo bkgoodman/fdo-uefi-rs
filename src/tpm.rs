@@ -2416,6 +2416,27 @@ pub fn tpm_nv_write(nv_index: u32, data: &[u8], attributes: u32) -> bool {
     }
 }
 
+/// Write `data` at offset 0 of an existing NV index with one TPM2_NV_Write
+/// (no undefine/define), so an interruption leaves the old or the new data.
+pub fn tpm_nv_write_in_place(nv_index: u32, data: &[u8]) -> bool {
+    let tcg_handle = match boot::get_handle_for_protocol::<Tcg>() {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let mut tcg = match boot::open_protocol_exclusive::<Tcg>(tcg_handle) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let write_cmd = build_nv_write_cmd(nv_index, data);
+    match tpm_submit_with_retry(&mut tcg, &write_cmd, 64) {
+        Ok(_) => true,
+        Err(rc) => {
+            warn!("NV_Write (in place) failed for 0x{:08x}: rc=0x{:08x}", nv_index, rc);
+            false
+        }
+    }
+}
+
 /// Build TPM2_NV_UndefineSpace command
 fn build_nv_undefine_space_cmd(nv_index: u32) -> Vec<u8> {
     const TPM2_CC_NV_UNDEFINE_SPACE: u32 = 0x00000122;

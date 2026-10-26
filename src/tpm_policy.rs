@@ -55,6 +55,9 @@ pub const DCTPM_NV_ATTRIBUTES: u32 = TPMA_NV_OWNERWRITE
     | TPMA_NV_NO_DA
     | TPMA_NV_WRITE_STCLEAR;
 
+/// DCTPM NV index handle (spec Table 5).
+pub const DCTPM_NV_INDEX: u32 = 0x01D1_0001;
+
 /// DCTPM magic ("FDO1"). Readers SHALL treat a mismatch as no credentials.
 pub const DCTPM_MAGIC: u32 = 0x4644_4F31;
 
