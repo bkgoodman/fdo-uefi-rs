@@ -95,6 +95,15 @@ pub fn derive_session_keys(shared_secret: &[u8]) -> To2SessionKeys {
     }
 }
 
+/// ECDH ShSe = Shx || DeviceRandom || OwnerRandom, by role (FDO spec, ECDH
+/// key exchange). At FDO 2.0 the Device's parameter is xA (TO2.ProveDevice20)
+/// and the Owner's is xB (TO2.ProveOVHdr20).
+pub fn build_ecdh_shse(mut shx: Vec<u8>, device_rand: &[u8], owner_rand: &[u8]) -> Vec<u8> {
+    shx.extend_from_slice(device_rand);
+    shx.extend_from_slice(owner_rand);
+    shx
+}
+
 /// Parse random bytes from FDO key exchange parameter format
 /// FDO format: [2-byte xLen][x][2-byte yLen][y][2-byte randLen][rand]
 fn parse_kex_random(kex_param: &[u8]) -> Option<Vec<u8>> {
@@ -2009,10 +2018,8 @@ pub fn perform_to2(
         .ok_or_else(|| FdoError::CborError(String::from("Failed to parse xA random bytes")))?;
     debug!("  xA random: {} bytes, {:02x?}", xa_rand.len(), &xa_rand);
     
-    // FDO shared secret = ECDH_x || xB.Rand || xA.Rand (per go-fdo kex/ecdh.go:300)
-    let mut shared_secret = ecdh_result;
-    shared_secret.extend_from_slice(&xb_rand);
-    shared_secret.extend_from_slice(&xa_rand);
+    // FDO 2.0: the Device (us) sent xA, the Owner sent xB.
+    let shared_secret = build_ecdh_shse(ecdh_result, &xa_rand, &xb_rand);
     debug!("  Full shared secret: {} bytes", shared_secret.len());
     debug!("  Shared secret preview: {:02x?}", &shared_secret[..shared_secret.len().min(16)]);
     
@@ -2681,6 +2688,31 @@ pub fn test_to1_protocol(rv_url: &str, guid: &[u8; 16], device_key_handle: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ECDH ShSe known answer (shared with go-fdo kex/ecdh_kat_test.go,
+    // vector "ECDH256-A256GCM"; Shx from device scalar SHA256("fdo-kat-device")
+    // and owner scalar SHA256("fdo-kat-owner"), DeviceRandom 0x11*16,
+    // OwnerRandom 0x22*16) ---
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    const KAT_SHX: &str = "28ec90132b66e9cce5d13f52bd3408dece6be04d89a34a27b3b8ba3498a4b272";
+    const KAT_SEK: &str = "dd637b926fac42795349dc7898447da80c0c829534ba4cf9c4cac0822e5b63e2";
+
+    #[test]
+    fn test_ecdh_shse_known_answer() {
+        let shse = build_ecdh_shse(hex(KAT_SHX), &[0x11; 16], &[0x22; 16]);
+        assert_eq!(derive_session_keys(&shse).sek, hex(KAT_SEK));
+    }
+
+    #[test]
+    fn test_ecdh_shse_owner_random_first_is_wrong() {
+        // The pre-fix order (Shx || xB.Rand || xA.Rand at 2.0) must not match.
+        let shse = build_ecdh_shse(hex(KAT_SHX), &[0x22; 16], &[0x11; 16]);
+        assert_ne!(derive_session_keys(&shse).sek, hex(KAT_SEK));
+    }
 
     // --- CborEncoder ---
 
