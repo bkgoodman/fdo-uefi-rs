@@ -109,7 +109,7 @@ if [ "$SKIP_BUILD" = false ] && [ -d "$RUST_SRC" ]; then
     log_ok "Build complete"
 fi
 
-RUST_EFI="$RUST_SRC/target/x86_64-unknown-uefi/release/fdo-uefi.efi"
+RUST_EFI="${RUST_EFI:-$RUST_SRC/target/x86_64-unknown-uefi/release/fdo-uefi.efi}"
 if [ ! -f "$RUST_EFI" ]; then
     log_err "UEFI binary not found: $RUST_EFI"
     log_err "Build with: cd $RUST_SRC && cargo +nightly build --release --features rv-firmware"
@@ -120,7 +120,7 @@ log_ok "UEFI binary: $RUST_EFI ($(stat -c%s "$RUST_EFI") bytes)"
 # --- Setup workspace ---
 log_section "Setting Up Workspace"
 
-sudo killall -9 swtpm server qemu-system-x86_64 2>/dev/null || true
+# No killall: the QEMU host is shared (other VMs, swtpm instances). Processes started here are stopped by PID in cleanup().
 sleep 1
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR" "$VOUCHER_DIR" "$WORKDIR/www"
